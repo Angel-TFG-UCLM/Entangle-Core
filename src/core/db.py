@@ -89,7 +89,7 @@ class Database:
         Raises:
             Exception: Si la base de datos no está conectada
         """
-        if not self.db:
+        if self.db is None:
             raise Exception("Base de datos no conectada. Ejecuta connect() primero.")
         return self.db[collection_name]
     
@@ -112,7 +112,7 @@ class Database:
         Raises:
             Exception: Si la base de datos no está conectada
         """
-        if not self.db:
+        if self.db is None:
             raise Exception("Base de datos no conectada. Ejecuta connect() primero.")
         return self.db
     
