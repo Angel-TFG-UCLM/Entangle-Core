@@ -143,31 +143,33 @@ class GitHubGraphQLClient:
                     time.sleep(wait_seconds)
                     logger.info("Rate limit reseteado. Continuando...")
     
-    def _build_search_query(self, config_criteria) -> str:
+    def _build_search_query(self, config_criteria, use_simple_query: bool = False) -> str:
         """
         Construye una query de búsqueda de GitHub a partir de los criterios de configuración.
         
         Args:
             config_criteria: Instancia de IngestionConfig con los criterios
+            use_simple_query: Si True, usa solo la keyword principal (para búsquedas amplias)
             
         Returns:
-            String de búsqueda de GitHub (ej: "quantum language:Python stars:>10")
+            String de búsqueda de GitHub (ej: "quantum stars:>10 fork:false")
         """
         query_parts = []
         
-        # Agregar keywords (unidas con OR)
+        # Agregar keywords como términos de búsqueda principales
         if config_criteria.keywords:
-            # Usar las primeras keywords como búsqueda principal
-            # GitHub limita la longitud de la query, así que seleccionamos las más importantes
-            keywords_query = " OR ".join(config_criteria.keywords[:5])
-            query_parts.append(f"({keywords_query})")
+            if use_simple_query:
+                # Búsqueda simple: solo la primera keyword
+                query_parts.append(config_criteria.keywords[0])
+            else:
+                # Búsqueda avanzada: combinar keywords principales con OR
+                # Seleccionar las primeras 5 keywords más relevantes
+                main_keywords = config_criteria.keywords[:5]
+                # GitHub entiende espacios como OR cuando están en el texto de búsqueda
+                keywords_query = " OR ".join(main_keywords)
+                query_parts.append(f"({keywords_query})")
         
-        # Agregar lenguajes (unidas con OR)
-        if config_criteria.languages:
-            languages_query = " OR ".join([f"language:{lang}" for lang in config_criteria.languages])
-            query_parts.append(f"({languages_query})")
-        
-        # Agregar estrellas mínimas
+        # Agregar estrellas mínimas (criterio importante para calidad)
         if config_criteria.min_stars > 0:
             query_parts.append(f"stars:>={config_criteria.min_stars}")
         
@@ -185,7 +187,8 @@ class GitHubGraphQLClient:
         self, 
         config_criteria=None,
         first: int = 100,
-        after: Optional[str] = None
+        after: Optional[str] = None,
+        use_simple_query: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Busca repositorios usando los criterios de configuración.
@@ -194,6 +197,7 @@ class GitHubGraphQLClient:
             config_criteria: Instancia de IngestionConfig (usa ingestion_config por defecto)
             first: Número de resultados a obtener (máx 100 por página)
             after: Cursor para paginación
+            use_simple_query: Si True, usa búsqueda simple (más resultados)
             
         Returns:
             Lista de diccionarios con información de repositorios
@@ -206,7 +210,7 @@ class GitHubGraphQLClient:
         self.check_rate_limit()
         
         # Construir la query de búsqueda
-        search_query = self._build_search_query(config_criteria)
+        search_query = self._build_search_query(config_criteria, use_simple_query)
         
         # Query GraphQL para búsqueda de repositorios
         graphql_query = """
@@ -268,6 +272,33 @@ class GitHubGraphQLClient:
                     topic {
                       name
                     }
+                  }
+                }
+                hasIssuesEnabled
+                hasWikiEnabled
+                openIssues: issues(states: OPEN) {
+                  totalCount
+                }
+                closedIssues: issues(states: CLOSED) {
+                  totalCount
+                }
+                pullRequests {
+                  totalCount
+                }
+                defaultBranchRef {
+                  name
+                  target {
+                    ... on Commit {
+                      history {
+                        totalCount
+                      }
+                    }
+                  }
+                }
+                diskUsage
+                object(expression: "HEAD:README.md") {
+                  ... on Blob {
+                    text
                   }
                 }
               }
