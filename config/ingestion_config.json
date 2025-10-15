@@ -1,0 +1,35 @@
+{
+  "description": "Configuración de criterios de ingesta para repositorios de software cuántico",
+  "version": "1.0",
+  "keywords": [
+    "quantum",
+    "qiskit",
+    "braket",
+    "cirq",
+    "pennylane",
+    "quantum computing",
+    "quantum algorithms",
+    "quantum machine learning",
+    "qml",
+    "qubit",
+    "quantum simulator",
+    "quantum circuit"
+  ],
+  "languages": [
+    "Python",
+    "C++",
+    "Q#",
+    "Rust",
+    "Julia",
+    "JavaScript"
+  ],
+  "min_stars": 10,
+  "max_inactivity_days": 365,
+  "exclude_forks": true,
+  "min_contributors": 1,
+  "additional_filters": {
+    "has_topics": true,
+    "has_readme": true,
+    "min_size_kb": 10
+  }
+}
