@@ -58,31 +58,48 @@ class GitHubGraphQLClient:
         
         logger.debug(f"Ejecutando query GraphQL: {query[:100]}...")
         
-        try:
-            response = requests.post(
-                self.api_url,
-                json=payload,
-                headers=self.headers,
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Verificar si hay errores en la respuesta
-            if "errors" in data:
-                logger.error(f"Errores en la respuesta de GraphQL: {data['errors']}")
-                raise Exception(f"GraphQL errors: {data['errors']}")
-            
-            logger.debug("Query ejecutada exitosamente")
-            return data
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error en la petición GraphQL: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Error inesperado al ejecutar query: {e}")
-            raise
+        # Reintentos automáticos en caso de errores 502/503
+        max_retries = 5
+        retry_delay = 5  # segundos
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    self.api_url,
+                    json=payload,
+                    headers=self.headers,
+                    timeout=30
+                )
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                # Verificar si hay errores en la respuesta
+                if "errors" in data:
+                    logger.error(f"Errores en la respuesta de GraphQL: {data['errors']}")
+                    raise Exception(f"GraphQL errors: {data['errors']}")
+                
+                logger.debug("Query ejecutada exitosamente")
+                return data
+                
+            except requests.exceptions.HTTPError as http_err:
+                # Reintentar solo en errores 502/503 (server errors temporales)
+                if response.status_code in [502, 503] and attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Error {response.status_code}, reintentando en {retry_delay}s (intento {attempt + 1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                else:
+                    logger.error(f"Error en la petición GraphQL: {http_err}")
+                    raise
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error en la petición GraphQL: {e}")
+                raise
+                
+            except Exception as e:
+                logger.error(f"Error inesperado al ejecutar query: {e}")
+                raise
     
     def get_rate_limit(self) -> Dict[str, Any]:
         """
@@ -227,7 +244,10 @@ class GitHubGraphQLClient:
                 name
                 nameWithOwner
                 owner {
+                  id
                   login
+                  url
+                  avatarUrl
                   ... on User {
                     name
                     email
@@ -368,10 +388,10 @@ class GitHubGraphQLClient:
                 logger.info(f"Alcanzado el límite de {max_results} repositorios")
                 break
             
-            # Obtener página actual
+            # Obtener página actual (reducido a 20 para evitar RESOURCE_LIMITS_EXCEEDED)
             result = self.search_repositories(
                 config_criteria=config_criteria,
-                first=100,
+                first=20,  # Reducido de 100 a 20 para evitar límites de recursos
                 after=after_cursor
             )
             
