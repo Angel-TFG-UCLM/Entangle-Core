@@ -4,35 +4,45 @@ Motor de ingesta de repositorios de GitHub.
 Este módulo implementa el flujo completo de ingesta:
 1. Búsqueda de repositorios usando criterios configurables
 2. Filtrado por criterios de calidad
-3. Almacenamiento en MongoDB y/o archivos locales
+3. Validación con modelos Pydantic
+4. Almacenamiento en MongoDB usando MongoRepository
+5. Soporte para reingestas incrementales
 """
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
+from pydantic import ValidationError
 
 from .graphql_client import GitHubGraphQLClient
+from .filters import RepositoryFilters
 from ..core.config import IngestionConfig, ingestion_config
 from ..core.logger import logger
-from ..core.db import Database
+from ..core.db import db, get_database
+from ..core.mongo_repository import MongoRepository
+from ..models import Repository, Organization, User, Relation
 
 
 class IngestionEngine:
     """
-    Motor central de ingesta de repositorios de software cuántico.
+    Motor central de ingesta de datos de GitHub con persistencia MongoDB.
     
     Orquesta el flujo completo:
     - Búsqueda con GitHubGraphQLClient
     - Filtrado según criterios de calidad
-    - Almacenamiento de resultados
+    - Validación con modelos Pydantic
+    - Almacenamiento con MongoRepository
+    - Soporte para reingestas incrementales
     """
     
     def __init__(
         self,
         client: Optional[GitHubGraphQLClient] = None,
         config: Optional[IngestionConfig] = None,
-        db: Optional[Database] = None
+        incremental: bool = False,
+        batch_size: int = 50
     ):
         """
         Inicializa el motor de ingesta.
@@ -40,90 +50,161 @@ class IngestionEngine:
         Args:
             client: Cliente GraphQL de GitHub (crea uno nuevo si es None)
             config: Configuración de ingesta (usa global si es None)
-            db: Instancia de base de datos (crea una nueva si es None)
+            incremental: Si True, solo actualiza documentos modificados
+            batch_size: Tamaño de lote para operaciones bulk
         """
         self.client = client or GitHubGraphQLClient()
         self.config = config or ingestion_config
-        self.db = db or Database()
+        self.incremental = incremental
+        self.batch_size = batch_size
         
-        # Estadísticas de la ingesta
+        # Conectar a MongoDB
+        if not db.is_connected():
+            db.connect()
+        
+        # Crear repositorios MongoDB para cada colección
+        self.repo_db = MongoRepository("repositories", unique_fields=["id"])
+        self.org_db = MongoRepository("organizations", unique_fields=["id"])
+        self.user_db = MongoRepository("users", unique_fields=["id"])
+        self.relation_db = MongoRepository("relations", unique_fields=["source_id", "target_id", "relation_type"])
+        
+        # Estadísticas de la ingesta (ampliadas con nuevos filtros y persistencia)
         self.stats = {
+            # Extracción
             "total_found": 0,
             "total_filtered": 0,
+            
+            # Filtrado
+            "filtered_by_archived": 0,
             "filtered_by_fork": 0,
             "filtered_by_stars": 0,
             "filtered_by_language": 0,
             "filtered_by_inactivity": 0,
             "filtered_by_keywords": 0,
-            "total_saved": 0,
+            "filtered_by_no_description": 0,
+            "filtered_by_minimal_project": 0,
+            "filtered_by_community_engagement": 0,
+            
+            # Validación
+            "validation_errors": 0,
+            "validation_success": 0,
+            
+            # Persistencia
+            "repositories_inserted": 0,
+            "repositories_updated": 0,
+            "organizations_inserted": 0,
+            "organizations_updated": 0,
+            "users_inserted": 0,
+            "users_updated": 0,
+            "relations_created": 0,
+            
+            # Tiempos
+            "time_extraction": 0.0,
+            "time_filtering": 0.0,
+            "time_validation": 0.0,
+            "time_persistence": 0.0,
+            
             "start_time": None,
             "end_time": None
         }
         
-        logger.info("Motor de ingesta inicializado correctamente")
+        logger.info(f"Motor de ingesta inicializado (incremental={'SÍ' if incremental else 'NO'}, batch_size={batch_size})")
     
     def run(
         self,
         max_results: Optional[int] = None,
-        save_to_db: bool = True,
         save_to_json: bool = True,
         output_file: str = "ingestion_results.json"
     ) -> Dict[str, Any]:
         """
-        Ejecuta el flujo completo de ingesta.
+        Ejecuta el flujo completo de ingesta con validación y persistencia.
+        
+        Flujo:
+        1. Extracción → Búsqueda de repositorios
+        2. Filtrado → Aplicar criterios de calidad
+        3. Validación → Parsear y validar con Pydantic
+        4. Persistencia → Guardar en MongoDB (bulk operations)
+        5. Relaciones → Crear relaciones entre entidades
         
         Args:
             max_results: Número máximo de repositorios a obtener (None = todos)
-            save_to_db: Si se deben guardar los resultados en MongoDB
             save_to_json: Si se deben guardar los resultados en JSON
             output_file: Nombre del archivo JSON de salida
             
         Returns:
-            Diccionario con resultados y estadísticas
+            Diccionario con resultados y estadísticas completas
         """
         logger.info("=" * 80)
-        logger.info("INICIANDO PROCESO DE INGESTA")
+        logger.info("🚀 INICIANDO PROCESO DE INGESTA")
         logger.info("=" * 80)
+        logger.info(f"Modo: {'Incremental' if self.incremental else 'Completo'}")
+        logger.info(f"Tamaño de lote: {self.batch_size}")
         
         self.stats["start_time"] = datetime.now(timezone.utc)
         
         try:
-            # 1. Buscar repositorios
-            logger.info("Fase 1: Búsqueda de repositorios")
-            repositories = self._search_repositories(max_results)
-            self.stats["total_found"] = len(repositories)
+            # ==================== FASE 1: EXTRACCIÓN ====================
+            start_extraction = time.time()
+            logger.info("\n📥 FASE 1: Extracción de Repositorios")
+            repositories_raw = self._search_repositories(max_results)
+            self.stats["total_found"] = len(repositories_raw)
+            self.stats["time_extraction"] = time.time() - start_extraction
             
-            logger.info(f"✓ Repositorios encontrados: {len(repositories)}")
+            logger.info(f"✅ {len(repositories_raw)} repositorios extraídos en {self.stats['time_extraction']:.2f}s")
             
-            # 2. Filtrar repositorios
-            logger.info("\nFase 2: Filtrado de repositorios")
-            filtered_repos = self.filter_repositories(repositories)
-            self.stats["total_filtered"] = len(filtered_repos)
+            # ==================== FASE 2: FILTRADO ====================
+            start_filtering = time.time()
+            logger.info("\n🔍 FASE 2: Filtrado de Calidad")
+            filtered_repos_raw = self.filter_repositories(repositories_raw)
+            self.stats["total_filtered"] = len(filtered_repos_raw)
+            self.stats["time_filtering"] = time.time() - start_filtering
             
-            logger.info(f"✓ Repositorios después de filtrado: {len(filtered_repos)}")
+            logger.info(f"✅ {len(filtered_repos_raw)} repositorios válidos en {self.stats['time_filtering']:.2f}s")
             
-            # 3. Guardar resultados
-            logger.info("\nFase 3: Almacenamiento de resultados")
-            self.save_results(
-                filtered_repos,
-                save_to_db=save_to_db,
-                save_to_json=save_to_json,
-                output_file=output_file
-            )
+            # ==================== FASE 3: VALIDACIÓN ====================
+            start_validation = time.time()
+            logger.info("\n✔️  FASE 3: Validación con Modelos Pydantic")
+            validated_repos, validation_errors = self._validate_repositories(filtered_repos_raw)
+            self.stats["validation_success"] = len(validated_repos)
+            self.stats["validation_errors"] = len(validation_errors)
+            self.stats["time_validation"] = time.time() - start_validation
+            
+            logger.info(f"✅ {len(validated_repos)} repositorios validados en {self.stats['time_validation']:.2f}s")
+            if validation_errors:
+                logger.warning(f"⚠️  {len(validation_errors)} errores de validación")
+            
+            # ==================== FASE 4: PERSISTENCIA ====================
+            start_persistence = time.time()
+            logger.info("\n💾 FASE 4: Persistencia en MongoDB")
+            self._persist_repositories(validated_repos)
+            self.stats["time_persistence"] = time.time() - start_persistence
+            
+            logger.info(f"✅ Persistencia completada en {self.stats['time_persistence']:.2f}s")
+            
+            # ==================== FASE 5: RELACIONES ====================
+            logger.info("\n🔗 FASE 5: Creación de Relaciones")
+            self._create_relations(validated_repos)
+            
+            logger.info(f"✅ {self.stats['relations_created']} relaciones creadas")
+            
+            # ==================== GUARDAR JSON (OPCIONAL) ====================
+            if save_to_json:
+                logger.info(f"\n📄 Guardando resultados en {output_file}...")
+                self._save_to_json(validated_repos, output_file)
             
             self.stats["end_time"] = datetime.now(timezone.utc)
             
-            # 4. Generar reporte
-            report = self._generate_report(filtered_repos)
+            # ==================== REPORTE FINAL ====================
+            report = self._generate_report(validated_repos, validation_errors)
             
-            logger.info("=" * 80)
-            logger.info("PROCESO DE INGESTA COMPLETADO EXITOSAMENTE")
+            logger.info("\n" + "=" * 80)
+            logger.info("✅ PROCESO DE INGESTA COMPLETADO EXITOSAMENTE")
             logger.info("=" * 80)
             
             return report
             
         except Exception as e:
-            logger.error(f"Error durante el proceso de ingesta: {e}", exc_info=True)
+            logger.error(f"❌ Error durante el proceso de ingesta: {e}", exc_info=True)
             raise
     
     def _search_repositories(self, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -134,9 +215,9 @@ class IngestionEngine:
             max_results: Número máximo de repositorios a obtener
             
         Returns:
-            Lista de repositorios encontrados
+            Lista de repositorios encontrados (datos raw de GraphQL)
         """
-        logger.info("Ejecutando búsqueda en GitHub...")
+        logger.info("🔎 Ejecutando búsqueda en GitHub...")
         
         try:
             # Búsqueda con paginación automática
@@ -145,16 +226,192 @@ class IngestionEngine:
                 max_results=max_results
             )
             
-            logger.info(f"Búsqueda completada: {len(result)} repositorios obtenidos")
+            logger.debug(f"Búsqueda completada: {len(result)} repositorios obtenidos")
             return result
             
         except Exception as e:
-            logger.error(f"Error en la búsqueda de repositorios: {e}")
+            logger.error(f"❌ Error en la búsqueda de repositorios: {e}")
             raise
+    
+    def _validate_repositories(
+        self,
+        repositories_raw: List[Dict[str, Any]]
+    ) -> Tuple[List[Repository], List[Dict[str, Any]]]:
+        """
+        Valida repositorios raw de GraphQL y los convierte a modelos Pydantic.
+        
+        Args:
+            repositories_raw: Lista de repositorios sin validar (dict de GraphQL)
+            
+        Returns:
+            Tupla de (repos_validados, errores_validación)
+        """
+        validated = []
+        errors = []
+        
+        logger.info(f"📋 Validando {len(repositories_raw)} repositorios...")
+        
+        for i, repo_raw in enumerate(repositories_raw, 1):
+            try:
+                # Parsear datos GraphQL a modelo Pydantic
+                repository = Repository.from_graphql_response(repo_raw)
+                validated.append(repository)
+                
+                if i % 10 == 0:
+                    logger.debug(f"  Validados: {i}/{len(repositories_raw)}")
+                    
+            except ValidationError as e:
+                error_info = {
+                    "repository": repo_raw.get("nameWithOwner", "unknown"),
+                    "errors": e.errors(),
+                    "raw_data": repo_raw
+                }
+                errors.append(error_info)
+                logger.warning(f"⚠️  Error validando {repo_raw.get('nameWithOwner')}: {e}")
+                
+            except Exception as e:
+                error_info = {
+                    "repository": repo_raw.get("nameWithOwner", "unknown"),
+                    "error": str(e),
+                    "raw_data": repo_raw
+                }
+                errors.append(error_info)
+                logger.error(f"❌ Error inesperado validando {repo_raw.get('nameWithOwner')}: {e}")
+        
+        # Actualizar estadísticas
+        self.stats["validation_success"] = len(validated)
+        self.stats["validation_errors"] = len(errors)
+        
+        logger.info(f"✅ Validación completada: {len(validated)} exitosos, {len(errors)} errores")
+        
+        return validated, errors
+    
+    def _persist_repositories(self, repositories: List[Repository]) -> None:
+        """
+        Persiste repositorios en MongoDB usando operaciones bulk.
+        
+        Args:
+            repositories: Lista de repositorios validados (modelos Pydantic)
+        """
+        if not repositories:
+            logger.warning("⚠️  No hay repositorios para persistir")
+            return
+        
+        logger.info(f"💾 Persistiendo {len(repositories)} repositorios en lotes de {self.batch_size}...")
+        
+        total_inserted = 0
+        total_updated = 0
+        
+        # Procesar en lotes
+        for i in range(0, len(repositories), self.batch_size):
+            batch = repositories[i:i + self.batch_size]
+            batch_num = i // self.batch_size + 1
+            total_batches = (len(repositories) + self.batch_size - 1) // self.batch_size
+            
+            logger.debug(f"  Procesando lote {batch_num}/{total_batches} ({len(batch)} repos)...")
+            
+            try:
+                # Bulk upsert
+                result = self.repo_db.bulk_upsert(
+                    documents=batch,
+                    unique_field="id"
+                )
+                
+                total_inserted += result["upserted_count"]
+                total_updated += result["modified_count"]
+                
+                logger.debug(
+                    f"    ✓ Lote {batch_num}: "
+                    f"{result['upserted_count']} nuevos, "
+                    f"{result['modified_count']} actualizados"
+                )
+                
+            except Exception as e:
+                logger.error(f"❌ Error en lote {batch_num}: {e}")
+                # Intentar insertar uno por uno en caso de error
+                for repo in batch:
+                    try:
+                        upsert_result = self.repo_db.upsert_one(
+                            query={"id": repo.id},
+                            document=repo.dict(),
+                            update_timestamp=True
+                        )
+                        if upsert_result["operation"] == "insert":
+                            total_inserted += 1
+                        else:
+                            total_updated += 1
+                    except Exception as e2:
+                        logger.error(f"❌ Error insertando {repo.full_name if hasattr(repo, 'full_name') else repo.id}: {e2}")
+        
+        self.stats["repositories_inserted"] = total_inserted
+        self.stats["repositories_updated"] = total_updated
+        
+        logger.info(
+            f"✅ Persistencia completada: "
+            f"{total_inserted} nuevos, {total_updated} actualizados"
+        )
+    
+    def _create_relations(self, repositories: List[Repository]) -> None:
+        """
+        Crea relaciones entre repositorios y sus owners (organizaciones/usuarios).
+        
+        Args:
+            repositories: Lista de repositorios validados
+        """
+        logger.info("🔗 Creando relaciones...")
+        
+        relations_created = 0
+        
+        for repo in repositories:
+            try:
+                # Verificar que tiene owner
+                if not repo.owner:
+                    logger.debug(f"Repositorio {repo.full_name} no tiene owner, saltando relación")
+                    continue
+                
+                # Relación: Organization/User owns Repository
+                from src.models.relation import ContributionMetrics
+                
+                contribution_metrics = ContributionMetrics(
+                    commits_count=repo.commits_count or 0,
+                    issues_opened=0,  # No disponible en datos de repo
+                    pull_requests_opened=0  # No disponible en datos de repo
+                )
+                
+                relation = Relation.create_user_repo_contribution(
+                    user_id=repo.owner.id,
+                    user_login=repo.owner.login,
+                    repo_id=repo.id,
+                    repo_name=repo.full_name or repo.name,
+                    contribution_metrics=contribution_metrics,
+                    started_at=repo.created_at
+                )
+                
+                # Insertar relación (evitar duplicados)
+                result = self.relation_db.insert_one(relation.dict(), check_duplicates=True)
+                if result:
+                    relations_created += 1
+                    
+            except Exception as e:
+                logger.debug(f"No se pudo crear relación para {repo.full_name if hasattr(repo, 'full_name') else 'unknown'}: {e}")
+        
+        self.stats["relations_created"] = relations_created
+        logger.debug(f"✓ {relations_created} relaciones creadas")
     
     def filter_repositories(self, repositories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Aplica todos los filtros de calidad a los repositorios.
+        Aplica todos los filtros de calidad y relevancia a los repositorios.
+        
+        Orden de filtros (de más restrictivo a menos):
+        1. Archivado
+        2. Descripción/README
+        3. Tamaño mínimo del proyecto
+        4. Actividad reciente
+        5. Fork válido (si es fork)
+        6. Keywords cuánticas
+        7. Lenguaje válido
+        8. Estrellas mínimas
+        9. Engagement de comunidad
         
         Args:
             repositories: Lista de repositorios a filtrar
@@ -162,277 +419,137 @@ class IngestionEngine:
         Returns:
             Lista de repositorios que pasan todos los filtros
         """
-        logger.info(f"Aplicando filtros a {len(repositories)} repositorios...")
+        logger.info(f"Aplicando filtros avanzados a {len(repositories)} repositorios...")
         
         filtered = []
         
         for repo in repositories:
-            # Aplicar cada filtro
-            if not self._filter_by_fork(repo):
-                self.stats["filtered_by_fork"] += 1
+            # 1. Filtro: No archivado
+            if not RepositoryFilters.is_not_archived(repo):
+                self.stats["filtered_by_archived"] += 1
                 continue
             
-            if not self._filter_by_stars(repo):
-                self.stats["filtered_by_stars"] += 1
+            # 2. Filtro: Tiene descripción o README
+            if not RepositoryFilters.has_description(repo):
+                self.stats["filtered_by_no_description"] += 1
                 continue
             
-            if not self._filter_by_language(repo):
-                self.stats["filtered_by_language"] += 1
+            # 3. Filtro: Tamaño mínimo (commits y KB)
+            if not RepositoryFilters.is_minimal_project(repo, min_commits=10, min_size_kb=10):
+                self.stats["filtered_by_minimal_project"] += 1
                 continue
             
-            if not self._filter_by_inactivity(repo):
+            # 4. Filtro: Actividad reciente
+            if not RepositoryFilters.is_active(repo, self.config.max_inactivity_days):
                 self.stats["filtered_by_inactivity"] += 1
                 continue
             
-            if not self._filter_by_keywords(repo):
+            # 5. Filtro: Fork válido (si es fork, debe tener contribuciones propias)
+            if not RepositoryFilters.is_valid_fork(repo):
+                self.stats["filtered_by_fork"] += 1
+                continue
+            
+            # 6. Filtro: Keywords cuánticas
+            if not RepositoryFilters.matches_keywords(repo, self.config.keywords):
                 self.stats["filtered_by_keywords"] += 1
+                continue
+            
+            # 7. Filtro: Lenguaje válido
+            if not RepositoryFilters.has_valid_language(repo, self.config.languages):
+                self.stats["filtered_by_language"] += 1
+                continue
+            
+            # 8. Filtro: Estrellas mínimas
+            if not RepositoryFilters.has_minimum_stars(repo, self.config.min_stars):
+                self.stats["filtered_by_stars"] += 1
+                continue
+            
+            # 9. Filtro: Engagement de comunidad (opcional pero recomendado)
+            if not RepositoryFilters.has_community_engagement(repo, min_watchers=3, min_forks=1):
+                self.stats["filtered_by_community_engagement"] += 1
                 continue
             
             # Si pasa todos los filtros, agregarlo
             filtered.append(repo)
         
         logger.info(f"Filtrado completado: {len(filtered)} repositorios válidos")
-        logger.info(f"  - Rechazados por ser fork: {self.stats['filtered_by_fork']}")
-        logger.info(f"  - Rechazados por estrellas: {self.stats['filtered_by_stars']}")
-        logger.info(f"  - Rechazados por lenguaje: {self.stats['filtered_by_language']}")
+        logger.info(f"  - Rechazados por archivado: {self.stats['filtered_by_archived']}")
+        logger.info(f"  - Rechazados por falta de descripción: {self.stats['filtered_by_no_description']}")
+        logger.info(f"  - Rechazados por tamaño mínimo: {self.stats['filtered_by_minimal_project']}")
         logger.info(f"  - Rechazados por inactividad: {self.stats['filtered_by_inactivity']}")
+        logger.info(f"  - Rechazados por fork sin aportes: {self.stats['filtered_by_fork']}")
         logger.info(f"  - Rechazados por keywords: {self.stats['filtered_by_keywords']}")
+        logger.info(f"  - Rechazados por lenguaje: {self.stats['filtered_by_language']}")
+        logger.info(f"  - Rechazados por estrellas: {self.stats['filtered_by_stars']}")
+        logger.info(f"  - Rechazados por bajo engagement: {self.stats['filtered_by_community_engagement']}")
         
         return filtered
     
-    def _filter_by_fork(self, repo: Dict[str, Any]) -> bool:
-        """
-        Filtra por fork.
-        
-        Args:
-            repo: Repositorio a evaluar
-            
-        Returns:
-            True si pasa el filtro, False si debe ser rechazado
-        """
-        if not self.config.exclude_forks:
-            return True
-        
-        is_fork = repo.get("isFork", False)
-        
-        if is_fork:
-            logger.debug(f"Repo rechazado (fork): {repo.get('nameWithOwner')}")
-            return False
-        
-        return True
-    
-    def _filter_by_stars(self, repo: Dict[str, Any]) -> bool:
-        """
-        Filtra por número de estrellas.
-        
-        Args:
-            repo: Repositorio a evaluar
-            
-        Returns:
-            True si pasa el filtro, False si debe ser rechazado
-        """
-        stars = repo.get("stargazerCount", 0)
-        min_stars = self.config.min_stars
-        
-        if stars < min_stars:
-            logger.debug(
-                f"Repo rechazado (stars {stars} < {min_stars}): "
-                f"{repo.get('nameWithOwner')}"
-            )
-            return False
-        
-        return True
-    
-    def _filter_by_language(self, repo: Dict[str, Any]) -> bool:
-        """
-        Filtra por lenguaje de programación.
-        
-        Args:
-            repo: Repositorio a evaluar
-            
-        Returns:
-            True si pasa el filtro, False si debe ser rechazado
-        """
-        if not self.config.languages:
-            return True
-        
-        primary_language = repo.get("primaryLanguage")
-        
-        if not primary_language:
-            logger.debug(f"Repo sin lenguaje principal: {repo.get('nameWithOwner')}")
-            return False
-        
-        language_name = primary_language.get("name")
-        
-        if language_name not in self.config.languages:
-            logger.debug(
-                f"Repo rechazado (lenguaje {language_name} no permitido): "
-                f"{repo.get('nameWithOwner')}"
-            )
-            return False
-        
-        return True
-    
-    def _filter_by_inactivity(self, repo: Dict[str, Any]) -> bool:
-        """
-        Filtra por inactividad (última actualización).
-        
-        Args:
-            repo: Repositorio a evaluar
-            
-        Returns:
-            True si pasa el filtro, False si debe ser rechazado
-        """
-        updated_at_str = repo.get("updatedAt")
-        
-        if not updated_at_str:
-            logger.debug(f"Repo sin fecha de actualización: {repo.get('nameWithOwner')}")
-            return False
-        
-        # Convertir fecha
-        updated_at = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00'))
-        now = datetime.now(timezone.utc)
-        
-        # Calcular días de inactividad
-        inactivity_days = (now - updated_at).days
-        max_inactivity = self.config.max_inactivity_days
-        
-        if inactivity_days > max_inactivity:
-            logger.debug(
-                f"Repo rechazado (inactivo {inactivity_days} días > {max_inactivity}): "
-                f"{repo.get('nameWithOwner')}"
-            )
-            return False
-        
-        return True
-    
-    def _filter_by_keywords(self, repo: Dict[str, Any]) -> bool:
-        """
-        Filtra por presencia de keywords en nombre o descripción.
-        
-        Args:
-            repo: Repositorio a evaluar
-            
-        Returns:
-            True si pasa el filtro, False si debe ser rechazado
-        """
-        if not self.config.keywords:
-            return True
-        
-        # Obtener textos donde buscar
-        name = repo.get("name", "").lower()
-        description = repo.get("description", "") or ""
-        description = description.lower()
-        
-        # Combinar nombre y descripción
-        searchable_text = f"{name} {description}"
-        
-        # Verificar si alguna keyword está presente
-        for keyword in self.config.keywords:
-            if keyword.lower() in searchable_text:
-                return True
-        
-        # También verificar en topics si existen
-        topics = repo.get("repositoryTopics", {}).get("nodes", [])
-        for topic_node in topics:
-            topic_name = topic_node.get("topic", {}).get("name", "").lower()
-            for keyword in self.config.keywords:
-                if keyword.lower() in topic_name:
-                    return True
-        
-        logger.debug(
-            f"Repo rechazado (sin keywords cuánticas): "
-            f"{repo.get('nameWithOwner')}"
-        )
-        return False
-    
-    def save_results(
+    def _save_to_json(
         self,
-        repositories: List[Dict[str, Any]],
-        save_to_db: bool = True,
-        save_to_json: bool = True,
+        repositories: List[Repository],
         output_file: str = "ingestion_results.json"
-    ):
+    ) -> None:
         """
-        Guarda los resultados en MongoDB y/o archivo JSON.
+        Guarda los resultados en archivo JSON.
         
         Args:
-            repositories: Lista de repositorios a guardar
-            save_to_db: Si se deben guardar en MongoDB
-            save_to_json: Si se deben guardar en JSON
+            repositories: Lista de repositorios validados
             output_file: Nombre del archivo JSON
         """
-        saved_count = 0
-        
-        # Guardar en MongoDB
-        if save_to_db:
-            try:
-                logger.info("Guardando repositorios en MongoDB...")
-                self.db.connect()
-                collection = self.db.get_collection("repositories")
-                
-                for repo in repositories:
-                    # Agregar metadata de ingesta
-                    repo["ingestion_date"] = datetime.now(timezone.utc).isoformat()
-                    repo["ingestion_version"] = self.config.version
-                    
-                    # Upsert (actualizar o insertar)
-                    collection.update_one(
-                        {"id": repo["id"]},
-                        {"$set": repo},
-                        upsert=True
-                    )
-                    saved_count += 1
-                
-                self.db.disconnect()
-                logger.info(f"✓ {saved_count} repositorios guardados en MongoDB")
-                
-            except Exception as e:
-                logger.error(f"Error al guardar en MongoDB: {e}")
-                logger.warning("Continuando con guardado en JSON...")
-        
-        # Guardar en JSON
-        if save_to_json:
-            try:
-                logger.info(f"Guardando repositorios en {output_file}...")
-                
-                # Crear directorio si no existe
-                output_path = Path(output_file)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Guardar con metadata
-                output_data = {
-                    "metadata": {
-                        "ingestion_date": datetime.now(timezone.utc).isoformat(),
-                        "total_repositories": len(repositories),
-                        "config_version": self.config.version,
-                        "criteria": {
-                            "keywords": self.config.keywords,
-                            "languages": self.config.languages,
-                            "min_stars": self.config.min_stars,
-                            "max_inactivity_days": self.config.max_inactivity_days,
-                            "exclude_forks": self.config.exclude_forks
-                        }
+        try:
+            logger.info(f"📄 Guardando {len(repositories)} repositorios en {output_file}...")
+            
+            # Crear directorio si no existe
+            output_path = Path(output_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Convertir modelos Pydantic a dict
+            repos_dict = [repo.dict() for repo in repositories]
+            
+            # Guardar con metadata
+            output_data = {
+                "metadata": {
+                    "ingestion_date": datetime.now(timezone.utc).isoformat(),
+                    "total_repositories": len(repositories),
+                    "config_version": self.config.version,
+                    "incremental_mode": self.incremental,
+                    "criteria": {
+                        "keywords": self.config.keywords,
+                        "languages": self.config.languages,
+                        "min_stars": self.config.min_stars,
+                        "max_inactivity_days": self.config.max_inactivity_days,
+                        "exclude_forks": self.config.exclude_forks
                     },
-                    "repositories": repositories
-                }
-                
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    json.dump(output_data, f, indent=2, ensure_ascii=False, default=str)
-                
-                logger.info(f"✓ {len(repositories)} repositorios guardados en {output_file}")
-                
-            except Exception as e:
-                logger.error(f"Error al guardar en JSON: {e}")
-        
-        self.stats["total_saved"] = saved_count if save_to_db else len(repositories)
+                    "statistics": {
+                        "repositories_inserted": self.stats["repositories_inserted"],
+                        "repositories_updated": self.stats["repositories_updated"],
+                        "relations_created": self.stats["relations_created"],
+                        "validation_errors": self.stats["validation_errors"]
+                    }
+                },
+                "repositories": repos_dict
+            }
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False, default=str)
+            
+            logger.info(f"✅ Repositorios guardados en {output_file}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error al guardar en JSON: {e}")
     
-    def _generate_report(self, repositories: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _generate_report(
+        self,
+        repositories: List[Repository],
+        validation_errors: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         """
-        Genera un reporte completo del proceso de ingesta.
+        Genera un reporte completo del proceso de ingesta con todas las métricas.
         
         Args:
-            repositories: Lista de repositorios procesados
+            repositories: Lista de repositorios validados
+            validation_errors: Lista de errores de validación
             
         Returns:
             Diccionario con el reporte completo
@@ -444,27 +561,51 @@ class IngestionEngine:
         # Estadísticas por lenguaje
         language_stats = {}
         for repo in repositories:
-            lang = repo.get("primaryLanguage", {}).get("name", "Unknown")
-            language_stats[lang] = language_stats.get(lang, 0) + 1
+            # primary_language es un objeto Language, extraer el nombre
+            lang_name = "Unknown"
+            if repo.primary_language:
+                lang_name = repo.primary_language.name if hasattr(repo.primary_language, 'name') else str(repo.primary_language)
+            language_stats[lang_name] = language_stats.get(lang_name, 0) + 1
         
-        # Estadísticas de estrellas
-        star_counts = [repo.get("stargazerCount", 0) for repo in repositories]
+        # Estadísticas de estrellas (atributo correcto: stargazer_count)
+        star_counts = [repo.stargazer_count or 0 for repo in repositories]
         avg_stars = sum(star_counts) / len(star_counts) if star_counts else 0
+        
+        # Calcular tasa de persistencia
+        total_persisted = self.stats["repositories_inserted"] + self.stats["repositories_updated"]
+        persistence_rate = (total_persisted / len(repositories) * 100) if repositories else 0
         
         report = {
             "summary": {
                 "total_found": self.stats["total_found"],
                 "total_filtered": self.stats["total_filtered"],
-                "total_saved": self.stats["total_saved"],
+                "validation_success": self.stats["validation_success"],
+                "validation_errors": self.stats["validation_errors"],
+                "repositories_inserted": self.stats["repositories_inserted"],
+                "repositories_updated": self.stats["repositories_updated"],
+                "relations_created": self.stats["relations_created"],
                 "success_rate": f"{(self.stats['total_filtered'] / self.stats['total_found'] * 100):.1f}%" if self.stats["total_found"] > 0 else "0%",
-                "duration_seconds": duration
+                "persistence_rate": f"{persistence_rate:.1f}%",
+                "duration_seconds": duration,
+                "incremental_mode": self.incremental
+            },
+            "timing": {
+                "extraction": f"{self.stats['time_extraction']:.2f}s",
+                "filtering": f"{self.stats['time_filtering']:.2f}s",
+                "validation": f"{self.stats['time_validation']:.2f}s",
+                "persistence": f"{self.stats['time_persistence']:.2f}s",
+                "total": f"{duration:.2f}s" if duration else "N/A"
             },
             "filtering": {
-                "rejected_by_fork": self.stats["filtered_by_fork"],
-                "rejected_by_stars": self.stats["filtered_by_stars"],
-                "rejected_by_language": self.stats["filtered_by_language"],
+                "rejected_by_archived": self.stats["filtered_by_archived"],
+                "rejected_by_no_description": self.stats["filtered_by_no_description"],
+                "rejected_by_minimal_project": self.stats["filtered_by_minimal_project"],
                 "rejected_by_inactivity": self.stats["filtered_by_inactivity"],
-                "rejected_by_keywords": self.stats["filtered_by_keywords"]
+                "rejected_by_fork": self.stats["filtered_by_fork"],
+                "rejected_by_keywords": self.stats["filtered_by_keywords"],
+                "rejected_by_language": self.stats["filtered_by_language"],
+                "rejected_by_stars": self.stats["filtered_by_stars"],
+                "rejected_by_community_engagement": self.stats["filtered_by_community_engagement"]
             },
             "statistics": {
                 "languages": language_stats,
@@ -472,29 +613,55 @@ class IngestionEngine:
                 "max_stars": max(star_counts) if star_counts else 0,
                 "min_stars": min(star_counts) if star_counts else 0
             },
-            "repositories": repositories
+            "errors": {
+                "validation_errors": len(validation_errors),
+                "sample_errors": validation_errors[:5] if validation_errors else []
+            }
         }
         
         # Log del reporte
         logger.info("\n" + "=" * 80)
-        logger.info("REPORTE DE INGESTA")
+        logger.info("📊 REPORTE DE INGESTA")
         logger.info("=" * 80)
-        logger.info(f"Repositorios encontrados: {report['summary']['total_found']}")
-        logger.info(f"Repositorios válidos: {report['summary']['total_filtered']}")
-        logger.info(f"Tasa de éxito: {report['summary']['success_rate']}")
-        logger.info(f"Duración: {duration:.1f}s" if duration else "N/A")
-        logger.info(f"\nDistribución por lenguaje:")
-        for lang, count in sorted(language_stats.items(), key=lambda x: x[1], reverse=True):
-            logger.info(f"  - {lang}: {count}")
+        logger.info(f"\n🔍 Extracción:")
+        logger.info(f"  • Repositorios encontrados: {report['summary']['total_found']}")
+        logger.info(f"  • Tiempo: {report['timing']['extraction']}")
+        
+        logger.info(f"\n🔍 Filtrado:")
+        logger.info(f"  • Repositorios válidos: {report['summary']['total_filtered']}")
+        logger.info(f"  • Tasa de aceptación: {report['summary']['success_rate']}")
+        logger.info(f"  • Tiempo: {report['timing']['filtering']}")
+        
+        logger.info(f"\n✔️  Validación:")
+        logger.info(f"  • Validaciones exitosas: {report['summary']['validation_success']}")
+        logger.info(f"  • Errores de validación: {report['summary']['validation_errors']}")
+        logger.info(f"  • Tiempo: {report['timing']['validation']}")
+        
+        logger.info(f"\n💾 Persistencia:")
+        logger.info(f"  • Repositorios nuevos: {report['summary']['repositories_inserted']}")
+        logger.info(f"  • Repositorios actualizados: {report['summary']['repositories_updated']}")
+        logger.info(f"  • Relaciones creadas: {report['summary']['relations_created']}")
+        logger.info(f"  • Tasa de persistencia: {report['summary']['persistence_rate']}")
+        logger.info(f"  • Tiempo: {report['timing']['persistence']}")
+        
+        logger.info(f"\n📈 Estadísticas:")
+        logger.info(f"  • Distribución por lenguaje:")
+        for lang, count in sorted(language_stats.items(), key=lambda x: x[1], reverse=True)[:5]:
+            logger.info(f"    - {lang}: {count}")
+        logger.info(f"  • Estrellas promedio: {report['statistics']['average_stars']}")
+        
+        logger.info(f"\n⏱️  Tiempo total: {report['timing']['total']}")
         logger.info("=" * 80)
         
         return report
 
 
-# Función helper para ejecutar ingesta rápida
+# ==================== FUNCIONES HELPER ====================
+
 def run_ingestion(
     max_results: Optional[int] = None,
-    save_to_db: bool = True,
+    incremental: bool = False,
+    batch_size: int = 50,
     save_to_json: bool = True,
     output_file: str = "ingestion_results.json"
 ) -> Dict[str, Any]:
@@ -503,17 +670,42 @@ def run_ingestion(
     
     Args:
         max_results: Número máximo de repositorios
-        save_to_db: Guardar en MongoDB
+        incremental: Si True, solo actualiza documentos modificados
+        batch_size: Tamaño de lote para operaciones bulk
         save_to_json: Guardar en JSON
         output_file: Archivo de salida
         
     Returns:
         Reporte de la ingesta
     """
-    engine = IngestionEngine()
+    engine = IngestionEngine(
+        incremental=incremental,
+        batch_size=batch_size
+    )
     return engine.run(
         max_results=max_results,
-        save_to_db=save_to_db,
         save_to_json=save_to_json,
         output_file=output_file
+    )
+
+
+def run_incremental_ingestion(
+    max_results: Optional[int] = None,
+    batch_size: int = 100
+) -> Dict[str, Any]:
+    """
+    Ejecuta una ingesta incremental (solo actualiza documentos modificados).
+    
+    Args:
+        max_results: Número máximo de repositorios
+        batch_size: Tamaño de lote (puede ser mayor en incrementales)
+        
+    Returns:
+        Reporte de la ingesta
+    """
+    return run_ingestion(
+        max_results=max_results,
+        incremental=True,
+        batch_size=batch_size,
+        save_to_json=False
     )
