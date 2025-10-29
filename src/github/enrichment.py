@@ -263,6 +263,15 @@ class EnrichmentEngine:
                 updates["merged_pull_requests_count"] = merged_count
                 self._increment_field_stat("merged_pull_requests_count")
         
+        # 18. Colaboradores completos (contributors + mentionableUsers)
+        if not repo.get("collaborators") or len(repo.get("collaborators", [])) == 0:
+            collaborators_data = self._fetch_collaborators_combined(name_with_owner)
+            if collaborators_data:
+                updates["collaborators"] = collaborators_data["collaborators"]
+                updates["collaborators_count"] = collaborators_data["count"]
+                self._increment_field_stat("collaborators")
+                self._increment_field_stat("collaborators_count")
+        
         # Actualizar en MongoDB si hay cambios
         if updates:
             updates["updated_at"] = datetime.now()
@@ -872,57 +881,60 @@ class EnrichmentEngine:
             variables = {"owner": owner, "name": name}
             result = self.graphql_client.execute_query(query, variables)
             
-            if result and "repository" in result and result["repository"]:
-                repo_data = result["repository"]
-                
-                # Code of Conduct
-                if not current_repo.get("code_of_conduct"):
-                    code_of_conduct = repo_data.get("codeOfConduct")
-                    if code_of_conduct:
-                        updates["code_of_conduct"] = {
-                            "name": code_of_conduct.get("name"),
-                            "url": code_of_conduct.get("url")
-                        }
-                
-                # Funding Links
-                if not current_repo.get("funding_links") or len(current_repo.get("funding_links", [])) == 0:
-                    funding_links = repo_data.get("fundingLinks", [])
-                    if funding_links:
-                        updates["funding_links"] = [
-                            {
-                                "platform": link.get("platform"),
-                                "url": link.get("url")
+            # El resultado viene dentro de "data"
+            if result:
+                data = result.get("data", result)  # Compatibilidad con ambos formatos
+                if data and "repository" in data and data["repository"]:
+                    repo_data = data["repository"]
+                    
+                    # Code of Conduct
+                    if not current_repo.get("code_of_conduct"):
+                        code_of_conduct = repo_data.get("codeOfConduct")
+                        if code_of_conduct:
+                            updates["code_of_conduct"] = {
+                                "name": code_of_conduct.get("name"),
+                                "url": code_of_conduct.get("url")
                             }
-                            for link in funding_links
-                        ]
-                
-                # Discussions count
-                if current_repo.get("discussions_count", 0) == 0:
-                    discussions = repo_data.get("discussionCategories", {}).get("totalCount", 0)
-                    if discussions > 0:
-                        updates["discussions_count"] = discussions
-                
-                # Projects enabled
-                if current_repo.get("has_projects_enabled") is None:
-                    has_projects = repo_data.get("hasProjectsEnabled", False)
-                    updates["has_projects_enabled"] = has_projects
-                
-                # Vulnerability alerts count
-                if current_repo.get("vulnerability_alerts_count", 0) == 0:
-                    vuln_alerts = repo_data.get("vulnerabilityAlerts", {}).get("totalCount", 0)
-                    if vuln_alerts > 0:
-                        updates["vulnerability_alerts_count"] = vuln_alerts
-                
-                # Security policy enabled
-                if current_repo.get("is_security_policy_enabled") is None:
-                    security_policy = repo_data.get("isSecurityPolicyEnabled", False)
-                    updates["is_security_policy_enabled"] = security_policy
-                
-                # Merged pull requests count
-                if current_repo.get("merged_pull_requests_count", 0) == 0:
-                    merged_prs = repo_data.get("mergedPullRequests", {}).get("totalCount", 0)
-                    if merged_prs > 0:
-                        updates["merged_pull_requests_count"] = merged_prs
+                    
+                    # Funding Links
+                    if not current_repo.get("funding_links") or len(current_repo.get("funding_links", [])) == 0:
+                        funding_links = repo_data.get("fundingLinks", [])
+                        if funding_links:
+                            updates["funding_links"] = [
+                                {
+                                    "platform": link.get("platform"),
+                                    "url": link.get("url")
+                                }
+                                for link in funding_links
+                            ]
+                    
+                    # Discussions count
+                    if current_repo.get("discussions_count", 0) == 0:
+                        discussions = repo_data.get("discussionCategories", {}).get("totalCount", 0)
+                        if discussions > 0:
+                            updates["discussions_count"] = discussions
+                    
+                    # Projects enabled
+                    if current_repo.get("has_projects_enabled") is None:
+                        has_projects = repo_data.get("hasProjectsEnabled", False)
+                        updates["has_projects_enabled"] = has_projects
+                    
+                    # Vulnerability alerts count
+                    if current_repo.get("vulnerability_alerts_count", 0) == 0:
+                        vuln_alerts = repo_data.get("vulnerabilityAlerts", {}).get("totalCount", 0)
+                        if vuln_alerts > 0:
+                            updates["vulnerability_alerts_count"] = vuln_alerts
+                    
+                    # Security policy enabled
+                    if current_repo.get("is_security_policy_enabled") is None:
+                        security_policy = repo_data.get("isSecurityPolicyEnabled", False)
+                        updates["is_security_policy_enabled"] = security_policy
+                    
+                    # Merged pull requests count
+                    if current_repo.get("merged_pull_requests_count", 0) == 0:
+                        merged_prs = repo_data.get("mergedPullRequests", {}).get("totalCount", 0)
+                        if merged_prs > 0:
+                            updates["merged_pull_requests_count"] = merged_prs
             
             return updates
             
@@ -959,3 +971,281 @@ class EnrichmentEngine:
         except Exception as e:
             logger.error(f"❌ Error en _fetch_merged_prs_count_rest para {name_with_owner}: {e}")
             return 0
+    
+    def _fetch_collaborators_combined(self, name_with_owner: str) -> Optional[Dict[str, Any]]:
+        """
+        Obtiene colaboradores combinando contributors (REST) y mentionableUsers (GraphQL).
+        
+        Estrategia:
+        1. Contributors: Usuarios que han hecho commits (REST API)
+        2. MentionableUsers: Usuarios que pueden ser mencionados (GraphQL)
+        3. Combinar: Marcar quiénes han hecho commits y quiénes no
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+        
+        Returns:
+            Diccionario con lista de colaboradores y conteo total
+        """
+        try:
+            # 1. Obtener contributors (REST API)
+            contributors = self._fetch_contributors_rest(name_with_owner)
+            contributors_logins = {c["login"]: c for c in contributors}
+            
+            # 2. Obtener mentionableUsers (GraphQL)
+            mentionable = self._fetch_mentionable_users_graphql(name_with_owner)
+            
+            # 3. Combinar ambas listas
+            collaborators_map = {}
+            
+            # Primero, agregar todos los contributors (tienen commits)
+            for login, contributor_data in contributors_logins.items():
+                collaborators_map[login] = {
+                    "login": login,
+                    "id": contributor_data.get("id"),
+                    "avatar_url": contributor_data.get("avatar_url"),
+                    "type": contributor_data.get("type"),
+                    "contributions": contributor_data.get("contributions", 0),
+                    "has_commits": True,
+                    "is_mentionable": login in [m["login"] for m in mentionable]
+                }
+            
+            # Luego, agregar mentionableUsers que NO están en contributors
+            for mentionable_user in mentionable:
+                login = mentionable_user["login"]
+                if login not in collaborators_map:
+                    collaborators_map[login] = {
+                        "login": login,
+                        "id": mentionable_user.get("id"),
+                        "avatar_url": mentionable_user.get("avatar_url"),
+                        "type": mentionable_user.get("type"),
+                        "contributions": 0,
+                        "has_commits": False,
+                        "is_mentionable": True
+                    }
+            
+            # Convertir a lista ordenada por contributions
+            collaborators_list = sorted(
+                collaborators_map.values(),
+                key=lambda x: x["contributions"],
+                reverse=True
+            )
+            
+            return {
+                "collaborators": collaborators_list,
+                "count": len(collaborators_list)
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_collaborators_combined para {name_with_owner}: {e}")
+            return None
+    
+    def _fetch_contributors_rest(self, name_with_owner: str, max_contributors: int = None) -> List[Dict[str, Any]]:
+        """
+        Obtiene la lista COMPLETA de contributors (usuarios que han hecho commits) desde REST API.
+        Usa paginación con Link headers para obtener TODOS los contributors, no solo los primeros 100.
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+            max_contributors: Número máximo de contributors a obtener (None = todos)
+        
+        Returns:
+            Lista de contributors
+        """
+        try:
+            url = f"https://api.github.com/repos/{name_with_owner}/contributors"
+            all_contributors = []
+            page = 1
+            per_page = 100  # Máximo permitido por REST API
+            
+            logger.info(f"🔄 Recuperando contributors para {name_with_owner}...")
+            
+            while True:
+                params = {
+                    "per_page": per_page,
+                    "anon": "false",  # Excluir usuarios anónimos
+                    "page": page
+                }
+                
+                response = requests.get(url, headers=self.rest_headers, params=params, timeout=10)
+                
+                if response.status_code != 200:
+                    logger.warning(f"⚠️  Error al obtener contributors para {name_with_owner}: {response.status_code}")
+                    break
+                
+                contributors = response.json()
+                
+                if not contributors:  # No hay más contributors
+                    break
+                
+                # Agregar contributors de esta página
+                for c in contributors:
+                    if c.get("login"):
+                        all_contributors.append({
+                            "login": c.get("login"),
+                            "id": c.get("node_id"),
+                            "avatar_url": c.get("avatar_url"),
+                            "type": c.get("type"),
+                            "contributions": c.get("contributions", 0)
+                        })
+                        
+                        # Romper si alcanzamos el límite
+                        if max_contributors and len(all_contributors) >= max_contributors:
+                            break
+                
+                logger.info(f"   Página {page}: +{len(contributors)} contributors (total: {len(all_contributors)})")
+                
+                # Si alcanzamos el límite o no hay más páginas, salir
+                if max_contributors and len(all_contributors) >= max_contributors:
+                    break
+                
+                # Verificar si hay más páginas usando Link header
+                link_header = response.headers.get("Link", "")
+                if "next" not in link_header:
+                    break
+                
+                page += 1
+                
+                # Seguridad: evitar bucles infinitos
+                if page > 100:  # Max 10,000 contributors (100 páginas * 100 contributors)
+                    logger.warning(f"⚠️  Límite de páginas alcanzado (100 páginas)")
+                    break
+            
+            logger.info(f"✅ Recuperados {len(all_contributors)} contributors para {name_with_owner}")
+            
+            return all_contributors
+                
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_contributors_rest para {name_with_owner}: {e}")
+            return []
+    
+    def _fetch_mentionable_users_graphql(self, name_with_owner: str, max_users: int = None) -> List[Dict[str, Any]]:
+        """
+        Obtiene la lista COMPLETA de mentionableUsers (usuarios que pueden ser mencionados) desde GraphQL.
+        Usa paginación con cursores para obtener TODOS los usuarios, no solo los primeros 100.
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+            max_users: Número máximo de usuarios a obtener (None = todos)
+        
+        Returns:
+            Lista de usuarios mencionables
+        """
+        try:
+            owner, name = name_with_owner.split("/")
+            
+            # Query con paginación usando cursores
+            query = """
+            query($owner: String!, $name: String!, $first: Int!, $after: String) {
+              repository(owner: $owner, name: $name) {
+                mentionableUsers(first: $first, after: $after) {
+                  totalCount
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                  nodes {
+                    id
+                    login
+                    avatarUrl
+                    name
+                    email
+                  }
+                }
+              }
+            }
+            """
+            
+            all_users = []
+            has_next_page = True
+            after_cursor = None
+            page = 1
+            per_page = 100  # Máximo permitido por GraphQL
+            
+            # Primera petición para obtener el totalCount
+            variables = {
+                "owner": owner,
+                "name": name,
+                "first": per_page,
+                "after": None
+            }
+            
+            result = self.graphql_client.execute_query(query, variables)
+            
+            if not result:
+                return []
+            
+            data = result.get("data", result)
+            if not data or "repository" not in data:
+                return []
+            
+            repo_data = data["repository"]
+            mentionable_data = repo_data.get("mentionableUsers", {})
+            total_count = mentionable_data.get("totalCount", 0)
+            
+            logger.info(f"📊 Total de mentionableUsers para {name_with_owner}: {total_count}")
+            
+            # Si max_users está definido y es menor que el total, limitamos
+            target_count = min(max_users, total_count) if max_users else total_count
+            
+            logger.info(f"� Recuperando {target_count} mentionableUsers mediante paginación...")
+            
+            # Iterar paginación hasta obtener todos los usuarios
+            while has_next_page and len(all_users) < target_count:
+                variables = {
+                    "owner": owner,
+                    "name": name,
+                    "first": per_page,
+                    "after": after_cursor
+                }
+                
+                result = self.graphql_client.execute_query(query, variables)
+                
+                if not result:
+                    break
+                
+                data = result.get("data", result)
+                if not data or "repository" not in data:
+                    break
+                
+                repo_data = data["repository"]
+                mentionable_data = repo_data.get("mentionableUsers", {})
+                
+                users = mentionable_data.get("nodes", [])
+                page_info = mentionable_data.get("pageInfo", {})
+                
+                # Agregar usuarios de esta página
+                for u in users:
+                    if u.get("login"):
+                        all_users.append({
+                            "login": u.get("login"),
+                            "id": u.get("id"),
+                            "avatar_url": u.get("avatarUrl"),
+                            "name": u.get("name"),
+                            "email": u.get("email"),
+                            "type": "User"  # GraphQL no devuelve type, asumimos User
+                        })
+                        
+                        # Romper si alcanzamos el límite
+                        if max_users and len(all_users) >= max_users:
+                            break
+                
+                # Actualizar paginación
+                has_next_page = page_info.get("hasNextPage", False)
+                after_cursor = page_info.get("endCursor")
+                
+                logger.info(f"   Página {page}: +{len(users)} usuarios (total: {len(all_users)}/{target_count})")
+                page += 1
+                
+                # Seguridad: evitar bucles infinitos
+                if page > 100:  # Max 10,000 usuarios (100 páginas * 100 usuarios)
+                    logger.warning(f"⚠️  Límite de páginas alcanzado (100 páginas)")
+                    break
+            
+            logger.info(f"✅ Recuperados {len(all_users)} mentionableUsers para {name_with_owner}")
+            
+            return all_users
+            
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_mentionable_users_graphql para {name_with_owner}: {e}")
+            return []
