@@ -1,0 +1,234 @@
+{
+  "metadata": {
+    "ingestion_date": "2025-10-29T15:09:06.440925+00:00",
+    "total_repositories": 1,
+    "config_version": "1.0",
+    "incremental_mode": false,
+    "criteria": {
+      "keywords": [
+        "quantum",
+        "qiskit",
+        "braket",
+        "cirq",
+        "pennylane",
+        "quantum computing",
+        "quantum algorithms",
+        "quantum machine learning",
+        "qml",
+        "qubit",
+        "quantum simulator",
+        "quantum circuit"
+      ],
+      "languages": [
+        "Python",
+        "C++",
+        "Q#",
+        "Rust",
+        "Julia",
+        "JavaScript"
+      ],
+      "min_stars": 10,
+      "max_inactivity_days": 365,
+      "exclude_forks": true
+    },
+    "statistics": {
+      "repositories_inserted": 1,
+      "repositories_updated": 0,
+      "relations_created": 0,
+      "validation_errors": 0
+    }
+  },
+  "repositories": [
+    {
+      "id": "MDEwOlJlcG9zaXRvcnk4MzgyMTY2OQ==",
+      "node_id": null,
+      "name": "qiskit",
+      "name_with_owner": "Qiskit/qiskit",
+      "full_name": null,
+      "description": "Qiskit is an open-source SDK for working with quantum computers at the level of extended quantum circuits, operators, and primitives.",
+      "url": "https://github.com/Qiskit/qiskit",
+      "homepage_url": "https://www.ibm.com/quantum/qiskit",
+      "ssh_url": null,
+      "clone_url": null,
+      "mirror_url": null,
+      "owner": {
+        "id": "MDEyOk9yZ2FuaXphdGlvbjMwNjk2OTg3",
+        "login": "Qiskit",
+        "avatar_url": "https://avatars.githubusercontent.com/u/30696987?v=4",
+        "url": "https://github.com/Qiskit",
+        "type": null
+      },
+      "organization_id": null,
+      "created_at": "2017-03-03 17:02:42+00:00",
+      "updated_at": "2025-10-29 13:04:16+00:00",
+      "pushed_at": "2025-10-29 15:01:50+00:00",
+      "ingested_at": "2025-10-29 15:09:06.425626",
+      "primary_language": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": [
+        {
+          "node": {
+            "name": "Python",
+            "color": null
+          },
+          "size": 12583040
+        },
+        {
+          "node": {
+            "name": "Makefile",
+            "color": null
+          },
+          "size": 5251
+        },
+        {
+          "node": {
+            "name": "Jupyter Notebook",
+            "color": null
+          },
+          "size": 1320
+        },
+        {
+          "node": {
+            "name": "OpenQASM",
+            "color": null
+          },
+          "size": 22803
+        },
+        {
+          "node": {
+            "name": "Shell",
+            "color": null
+          },
+          "size": 9615
+        },
+        {
+          "node": {
+            "name": "Rust",
+            "color": null
+          },
+          "size": 4037913
+        },
+        {
+          "node": {
+            "name": "CMake",
+            "color": null
+          },
+          "size": 3230
+        },
+        {
+          "node": {
+            "name": "C",
+            "color": null
+          },
+          "size": 182212
+        },
+        {
+          "node": {
+            "name": "C++",
+            "color": null
+          },
+          "size": 1852
+        }
+      ],
+      "languages_count": 0,
+      "repository_topics": [
+        {
+          "topic": {
+            "name": "quantum-computing"
+          }
+        },
+        {
+          "topic": {
+            "name": "qiskit"
+          }
+        },
+        {
+          "topic": {
+            "name": "sdk"
+          }
+        },
+        {
+          "topic": {
+            "name": "quantum-programming-language"
+          }
+        },
+        {
+          "topic": {
+            "name": "quantum-circuit"
+          }
+        },
+        {
+          "topic": {
+            "name": "quantum"
+          }
+        },
+        {
+          "topic": {
+            "name": "python"
+          }
+        }
+      ],
+      "topics_count": 0,
+      "stargazer_count": 6605,
+      "fork_count": 2661,
+      "watchers_count": 224,
+      "subscribers_count": 0,
+      "disk_usage": 158147,
+      "commits_count": 9817,
+      "branches_count": 0,
+      "tags_count": 0,
+      "releases_count": 0,
+      "has_issues_enabled": true,
+      "issues_count": 0,
+      "open_issues_count": 936,
+      "closed_issues_count": 4372,
+      "pull_requests_count": 9863,
+      "open_pull_requests_count": 0,
+      "closed_pull_requests_count": 0,
+      "merged_pull_requests_count": 0,
+      "has_projects_enabled": true,
+      "has_wiki_enabled": true,
+      "projects_count": 0,
+      "is_private": false,
+      "is_fork": false,
+      "is_archived": false,
+      "is_disabled": false,
+      "is_locked": false,
+      "is_mirror": false,
+      "is_template": false,
+      "is_security_policy_enabled": false,
+      "has_discussions_enabled": false,
+      "has_sponsorships_enabled": false,
+      "discussions_count": 0,
+      "license_info": {
+        "key": null,
+        "name": "Apache License 2.0",
+        "spdx_id": "Apache-2.0",
+        "url": null,
+        "nickname": null
+      },
+      "default_branch_ref_name": "main",
+      "parent_id": null,
+      "parent_name_with_owner": null,
+      "collaborators": [],
+      "collaborators_count": 0,
+      "recent_commits": [],
+      "last_commit_date": null,
+      "recent_issues": [],
+      "recent_pull_requests": [],
+      "latest_release": null,
+      "releases": [],
+      "vulnerability_alerts_count": 0,
+      "vulnerabilities": [],
+      "dependency_graph_manifests": [],
+      "readme_text": null,
+      "has_readme": false,
+      "network_count": 2661,
+      "code_of_conduct": null,
+      "funding_links": [],
+      "custom_properties": {}
+    }
+  ]
+}
