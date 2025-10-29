@@ -4,6 +4,10 @@ Completa información faltante usando GraphQL y REST API.
 """
 import sys
 import os
+
+# Agregar el directorio raíz al path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from dotenv import load_dotenv
 
 # Agregar el directorio raíz al path
