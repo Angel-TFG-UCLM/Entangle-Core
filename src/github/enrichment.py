@@ -242,6 +242,27 @@ class EnrichmentEngine:
                 self._increment_field_stat("license_info.key")
                 self._increment_field_stat("license_info.url")
         
+        # 15. Campos adicionales desde REST API
+        additional_fields = self._fetch_additional_fields_rest(name_with_owner, repo)
+        if additional_fields:
+            updates.update(additional_fields)
+            for field in additional_fields.keys():
+                self._increment_field_stat(field)
+        
+        # 16. Campos adicionales desde GraphQL
+        graphql_fields = self._fetch_additional_fields_graphql(name_with_owner, repo)
+        if graphql_fields:
+            updates.update(graphql_fields)
+            for field in graphql_fields.keys():
+                self._increment_field_stat(field)
+        
+        # 17. Merged PRs count desde REST API (búsqueda)
+        if repo.get("merged_pull_requests_count", 0) == 0:
+            merged_count = self._fetch_merged_prs_count_rest(name_with_owner)
+            if merged_count > 0:
+                updates["merged_pull_requests_count"] = merged_count
+                self._increment_field_stat("merged_pull_requests_count")
+        
         # Actualizar en MongoDB si hay cambios
         if updates:
             updates["updated_at"] = datetime.now()
@@ -736,3 +757,205 @@ class EnrichmentEngine:
         except Exception as e:
             logger.error(f"❌ Error en _fetch_license_info_rest para {name_with_owner}: {e}")
             return None
+    
+    def _fetch_additional_fields_rest(self, name_with_owner: str, current_repo: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Obtiene campos adicionales desde la REST API que no están en GraphQL.
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+            current_repo: Documento actual del repositorio
+        
+        Returns:
+            Diccionario con campos adicionales a actualizar
+        """
+        updates = {}
+        
+        try:
+            url = f"https://api.github.com/repos/{name_with_owner}"
+            response = requests.get(url, headers=self.rest_headers, timeout=10)
+            
+            if response.status_code != 200:
+                logger.warning(f"⚠️  Error al obtener campos adicionales para {name_with_owner}: {response.status_code}")
+                return updates
+            
+            data = response.json()
+            
+            # subscribers_count (watchers reales)
+            if current_repo.get("subscribers_count", 0) == 0:
+                subscribers = data.get("subscribers_count", 0)
+                if subscribers > 0:
+                    updates["subscribers_count"] = subscribers
+            
+            # network_count (forks totales en toda la red)
+            if current_repo.get("network_count", 0) == 0:
+                network = data.get("network_count", 0)
+                if network > 0:
+                    updates["network_count"] = network
+            
+            # has_projects_enabled
+            if current_repo.get("has_projects_enabled") is None:
+                has_projects = data.get("has_projects", False)
+                updates["has_projects_enabled"] = has_projects
+            
+            # has_discussions_enabled
+            if current_repo.get("has_discussions_enabled") is None:
+                has_discussions = data.get("has_discussions", False)
+                updates["has_discussions_enabled"] = has_discussions
+            
+            # Parent info (si es un fork)
+            if current_repo.get("is_fork") and not current_repo.get("parent_id"):
+                parent = data.get("parent")
+                if parent:
+                    updates["parent_id"] = parent.get("node_id")
+                    updates["parent_name_with_owner"] = parent.get("full_name")
+            
+            # Mirror URL (si es un mirror)
+            if current_repo.get("is_mirror") and not current_repo.get("mirror_url"):
+                mirror_url = data.get("mirror_url")
+                if mirror_url:
+                    updates["mirror_url"] = mirror_url
+            
+            # Security and analysis
+            security = data.get("security_and_analysis")
+            if security:
+                updates["is_security_policy_enabled"] = security.get("advanced_security", {}).get("status") == "enabled"
+            
+            return updates
+            
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_additional_fields_rest para {name_with_owner}: {e}")
+            return updates
+    
+    def _fetch_additional_fields_graphql(self, name_with_owner: str, current_repo: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Obtiene campos adicionales desde GraphQL que no están en la ingesta inicial.
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+            current_repo: Documento actual del repositorio
+        
+        Returns:
+            Diccionario con campos adicionales a actualizar
+        """
+        updates = {}
+        
+        try:
+            owner, name = name_with_owner.split("/")
+            
+            query = """
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) {
+                codeOfConduct {
+                  name
+                  url
+                }
+                fundingLinks {
+                  platform
+                  url
+                }
+                discussionCategories(first: 1) {
+                  totalCount
+                }
+                hasProjectsEnabled
+                vulnerabilityAlerts(first: 1) {
+                  totalCount
+                }
+                isSecurityPolicyEnabled
+                mergedPullRequests: pullRequests(states: MERGED) {
+                  totalCount
+                }
+              }
+            }
+            """
+            
+            variables = {"owner": owner, "name": name}
+            result = self.graphql_client.execute_query(query, variables)
+            
+            if result and "repository" in result and result["repository"]:
+                repo_data = result["repository"]
+                
+                # Code of Conduct
+                if not current_repo.get("code_of_conduct"):
+                    code_of_conduct = repo_data.get("codeOfConduct")
+                    if code_of_conduct:
+                        updates["code_of_conduct"] = {
+                            "name": code_of_conduct.get("name"),
+                            "url": code_of_conduct.get("url")
+                        }
+                
+                # Funding Links
+                if not current_repo.get("funding_links") or len(current_repo.get("funding_links", [])) == 0:
+                    funding_links = repo_data.get("fundingLinks", [])
+                    if funding_links:
+                        updates["funding_links"] = [
+                            {
+                                "platform": link.get("platform"),
+                                "url": link.get("url")
+                            }
+                            for link in funding_links
+                        ]
+                
+                # Discussions count
+                if current_repo.get("discussions_count", 0) == 0:
+                    discussions = repo_data.get("discussionCategories", {}).get("totalCount", 0)
+                    if discussions > 0:
+                        updates["discussions_count"] = discussions
+                
+                # Projects enabled
+                if current_repo.get("has_projects_enabled") is None:
+                    has_projects = repo_data.get("hasProjectsEnabled", False)
+                    updates["has_projects_enabled"] = has_projects
+                
+                # Vulnerability alerts count
+                if current_repo.get("vulnerability_alerts_count", 0) == 0:
+                    vuln_alerts = repo_data.get("vulnerabilityAlerts", {}).get("totalCount", 0)
+                    if vuln_alerts > 0:
+                        updates["vulnerability_alerts_count"] = vuln_alerts
+                
+                # Security policy enabled
+                if current_repo.get("is_security_policy_enabled") is None:
+                    security_policy = repo_data.get("isSecurityPolicyEnabled", False)
+                    updates["is_security_policy_enabled"] = security_policy
+                
+                # Merged pull requests count
+                if current_repo.get("merged_pull_requests_count", 0) == 0:
+                    merged_prs = repo_data.get("mergedPullRequests", {}).get("totalCount", 0)
+                    if merged_prs > 0:
+                        updates["merged_pull_requests_count"] = merged_prs
+            
+            return updates
+            
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_additional_fields_graphql para {name_with_owner}: {e}")
+            return updates
+    
+    def _fetch_merged_prs_count_rest(self, name_with_owner: str) -> int:
+        """
+        Obtiene el conteo de PRs mergeados usando la Search API de GitHub.
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+        
+        Returns:
+            Conteo de PRs mergeados
+        """
+        try:
+            url = "https://api.github.com/search/issues"
+            params = {
+                "q": f"repo:{name_with_owner} type:pr is:merged",
+                "per_page": 1
+            }
+            
+            response = requests.get(url, headers=self.rest_headers, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("total_count", 0)
+            else:
+                logger.warning(f"⚠️  Error al obtener PRs mergeados para {name_with_owner}: {response.status_code}")
+                return 0
+                
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_merged_prs_count_rest para {name_with_owner}: {e}")
+            return 0
