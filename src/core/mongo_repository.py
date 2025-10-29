@@ -450,11 +450,22 @@ class MongoRepository:
             # Preparar operaciones bulk
             operations = []
             for doc in documents:
-                doc_dict = self._to_dict(doc)
+                # Usar dict() en lugar de to_mongo_dict() para preservar el campo 'id'
+                if isinstance(doc, BaseModel):
+                    doc_dict = doc.dict(exclude_none=False) if hasattr(doc, 'dict') else doc.model_dump()
+                else:
+                    doc_dict = doc
+                
+                # Extraer el valor del campo único ANTES de agregar updated_at
+                unique_value = doc_dict.get(unique_field)
+                if unique_value is None:
+                    logger.warning(f"⚠️ Documento sin campo '{unique_field}', se omite del bulk_upsert")
+                    continue
+                
                 doc_dict["updated_at"] = datetime.utcnow()
                 
-                # Crear operación de upsert
-                query = {unique_field: doc_dict.get(unique_field)}
+                # Crear operación de upsert con el campo único correcto
+                query = {unique_field: unique_value}
                 update = {"$set": doc_dict}
                 operations.append(UpdateOne(query, update, upsert=True))
             

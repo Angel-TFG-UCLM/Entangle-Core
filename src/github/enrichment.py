@@ -216,6 +216,32 @@ class EnrichmentEngine:
             for field in pr_counts.keys():
                 self._increment_field_stat(field)
         
+        # 12. Campos calculables simples
+        updates.update(self._fix_simple_fields(repo))
+        
+        # 13. Owner type (REST API)
+        if not repo.get("owner", {}).get("type"):
+            owner_type = self._fetch_owner_type_rest(name_with_owner)
+            if owner_type:
+                owner = repo.get("owner", {})
+                owner["type"] = owner_type
+                updates["owner"] = owner
+                self._increment_field_stat("owner.type")
+                
+                # Si es Organization, agregar organization_id
+                if owner_type == "Organization" and not repo.get("organization_id"):
+                    updates["organization_id"] = owner.get("id")
+                    self._increment_field_stat("organization_id")
+        
+        # 14. License info completa (REST API)
+        license_info = repo.get("license_info", {})
+        if license_info and (not license_info.get("key") or not license_info.get("url")):
+            complete_license = self._fetch_license_info_rest(name_with_owner)
+            if complete_license:
+                updates["license_info"] = complete_license
+                self._increment_field_stat("license_info.key")
+                self._increment_field_stat("license_info.url")
+        
         # Actualizar en MongoDB si hay cambios
         if updates:
             updates["updated_at"] = datetime.now()
@@ -634,3 +660,79 @@ class EnrichmentEngine:
     def _increment_field_stat(self, field: str) -> None:
         """Incrementa el contador de un campo enriquecido."""
         self.stats["fields_enriched"][field] = self.stats["fields_enriched"].get(field, 0) + 1
+    
+    def _fix_simple_fields(self, repo: Dict[str, Any]) -> Dict[str, Any]:
+        """Corrige campos simples que son copias directas de otros campos."""
+        updates = {}
+        
+        # node_id es igual a id
+        if not repo.get("node_id") and repo.get("id"):
+            updates["node_id"] = repo["id"]
+            self._increment_field_stat("node_id")
+        
+        # full_name es igual a name_with_owner
+        if not repo.get("full_name") and repo.get("name_with_owner"):
+            updates["full_name"] = repo["name_with_owner"]
+            self._increment_field_stat("full_name")
+        
+        return updates
+    
+    def _fetch_owner_type_rest(self, name_with_owner: str) -> Optional[str]:
+        """
+        Obtiene el tipo de owner (User/Organization) desde la REST API.
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+        
+        Returns:
+            "User" o "Organization", o None si hay error
+        """
+        try:
+            owner_login = name_with_owner.split("/")[0]
+            url = f"https://api.github.com/users/{owner_login}"
+            
+            response = requests.get(url, headers=self.rest_headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("type")  # "User" o "Organization"
+            else:
+                logger.warning(f"⚠️  Error al obtener owner type para {owner_login}: {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_owner_type_rest para {name_with_owner}: {e}")
+            return None
+    
+    def _fetch_license_info_rest(self, name_with_owner: str) -> Optional[Dict[str, Any]]:
+        """
+        Obtiene información completa de licencia desde la REST API.
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+        
+        Returns:
+            Diccionario con todos los campos de licencia o None
+        """
+        try:
+            url = f"https://api.github.com/repos/{name_with_owner}"
+            response = requests.get(url, headers=self.rest_headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                license_data = data.get("license")
+                
+                if license_data:
+                    return {
+                        "key": license_data.get("key"),
+                        "name": license_data.get("name"),
+                        "spdx_id": license_data.get("spdx_id"),
+                        "url": license_data.get("url"),
+                        "nickname": None  # La REST API no tiene nickname
+                    }
+            else:
+                logger.warning(f"⚠️  Error al obtener licencia para {name_with_owner}: {response.status_code}")
+            
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_license_info_rest para {name_with_owner}: {e}")
+            return None
