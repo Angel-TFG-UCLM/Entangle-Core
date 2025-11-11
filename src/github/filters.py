@@ -14,6 +14,62 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Funciones helper privadas para filtros avanzados
+# ============================================================================
+
+def _get_searchable_text(repo: Dict[str, Any]) -> str:
+    """
+    Extrae texto buscable del repositorio (nombre, descripción, topics, README).
+    
+    Args:
+        repo: Repositorio del que extraer texto
+        
+    Returns:
+        Texto combinado en minúsculas
+    """
+    name = repo.get("name", "").lower()
+    description = repo.get("description") or ""
+    description = description.lower()
+    
+    # Topics
+    topics = (repo.get("repositoryTopics") or {}).get("nodes", [])
+    topic_names = [
+        (topic.get("topic") or {}).get("name", "").lower()
+        for topic in topics
+    ]
+    
+    # README (primeras 1000 caracteres para incluir más contexto)
+    readme_text = ""
+    readme_obj = repo.get("object")
+    if readme_obj:
+        readme_full = readme_obj.get("text", "")
+        readme_text = readme_full[:1000].lower() if readme_full else ""
+    
+    return f"{name} {description} {' '.join(topic_names)} {readme_text}"
+
+
+def _has_strong_keywords(text: str, keywords: List[str]) -> bool:
+    """
+    Verifica si el texto contiene keywords cuánticas fuertes.
+    
+    Args:
+        text: Texto donde buscar (debe estar en minúsculas)
+        keywords: Lista de keywords a buscar
+        
+    Returns:
+        True si encuentra al menos una keyword, False si no
+    """
+    for keyword in keywords:
+        if keyword.lower() in text:
+            return True
+    return False
+
+
+# ============================================================================
+# Clase principal de filtros
+# ============================================================================
+
 class RepositoryFilters:
     """
     Clase que agrupa todos los filtros avanzados de calidad para repositorios.
@@ -104,9 +160,9 @@ class RepositoryFilters:
             commit_count = history.get("totalCount", 0)
         
         # 2. Issues y PRs (indicadores de actividad)
-        open_issues = repo.get("openIssues", {}).get("totalCount", 0)
-        closed_issues = repo.get("closedIssues", {}).get("totalCount", 0)
-        pull_requests = repo.get("pullRequests", {}).get("totalCount", 0)
+        open_issues = (repo.get("openIssues") or {}).get("totalCount", 0)
+        closed_issues = (repo.get("closedIssues") or {}).get("totalCount", 0)
+        pull_requests = (repo.get("pullRequests") or {}).get("totalCount", 0)
         
         total_issues = open_issues + closed_issues
         
@@ -233,9 +289,9 @@ class RepositoryFilters:
         description = description.lower()
         
         # Topics
-        topics = repo.get("repositoryTopics", {}).get("nodes", [])
+        topics = (repo.get("repositoryTopics") or {}).get("nodes", [])
         topic_names = [
-            topic.get("topic", {}).get("name", "").lower()
+            (topic.get("topic") or {}).get("name", "").lower()
             for topic in topics
         ]
         
@@ -263,14 +319,26 @@ class RepositoryFilters:
     @staticmethod
     def has_valid_language(
         repo: Dict[str, Any],
-        valid_languages: List[str]
+        valid_languages: List[str],
+        strong_quantum_keywords: Optional[List[str]] = None
     ) -> bool:
         """
-        Verifica que el lenguaje principal esté en la lista de lenguajes válidos.
+        Verifica que el repositorio use lenguajes válidos (con lógica inteligente).
+        
+        Estrategia de validación:
+        1. Si el lenguaje principal está en valid_languages → ACEPTA
+        2. Si algún lenguaje secundario está en valid_languages → ACEPTA
+        3. Si contiene keywords cuánticas fuertes (override) → ACEPTA
+        4. En cualquier otro caso → RECHAZA
+        
+        Esto permite capturar repos con Jupyter Notebook, HTML, TypeScript, etc.
+        como lenguaje principal, pero que contienen código cuántico en Python/C++
+        en lenguajes secundarios o tienen fuerte contenido cuántico.
         
         Args:
             repo: Repositorio a evaluar
             valid_languages: Lista de lenguajes válidos
+            strong_quantum_keywords: Keywords cuánticas fuertes que activan override
             
         Returns:
             True si el lenguaje es válido, False si no lo es
@@ -278,25 +346,73 @@ class RepositoryFilters:
         if not valid_languages:
             return True
         
+        # Keywords cuánticas fuertes por defecto (frameworks principales)
+        if strong_quantum_keywords is None:
+            strong_quantum_keywords = [
+                "qiskit", "cirq", "pennylane", "braket", "pyquil",
+                "quantum algorithm", "quantum circuit", "quantum gate",
+                "vqe", "qaoa", "grover", "shor"
+            ]
+        
+        # 1. Verificar lenguaje principal
         primary_language = repo.get("primaryLanguage")
         
         if not primary_language:
+            # Sin lenguaje principal: verificar si tiene keywords fuertes
+            searchable_text = _get_searchable_text(repo)
+            if _has_strong_keywords(searchable_text, strong_quantum_keywords):
+                logger.debug(
+                    f"Repo aceptado (sin lenguaje principal pero con keywords cuánticas fuertes): "
+                    f"{repo.get('nameWithOwner')}"
+                )
+                return True
+            
             logger.debug(
                 f"Repo rechazado (sin lenguaje principal): "
                 f"{repo.get('nameWithOwner')}"
             )
             return False
         
-        language_name = primary_language.get("name")
+        primary_lang_name = primary_language.get("name")
         
-        if language_name not in valid_languages:
+        # Si lenguaje principal es válido → aceptar directamente
+        if primary_lang_name in valid_languages:
+            return True
+        
+        # 2. Verificar lenguajes secundarios
+        languages_edges = (repo.get("languages") or {}).get("edges", [])
+        secondary_languages = [
+            (edge.get("node") or {}).get("name")
+            for edge in languages_edges
+            if edge.get("node")
+        ]
+        
+        for lang in secondary_languages:
+            if lang in valid_languages:
+                logger.debug(
+                    f"Repo aceptado (lenguaje secundario válido {lang}, "
+                    f"aunque lenguaje principal es {primary_lang_name}): "
+                    f"{repo.get('nameWithOwner')}"
+                )
+                return True
+        
+        # 3. Override por keywords cuánticas fuertes
+        searchable_text = _get_searchable_text(repo)
+        if _has_strong_keywords(searchable_text, strong_quantum_keywords):
             logger.debug(
-                f"Repo rechazado (lenguaje {language_name} no permitido): "
+                f"Repo aceptado (override por keywords cuánticas fuertes, "
+                f"aunque lenguaje principal es {primary_lang_name}): "
                 f"{repo.get('nameWithOwner')}"
             )
-            return False
+            return True
         
-        return True
+        # 4. Rechazar si no cumple ningún criterio
+        logger.debug(
+            f"Repo rechazado (lenguaje principal {primary_lang_name} no válido, "
+            f"sin lenguajes secundarios válidos: {secondary_languages}): "
+            f"{repo.get('nameWithOwner')}"
+        )
+        return False
     
     @staticmethod
     def is_not_archived(repo: Dict[str, Any]) -> bool:
@@ -367,7 +483,7 @@ class RepositoryFilters:
         Returns:
             True si tiene engagement, False si no
         """
-        watchers = repo.get("watchers", {}).get("totalCount", 0)
+        watchers = (repo.get("watchers") or {}).get("totalCount", 0)
         forks = repo.get("forkCount", 0)
         
         # Criterio flexible: cumplir al menos uno de los dos
@@ -443,12 +559,23 @@ def filter_by_keywords(
 
 def filter_by_language(
     repositories: List[Dict[str, Any]],
-    valid_languages: List[str]
+    valid_languages: List[str],
+    strong_quantum_keywords: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
-    """Filtra repositorios por lenguaje."""
+    """
+    Filtra repositorios por lenguaje (con lógica inteligente).
+    
+    Args:
+        repositories: Lista de repositorios a filtrar
+        valid_languages: Lenguajes válidos
+        strong_quantum_keywords: Keywords cuánticas fuertes para override
+        
+    Returns:
+        Repositorios que pasan el filtro de lenguaje
+    """
     return [
         repo for repo in repositories
-        if RepositoryFilters.has_valid_language(repo, valid_languages)
+        if RepositoryFilters.has_valid_language(repo, valid_languages, strong_quantum_keywords)
     ]
 
 
@@ -478,6 +605,24 @@ def apply_all_filters(
     """
     logger.info(f"Aplicando filtros avanzados a {len(repositories)} repositorios...")
     
+    # Derivar keywords cuánticas fuertes de la lista completa
+    # (frameworks y conceptos clave que indican software cuántico)
+    strong_keywords = [
+        kw for kw in keywords
+        if any(framework in kw.lower() for framework in [
+            "qiskit", "cirq", "pennylane", "braket", "pyquil",
+            "algorithm", "circuit", "gate", "vqe", "qaoa",
+            "grover", "shor", "quantum computing", "quantum programming"
+        ])
+    ]
+    
+    # Si no hay keywords fuertes derivadas, usar una lista mínima por defecto
+    if not strong_keywords:
+        strong_keywords = [
+            "qiskit", "cirq", "pennylane", "braket",
+            "quantum algorithm", "quantum circuit"
+        ]
+    
     # Aplicar filtros en cascada
     filtered = repositories
     
@@ -485,33 +630,37 @@ def apply_all_filters(
     filtered = [r for r in filtered if RepositoryFilters.is_not_archived(r)]
     logger.info(f"  Después de filtro archivados: {len(filtered)}")
     
-    # 2. Actividad reciente
-    filtered = filter_by_activity(filtered, max_inactivity_days)
-    logger.info(f"  Después de filtro actividad: {len(filtered)}")
-    
-    # 3. Forks válidos
-    filtered = filter_by_fork_validity(filtered)
-    logger.info(f"  Después de filtro forks: {len(filtered)}")
-    
-    # 4. Documentación
+    # 2. Documentación (mover antes de actividad para rechazar rápido proyectos sin docs)
     filtered = filter_by_documentation(filtered)
     logger.info(f"  Después de filtro documentación: {len(filtered)}")
     
-    # 5. Tamaño mínimo
+    # 3. Tamaño mínimo
     filtered = filter_by_project_size(filtered, min_commits, min_size_kb)
     logger.info(f"  Después de filtro tamaño: {len(filtered)}")
+    
+    # 4. Actividad reciente
+    filtered = filter_by_activity(filtered, max_inactivity_days)
+    logger.info(f"  Después de filtro actividad: {len(filtered)}")
+    
+    # 5. Forks válidos
+    filtered = filter_by_fork_validity(filtered)
+    logger.info(f"  Después de filtro forks: {len(filtered)}")
     
     # 6. Keywords
     filtered = filter_by_keywords(filtered, keywords)
     logger.info(f"  Después de filtro keywords: {len(filtered)}")
     
-    # 7. Lenguaje
-    filtered = filter_by_language(filtered, valid_languages)
+    # 7. Lenguaje (con lógica inteligente que usa strong_keywords para override)
+    filtered = filter_by_language(filtered, valid_languages, strong_keywords)
     logger.info(f"  Después de filtro lenguaje: {len(filtered)}")
     
     # 8. Estrellas
     filtered = [r for r in filtered if RepositoryFilters.has_minimum_stars(r, min_stars)]
     logger.info(f"  Después de filtro estrellas: {len(filtered)}")
+    
+    # 9. Community engagement
+    filtered = [r for r in filtered if RepositoryFilters.has_community_engagement(r)]
+    logger.info(f"  Después de filtro engagement: {len(filtered)}")
     
     logger.info(f"Filtrado completo: {len(filtered)}/{len(repositories)} repositorios válidos")
     

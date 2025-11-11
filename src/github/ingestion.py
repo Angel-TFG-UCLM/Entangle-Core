@@ -548,52 +548,78 @@ class IngestionEngine:
         filtered = []
         
         for repo in repositories:
+            repo_name = repo.get("nameWithOwner", "unknown")
+            repo_url = repo.get("url", "")
+            
             # 1. Filtro: No archivado
             if not RepositoryFilters.is_not_archived(repo):
                 self.stats["filtered_by_archived"] += 1
+                logger.debug(f"❌ RECHAZADO [Archivado]: {repo_name} | {repo_url}")
                 continue
             
             # 2. Filtro: Tiene descripción o README
             if not RepositoryFilters.has_description(repo):
                 self.stats["filtered_by_no_description"] += 1
+                logger.debug(f"❌ RECHAZADO [Sin descripción/README]: {repo_name} | {repo_url}")
                 continue
             
             # 3. Filtro: Tamaño mínimo (commits y KB)
             if not RepositoryFilters.is_minimal_project(repo, min_commits=10, min_size_kb=10):
                 self.stats["filtered_by_minimal_project"] += 1
+                default_branch = repo.get("defaultBranchRef") or {}
+                target = default_branch.get("target") or {}
+                history = target.get("history") or {}
+                commits = history.get("totalCount", 0)
+                size_kb = repo.get("diskUsage", 0)
+                logger.debug(f"❌ RECHAZADO [Tamaño mínimo: {commits} commits, {size_kb} KB]: {repo_name} | {repo_url}")
                 continue
             
             # 4. Filtro: Actividad reciente
             if not RepositoryFilters.is_active(repo, self.config.max_inactivity_days):
                 self.stats["filtered_by_inactivity"] += 1
+                last_update = repo.get("updatedAt", "unknown")
+                logger.debug(f"❌ RECHAZADO [Inactivo desde {last_update}]: {repo_name} | {repo_url}")
                 continue
             
             # 5. Filtro: Fork válido (si es fork, debe tener contribuciones propias)
             if not RepositoryFilters.is_valid_fork(repo):
                 self.stats["filtered_by_fork"] += 1
+                logger.debug(f"❌ RECHAZADO [Fork sin contribuciones propias]: {repo_name} | {repo_url}")
                 continue
             
             # 6. Filtro: Keywords cuánticas
             if not RepositoryFilters.matches_keywords(repo, self.config.keywords):
                 self.stats["filtered_by_keywords"] += 1
+                logger.debug(f"❌ RECHAZADO [Sin keywords cuánticas]: {repo_name} | {repo_url}")
                 continue
             
             # 7. Filtro: Lenguaje válido
             if not RepositoryFilters.has_valid_language(repo, self.config.languages):
                 self.stats["filtered_by_language"] += 1
+                primary_lang = (repo.get("primaryLanguage") or {}).get("name", "unknown")
+                secondary_langs = [(edge.get("node") or {}).get("name") for edge in (repo.get("languages") or {}).get("edges", [])]
+                logger.debug(f"❌ RECHAZADO [Lenguaje: primario={primary_lang}, secundarios={secondary_langs}]: {repo_name} | {repo_url}")
                 continue
             
             # 8. Filtro: Estrellas mínimas
             if not RepositoryFilters.has_minimum_stars(repo, self.config.min_stars):
                 self.stats["filtered_by_stars"] += 1
+                stars = repo.get("stargazerCount", 0)
+                logger.debug(f"❌ RECHAZADO [Pocas estrellas: {stars}]: {repo_name} | {repo_url}")
                 continue
             
             # 9. Filtro: Engagement de comunidad (opcional pero recomendado)
             if not RepositoryFilters.has_community_engagement(repo, min_watchers=3, min_forks=1):
                 self.stats["filtered_by_community_engagement"] += 1
+                watchers = (repo.get("watchers") or {}).get("totalCount", 0)
+                forks = repo.get("forkCount", 0)
+                logger.debug(f"❌ RECHAZADO [Bajo engagement: {watchers} watchers, {forks} forks]: {repo_name} | {repo_url}")
                 continue
             
             # Si pasa todos los filtros, agregarlo
+            stars = repo.get("stargazerCount", 0)
+            primary_lang = (repo.get("primaryLanguage") or {}).get("name", "unknown")
+            logger.debug(f"✅ ACEPTADO [{primary_lang}, {stars}⭐]: {repo_name} | {repo_url}")
             filtered.append(repo)
         
         logger.info(f"Filtrado completado: {len(filtered)} repositorios válidos")
