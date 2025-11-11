@@ -91,6 +91,35 @@ Sistema completo de ingesta de repositorios de software cuántico desde GitHub c
 - **Lenguajes principales**: Python (90%+), C++, Julia, Rust
 - **Ejemplos**: Qiskit (6561⭐), Cirq (4724⭐), PennyLane (2838⭐)
 
+### 🚀 Nueva característica: Segmentación Dinámica
+
+**Problema**: GitHub Search API limita las búsquedas a 1,000 resultados máximo.
+
+**Solución**: Sistema de segmentación dinámica que divide la búsqueda en múltiples consultas específicas:
+- ✅ Rangos de estrellas configurables (ej: 10-49, 50-99, 100-499...)
+- ✅ Segmentación por años de creación (2015-2025)
+- ✅ Control automático de rate limit
+- ✅ Deduplicación automática
+- ✅ Capacidad de obtener **decenas de miles** de repositorios
+
+**Configuración**:
+```json
+{
+  "enable_segmentation": true,
+  "segmentation": {
+    "stars": [[10, 49], [50, 99], [100, 499], [500, 999], [1000, 4999], [5000, 999999]],
+    "created_years": [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+  }
+}
+```
+
+**Uso**:
+```bash
+python scripts/run_ingestion_segmented.py
+```
+
+**Documentación completa**: Ver [`docs/SEGMENTACION_DINAMICA.md`](docs/SEGMENTACION_DINAMICA.md)
+
 ---
 
 ## 🧑‍💻 Autor

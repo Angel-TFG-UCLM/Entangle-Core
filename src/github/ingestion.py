@@ -210,6 +210,7 @@ class IngestionEngine:
     def _search_repositories(self, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Busca repositorios usando el cliente GraphQL.
+        Si la segmentación está habilitada, ejecuta búsquedas segmentadas.
         
         Args:
             max_results: Número máximo de repositorios a obtener
@@ -220,18 +221,141 @@ class IngestionEngine:
         logger.info("🔎 Ejecutando búsqueda en GitHub...")
         
         try:
-            # Búsqueda con paginación automática
-            result = self.client.search_repositories_all_pages(
-                config_criteria=self.config,
-                max_results=max_results
-            )
-            
-            logger.debug(f"Búsqueda completada: {len(result)} repositorios obtenidos")
-            return result
+            # Verificar si está habilitada la segmentación
+            if self.config.enable_segmentation and self.config.segmentation:
+                logger.info("📊 Modo de segmentación dinámica activado")
+                return self._search_with_segmentation(max_results)
+            else:
+                # Búsqueda tradicional con paginación automática
+                result = self.client.search_repositories_all_pages(
+                    config_criteria=self.config,
+                    max_results=max_results
+                )
+                
+                logger.debug(f"Búsqueda completada: {len(result)} repositorios obtenidos")
+                return result
             
         except Exception as e:
             logger.error(f"❌ Error en la búsqueda de repositorios: {e}")
             raise
+    
+    def _search_with_segmentation(self, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Ejecuta búsquedas segmentadas por rangos de estrellas y años de creación
+        para superar el límite de 1000 resultados de GitHub Search API.
+        
+        Args:
+            max_results: Número máximo total de repositorios a obtener
+            
+        Returns:
+            Lista combinada de repositorios de todos los segmentos
+        """
+        segmentation = self.config.segmentation
+        star_ranges = segmentation.get("stars", [])
+        created_years = segmentation.get("created_years", [])
+        
+        logger.info(f"🎯 Segmentación configurada:")
+        logger.info(f"  • Rangos de estrellas: {len(star_ranges)}")
+        logger.info(f"  • Años de creación: {len(created_years)}")
+        
+        total_combinations = len(star_ranges) * len(created_years)
+        logger.info(f"  • Total de consultas a ejecutar: {total_combinations}")
+        
+        all_repositories = {}  # Usar dict para evitar duplicados por full_name
+        query_count = 0
+        
+        for star_range in star_ranges:
+            min_stars, max_stars = star_range
+            
+            for year in created_years:
+                query_count += 1
+                segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
+                
+                logger.info(f"\n📍 Consulta {query_count}/{total_combinations}: {segment_name}")
+                
+                try:
+                    # Verificar rate limit antes de cada búsqueda
+                    self._check_rate_limit()
+                    
+                    # Crear query específica para este segmento
+                    segment_repos = self.client.search_repositories_segmented(
+                        config_criteria=self.config,
+                        min_stars=min_stars,
+                        max_stars=max_stars,
+                        created_year=year,
+                        max_results=1000  # Máximo por segmento
+                    )
+                    
+                    # Agregar al conjunto total (evitando duplicados)
+                    new_repos = 0
+                    for repo in segment_repos:
+                        full_name = repo.get("nameWithOwner", repo.get("name", ""))
+                        if full_name and full_name not in all_repositories:
+                            all_repositories[full_name] = repo
+                            new_repos += 1
+                    
+                    logger.info(f"  ✓ Encontrados: {len(segment_repos)} repos, {new_repos} nuevos")
+                    logger.info(f"  📊 Total acumulado: {len(all_repositories)} repos únicos")
+                    
+                    # Si se alcanzó el límite global, parar
+                    if max_results and len(all_repositories) >= max_results:
+                        logger.info(f"\n🎯 Límite alcanzado: {len(all_repositories)} repositorios")
+                        break
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️  Error en segmento {segment_name}: {e}")
+                    continue
+            
+            # Salir del loop exterior si se alcanzó el límite
+            if max_results and len(all_repositories) >= max_results:
+                break
+        
+        result = list(all_repositories.values())
+        
+        logger.info(f"\n✅ Búsqueda segmentada completada:")
+        logger.info(f"  • Consultas ejecutadas: {query_count}/{total_combinations}")
+        logger.info(f"  • Repositorios únicos obtenidos: {len(result)}")
+        
+        return result
+    
+    def _check_rate_limit(self) -> None:
+        """
+        Verifica el rate limit de GitHub y espera si es necesario.
+        """
+        try:
+            rate_limit_config = self.config._config_data.get("rate_limit", {})
+            
+            if not rate_limit_config.get("check_before_request", True):
+                return
+            
+            rate_limit_info = self.client.get_rate_limit()
+            remaining = rate_limit_info.get("remaining", 5000)
+            limit = rate_limit_info.get("limit", 5000)
+            reset_at = rate_limit_info.get("reset_at")
+            
+            min_remaining = rate_limit_config.get("min_remaining", 100)
+            
+            logger.debug(f"Rate Limit: {remaining}/{limit} restantes")
+            
+            if remaining < min_remaining:
+                if rate_limit_config.get("wait_on_exhaustion", True):
+                    if reset_at:
+                        wait_seconds = (reset_at - datetime.now(timezone.utc)).total_seconds()
+                        if wait_seconds > 0:
+                            logger.warning(
+                                f"⏳ Rate limit bajo ({remaining} restantes). "
+                                f"Esperando {wait_seconds:.0f}s hasta reset..."
+                            )
+                            time.sleep(wait_seconds + 5)  # +5s de margen
+                            logger.info("✅ Rate limit reseteado, continuando...")
+                else:
+                    logger.warning(
+                        f"⚠️  Rate limit bajo ({remaining} restantes) pero "
+                        f"wait_on_exhaustion=False, continuando..."
+                    )
+        
+        except Exception as e:
+            logger.debug(f"No se pudo verificar rate limit: {e}")
     
     def _validate_repositories(
         self,

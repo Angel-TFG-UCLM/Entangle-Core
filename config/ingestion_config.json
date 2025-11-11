@@ -1,6 +1,6 @@
 {
   "description": "Configuración de criterios de ingesta para repositorios de software cuántico",
-  "version": "1.0",
+  "version": "2.0",
   "keywords": [
     "quantum",
     "qiskit",
@@ -31,5 +31,23 @@
     "has_topics": true,
     "has_readme": true,
     "min_size_kb": 10
+  },
+  "enable_segmentation": true,
+  "segmentation": {
+    "stars": [
+      [10, 49],
+      [50, 99],
+      [100, 499],
+      [500, 999],
+      [1000, 4999],
+      [5000, 999999]
+    ],
+    "created_years": [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+  },
+  "github_search_limit": 1000,
+  "rate_limit": {
+    "check_before_request": true,
+    "min_remaining": 100,
+    "wait_on_exhaustion": true
   }
 }

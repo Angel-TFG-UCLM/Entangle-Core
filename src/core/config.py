@@ -188,6 +188,22 @@ class IngestionConfig:
         """Versión de la configuración."""
         return self._config_data.get("version", "1.0")
     
+    @property
+    def segmentation(self) -> Optional[Dict[str, Any]]:
+        """
+        Configuración de segmentación para superar el límite de 1000 resultados.
+        
+        Returns:
+            Dict con 'stars' (lista de rangos [min, max]) y 'created_years' (lista de años)
+            o None si no está configurada la segmentación
+        """
+        return self._config_data.get("segmentation", None)
+    
+    @property
+    def enable_segmentation(self) -> bool:
+        """Si está habilitada la segmentación dinámica."""
+        return self.segmentation is not None and self._config_data.get("enable_segmentation", False)
+    
     def get_all_config(self) -> Dict[str, Any]:
         """
         Retorna toda la configuración como diccionario.
