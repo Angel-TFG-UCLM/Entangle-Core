@@ -108,6 +108,14 @@ class EnrichmentEngine:
         self.stats["end_time"] = datetime.now()
         duration = (self.stats["end_time"] - self.stats["start_time"]).total_seconds()
         
+        # Calcular estadísticas de enrichment_status
+        complete_count = self.repos_repository.collection.count_documents({
+            "enrichment_status.is_complete": True
+        })
+        incomplete_count = self.repos_repository.collection.count_documents({
+            "enrichment_status.is_complete": False
+        })
+        
         logger.info("\n" + "=" * 80)
         logger.info("✅ ENRIQUECIMIENTO COMPLETADO")
         logger.info("=" * 80)
@@ -116,6 +124,9 @@ class EnrichmentEngine:
         logger.info(f"  • Repositorios enriquecidos: {self.stats['total_enriched']}")
         logger.info(f"  • Errores: {self.stats['total_errors']}")
         logger.info(f"  • Duración: {duration:.2f}s")
+        logger.info(f"\n📊 Estado del Dataset:")
+        logger.info(f"  • Completamente enriquecidos: {complete_count}")
+        logger.info(f"  • Con campos faltantes: {incomplete_count}")
         logger.info(f"\n📝 Campos enriquecidos:")
         for field, count in sorted(self.stats['fields_enriched'].items()):
             logger.info(f"  • {field}: {count}")
@@ -136,18 +147,42 @@ class EnrichmentEngine:
             logger.warning(f"⚠️  Repositorio sin name_with_owner: {repo_id}")
             return
         
+        # Verificar si necesita enriquecimiento (optimización)
+        enrichment_status = repo.get("enrichment_status", {})
+        last_enriched = enrichment_status.get("last_enriched")
+        
+        if last_enriched:
+            try:
+                last_enriched_dt = datetime.fromisoformat(last_enriched)
+                days_since = (datetime.now() - last_enriched_dt).days
+                
+                # Si fue enriquecido hace menos de 7 días y está completo, saltar
+                if days_since < 7 and enrichment_status.get("is_complete"):
+                    logger.debug(f"⏭️ Saltando {name_with_owner}: enriquecido hace {days_since} días")
+                    return
+            except (ValueError, TypeError):
+                pass  # Si hay error parseando fecha, continuar con enriquecimiento
+        
         logger.debug(f"🔍 Enriqueciendo {name_with_owner}...")
         
         updates = {}
+        fields_enriched = []
+        fields_missing = []
         
         # 1. Campos calculables (no requieren API)
-        updates.update(self._calculate_fields(repo))
+        calculated = self._calculate_fields(repo)
+        updates.update(calculated)
+        fields_enriched.extend(calculated.keys())
         
         # 2. URLs calculables
-        updates.update(self._generate_urls(repo))
+        urls = self._generate_urls(repo)
+        updates.update(urls)
+        fields_enriched.extend(urls.keys())
         
         # 3. Owner type y organization_id
-        updates.update(self._enrich_owner_info(repo))
+        owner_info = self._enrich_owner_info(repo)
+        updates.update(owner_info)
+        fields_enriched.extend(owner_info.keys())
         
         # 4. README text (si está en la query pero no se parseó)
         if not repo.get("readme_text"):
@@ -155,8 +190,11 @@ class EnrichmentEngine:
             if readme:
                 updates["readme_text"] = readme
                 updates["has_readme"] = True
+                fields_enriched.extend(["readme_text", "has_readme"])
                 self._increment_field_stat("readme_text")
                 self._increment_field_stat("has_readme")
+            else:
+                fields_missing.append("readme_text")
         
         # 5. Releases (REST API)
         if not repo.get("releases") or repo.get("releases_count", 0) == 0:
@@ -165,16 +203,22 @@ class EnrichmentEngine:
                 updates["releases"] = releases_data["releases"]
                 updates["releases_count"] = releases_data["count"]
                 updates["latest_release"] = releases_data["latest"]
+                fields_enriched.extend(["releases", "releases_count"])
+                if releases_data["latest"]:
+                    fields_enriched.append("latest_release")
                 self._increment_field_stat("releases")
                 self._increment_field_stat("releases_count")
                 if releases_data["latest"]:
                     self._increment_field_stat("latest_release")
+            else:
+                fields_missing.append("releases")
         
         # 6. Branches count (REST API)
         if repo.get("branches_count", 0) == 0:
             branches_count = self._fetch_branches_count_rest(name_with_owner)
             if branches_count > 0:
                 updates["branches_count"] = branches_count
+                fields_enriched.append("branches_count")
                 self._increment_field_stat("branches_count")
         
         # 7. Tags count (REST API)
@@ -182,6 +226,7 @@ class EnrichmentEngine:
             tags_count = self._fetch_tags_count_rest(name_with_owner)
             if tags_count > 0:
                 updates["tags_count"] = tags_count
+                fields_enriched.append("tags_count")
                 self._increment_field_stat("tags_count")
         
         # 8. Recent commits (GraphQL)
@@ -189,10 +234,12 @@ class EnrichmentEngine:
             recent_commits = self._fetch_recent_commits_graphql(name_with_owner)
             if recent_commits:
                 updates["recent_commits"] = recent_commits
+                fields_enriched.append("recent_commits")
                 self._increment_field_stat("recent_commits")
                 # Extraer last_commit_date
                 if recent_commits and "committed_date" in recent_commits[0]:
                     updates["last_commit_date"] = recent_commits[0]["committed_date"]
+                    fields_enriched.append("last_commit_date")
                     self._increment_field_stat("last_commit_date")
         
         # 9. Recent issues (GraphQL)
@@ -200,6 +247,7 @@ class EnrichmentEngine:
             recent_issues = self._fetch_recent_issues_graphql(name_with_owner)
             if recent_issues:
                 updates["recent_issues"] = recent_issues
+                fields_enriched.append("recent_issues")
                 self._increment_field_stat("recent_issues")
         
         # 10. Recent pull requests (GraphQL)
@@ -207,17 +255,21 @@ class EnrichmentEngine:
             recent_prs = self._fetch_recent_pull_requests_graphql(name_with_owner)
             if recent_prs:
                 updates["recent_pull_requests"] = recent_prs
+                fields_enriched.append("recent_pull_requests")
                 self._increment_field_stat("recent_pull_requests")
         
         # 11. Pull requests detallados (REST API)
         pr_counts = self._fetch_pull_request_counts_rest(name_with_owner)
         if pr_counts:
             updates.update(pr_counts)
+            fields_enriched.extend(pr_counts.keys())
             for field in pr_counts.keys():
                 self._increment_field_stat(field)
         
         # 12. Campos calculables simples
-        updates.update(self._fix_simple_fields(repo))
+        simple_fields = self._fix_simple_fields(repo)
+        updates.update(simple_fields)
+        fields_enriched.extend(simple_fields.keys())
         
         # 13. Owner type (REST API)
         if not repo.get("owner", {}).get("type"):
@@ -226,11 +278,13 @@ class EnrichmentEngine:
                 owner = repo.get("owner", {})
                 owner["type"] = owner_type
                 updates["owner"] = owner
+                fields_enriched.append("owner.type")
                 self._increment_field_stat("owner.type")
                 
                 # Si es Organization, agregar organization_id
                 if owner_type == "Organization" and not repo.get("organization_id"):
                     updates["organization_id"] = owner.get("id")
+                    fields_enriched.append("organization_id")
                     self._increment_field_stat("organization_id")
         
         # 14. License info completa (REST API)
@@ -239,6 +293,7 @@ class EnrichmentEngine:
             complete_license = self._fetch_license_info_rest(name_with_owner)
             if complete_license:
                 updates["license_info"] = complete_license
+                fields_enriched.extend(["license_info.key", "license_info.url"])
                 self._increment_field_stat("license_info.key")
                 self._increment_field_stat("license_info.url")
         
@@ -246,6 +301,7 @@ class EnrichmentEngine:
         additional_fields = self._fetch_additional_fields_rest(name_with_owner, repo)
         if additional_fields:
             updates.update(additional_fields)
+            fields_enriched.extend(additional_fields.keys())
             for field in additional_fields.keys():
                 self._increment_field_stat(field)
         
@@ -253,6 +309,7 @@ class EnrichmentEngine:
         graphql_fields = self._fetch_additional_fields_graphql(name_with_owner, repo)
         if graphql_fields:
             updates.update(graphql_fields)
+            fields_enriched.extend(graphql_fields.keys())
             for field in graphql_fields.keys():
                 self._increment_field_stat(field)
         
@@ -261,6 +318,7 @@ class EnrichmentEngine:
             merged_count = self._fetch_merged_prs_count_rest(name_with_owner)
             if merged_count > 0:
                 updates["merged_pull_requests_count"] = merged_count
+                fields_enriched.append("merged_pull_requests_count")
                 self._increment_field_stat("merged_pull_requests_count")
         
         # 18. Colaboradores completos (contributors + mentionableUsers)
@@ -269,8 +327,20 @@ class EnrichmentEngine:
             if collaborators_data:
                 updates["collaborators"] = collaborators_data["collaborators"]
                 updates["collaborators_count"] = collaborators_data["count"]
+                fields_enriched.extend(["collaborators", "collaborators_count"])
                 self._increment_field_stat("collaborators")
                 self._increment_field_stat("collaborators_count")
+            else:
+                fields_missing.append("collaborators")
+        
+        # Agregar enrichment_status
+        updates["enrichment_status"] = {
+            "is_complete": len(fields_missing) == 0,
+            "last_enriched": datetime.now().isoformat(),
+            "fields_enriched": list(set(fields_enriched)),
+            "fields_missing": list(set(fields_missing)),
+            "total_fields_enriched": len(set(fields_enriched))
+        }
         
         # Actualizar en MongoDB si hay cambios
         if updates:
@@ -279,7 +349,7 @@ class EnrichmentEngine:
                 {"id": repo_id},
                 {"$set": updates}
             )
-            logger.debug(f"✅ {name_with_owner}: {len(updates)} campos actualizados")
+            logger.debug(f"✅ {name_with_owner}: {len(updates)} campos actualizados ({len(set(fields_enriched))} enriquecidos)")
         else:
             logger.debug(f"ℹ️  {name_with_owner}: Sin cambios")
     
