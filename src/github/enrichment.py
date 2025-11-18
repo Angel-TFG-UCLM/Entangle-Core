@@ -1176,9 +1176,15 @@ class EnrichmentEngine:
                 
                 page += 1
                 
-                # Seguridad: evitar bucles infinitos
-                if page > 100:  # Max 10,000 contributors (100 páginas * 100 contributors)
-                    logger.warning(f"⚠️  Límite de páginas alcanzado (100 páginas)")
+                # Logging de progreso cada N páginas
+                log_every = self.config.get("enrichment", {}).get("log_progress_every_n_pages", 100)
+                if page % log_every == 0:
+                    logger.info(f"📊 Progreso: {page} páginas procesadas, {len(all_contributors)} contributors acumulados")
+                
+                # Seguridad: evitar bucles infinitos (límite configurable)
+                max_pages = self.config.get("enrichment", {}).get("max_collaborator_pages", 1000)
+                if page > max_pages:
+                    logger.warning(f"⚠️  Límite de páginas alcanzado ({max_pages} páginas, {len(all_contributors)} contributors)")
                     break
             
             logger.info(f"✅ Recuperados {len(all_contributors)} contributors para {name_with_owner}")
@@ -1307,9 +1313,15 @@ class EnrichmentEngine:
                 logger.info(f"   Página {page}: +{len(users)} usuarios (total: {len(all_users)}/{target_count})")
                 page += 1
                 
-                # Seguridad: evitar bucles infinitos
-                if page > 100:  # Max 10,000 usuarios (100 páginas * 100 usuarios)
-                    logger.warning(f"⚠️  Límite de páginas alcanzado (100 páginas)")
+                # Logging de progreso cada N páginas
+                log_every = self.config.get("enrichment", {}).get("log_progress_every_n_pages", 100)
+                if page % log_every == 0:
+                    logger.info(f"📊 Progreso: {page} páginas procesadas, {len(all_users)} usuarios acumulados de {target_count}")
+                
+                # Seguridad: evitar bucles infinitos (límite configurable)
+                max_pages = self.config.get("enrichment", {}).get("max_collaborator_pages", 1000)
+                if page > max_pages:
+                    logger.warning(f"⚠️  Límite de páginas alcanzado ({max_pages} páginas, {len(all_users)} usuarios de {target_count})")
                     break
             
             logger.info(f"✅ Recuperados {len(all_users)} mentionableUsers para {name_with_owner}")

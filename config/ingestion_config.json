@@ -108,5 +108,9 @@
     "check_before_request": true,
     "min_remaining": 100,
     "wait_on_exhaustion": true
+  },
+  "enrichment": {
+    "max_collaborator_pages": 1000,
+    "log_progress_every_n_pages": 100
   }
 }
