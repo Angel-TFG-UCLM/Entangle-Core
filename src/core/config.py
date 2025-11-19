@@ -236,3 +236,21 @@ config = Config()
 
 # Instancia global de configuración de ingesta
 ingestion_config = IngestionConfig()
+
+
+def load_ingestion_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Carga y retorna la configuración de ingesta completa.
+    
+    Args:
+        config_path: Ruta opcional al archivo de configuración
+        
+    Returns:
+        Diccionario con toda la configuración
+    """
+    if config_path:
+        config_instance = IngestionConfig(config_path)
+    else:
+        config_instance = ingestion_config
+    
+    return config_instance.get_all_config()

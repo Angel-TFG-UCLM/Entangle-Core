@@ -6,6 +6,7 @@ import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import requests
+from functools import wraps
 from src.core.logger import logger
 from src.core.mongo_repository import MongoRepository
 from src.github.graphql_client import GitHubGraphQLClient
@@ -21,7 +22,8 @@ class EnrichmentEngine:
         self,
         github_token: str,
         repos_repository: MongoRepository,
-        batch_size: int = 10
+        batch_size: int = 10,
+        config: Optional[Dict[str, Any]] = None
     ):
         """
         Inicializa el motor de enriquecimiento.
@@ -30,9 +32,11 @@ class EnrichmentEngine:
             github_token: Token de autenticación de GitHub
             repos_repository: Repositorio MongoDB para repositorios
             batch_size: Número de repositorios a procesar por lote
+            config: Configuración opcional (se usa para rate limit y reintentos)
         """
         self.github_token = github_token
         self.repos_repository = repos_repository
+        self.config = config or {}
         self.batch_size = batch_size
         self.graphql_client = GitHubGraphQLClient(github_token)
         
@@ -43,17 +47,202 @@ class EnrichmentEngine:
             "X-GitHub-Api-Version": "2022-11-28"
         }
         
+        # Configuración de reintentos (desde config o defaults)
+        enrichment_config = self.config.get("enrichment", {})
+        self.max_retries = enrichment_config.get("max_retries", 3)
+        self.base_backoff = enrichment_config.get("base_backoff_seconds", 2)
+        
+        # Configuración de rate limit (desde config o defaults)
+        self.rate_limit_threshold = enrichment_config.get("rate_limit_threshold", 100)
+        self.last_rate_limit_check = None
+        self.current_rate_limit = None
+        
         # Estadísticas
         self.stats = {
             "total_processed": 0,
             "total_enriched": 0,
             "total_errors": 0,
+            "total_retries": 0,
+            "total_rate_limit_waits": 0,
             "fields_enriched": {},
             "start_time": None,
             "end_time": None
         }
         
-        logger.info(f"EnrichmentEngine inicializado (batch_size={batch_size})")
+        logger.info(f"🚀 EnrichmentEngine inicializado (batch_size={batch_size}, max_retries={self.max_retries})")
+    
+    def _check_and_display_rate_limit(self, force_display: bool = False) -> Dict[str, Any]:
+        """
+        Verifica el rate limit actual y lo muestra si es necesario.
+        Si queda poco rate limit, pausa hasta el reset.
+        
+        Args:
+            force_display: Forzar mostrar el rate limit aunque no haya cambiado
+            
+        Returns:
+            Información del rate limit
+        """
+        try:
+            # Obtener rate limit de GraphQL
+            rate_limit_info = self.graphql_client.get_rate_limit()
+            
+            if not rate_limit_info:
+                logger.warning("⚠️  No se pudo obtener información de rate limit")
+                return {}
+            
+            remaining = rate_limit_info.get("remaining", 0)
+            limit = rate_limit_info.get("limit", 5000)
+            reset_at = rate_limit_info.get("resetAt")
+            
+            # Calcular porcentaje
+            percentage = (remaining / limit * 100) if limit > 0 else 0
+            
+            # Guardar estado actual
+            self.current_rate_limit = rate_limit_info
+            self.last_rate_limit_check = datetime.now()
+            
+            # Mostrar con colores según el nivel
+            if percentage > 50 or force_display:
+                logger.info(f"📊 Rate Limit: {remaining}/{limit} ({percentage:.1f}%) - Reset: {reset_at}")
+            elif percentage > 20:
+                logger.warning(f"⚠️  Rate Limit: {remaining}/{limit} ({percentage:.1f}%) - Reset: {reset_at}")
+            else:
+                logger.error(f"🚨 Rate Limit CRÍTICO: {remaining}/{limit} ({percentage:.1f}%) - Reset: {reset_at}")
+            
+            # Si queda poco rate limit, pausar hasta el reset
+            if remaining < self.rate_limit_threshold:
+                logger.warning(f"⏸️  Rate limit bajo ({remaining} < {self.rate_limit_threshold}). Pausando hasta reset...")
+                self._wait_for_rate_limit_reset(reset_at)
+                self.stats["total_rate_limit_waits"] += 1
+            
+            return rate_limit_info
+            
+        except Exception as e:
+            logger.error(f"❌ Error verificando rate limit: {e}")
+            return {}
+    
+    def _wait_for_rate_limit_reset(self, reset_at: str) -> None:
+        """
+        Espera hasta que se resetee el rate limit.
+        
+        Args:
+            reset_at: Timestamp ISO 8601 del reset
+        """
+        try:
+            # Parsear el timestamp
+            reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
+            now = datetime.now(reset_time.tzinfo)
+            
+            if reset_time > now:
+                wait_seconds = (reset_time - now).total_seconds() + 10  # 10 segundos de margen
+                
+                logger.warning(f"⏳ Esperando {wait_seconds:.0f} segundos hasta reset del rate limit...")
+                logger.info(f"🕐 Hora de reset: {reset_at}")
+                
+                # Esperar en intervalos de 30s mostrando progreso
+                elapsed = 0
+                interval = 30
+                
+                while elapsed < wait_seconds:
+                    sleep_time = min(interval, wait_seconds - elapsed)
+                    time.sleep(sleep_time)
+                    elapsed += sleep_time
+                    
+                    remaining_wait = wait_seconds - elapsed
+                    if remaining_wait > 0:
+                        logger.info(f"⏳ Esperando... {remaining_wait:.0f} segundos restantes")
+                
+                logger.info("✅ Rate limit reseteado. Continuando...")
+                
+        except Exception as e:
+            logger.error(f"❌ Error esperando reset de rate limit: {e}")
+            # Esperar 60 segundos por defecto
+            logger.warning("⏳ Esperando 60 segundos por seguridad...")
+            time.sleep(60)
+    
+    def _retry_with_backoff(self, func, *args, **kwargs) -> Any:
+        """
+        Ejecuta una función con reintentos y backoff exponencial.
+        
+        Args:
+            func: Función a ejecutar
+            *args: Argumentos posicionales
+            **kwargs: Argumentos con nombre
+            
+        Returns:
+            Resultado de la función
+            
+        Raises:
+            Exception: Si fallan todos los reintentos
+        """
+        last_exception = None
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                # Verificar rate limit antes de cada intento
+                if attempt > 0:
+                    self._check_and_display_rate_limit()
+                
+                # Ejecutar función
+                result = func(*args, **kwargs)
+                
+                # Si tuvimos reintentos, registrar éxito
+                if attempt > 0:
+                    logger.info(f"✅ Éxito después de {attempt} reintento(s)")
+                    self.stats["total_retries"] += attempt
+                
+                return result
+                
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                if attempt < self.max_retries:
+                    wait_time = self.base_backoff ** attempt  # Backoff exponencial: 2, 4, 8 segundos
+                    logger.warning(f"⏱️  Timeout en intento {attempt + 1}/{self.max_retries + 1}. Reintentando en {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ Timeout después de {self.max_retries + 1} intentos")
+                    
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                error_msg = str(e).lower()
+                
+                # Si es rate limit, manejar especialmente
+                if "rate limit" in error_msg or "403" in error_msg:
+                    logger.warning(f"🚨 Rate limit detectado: {e}")
+                    self._check_and_display_rate_limit(force_display=True)
+                    if attempt < self.max_retries:
+                        logger.info(f"🔄 Reintentando después de verificar rate limit...")
+                        continue
+                    else:
+                        logger.error(f"❌ Rate limit persistente después de {self.max_retries + 1} intentos")
+                elif "502" in error_msg or "503" in error_msg or "504" in error_msg:
+                    # Errores de servidor de GitHub
+                    if attempt < self.max_retries:
+                        wait_time = self.base_backoff ** attempt
+                        logger.warning(f"🔧 Error de servidor GitHub ({e}). Reintentando en {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"❌ Error de servidor persistente después de {self.max_retries + 1} intentos")
+                else:
+                    # Otros errores de requests
+                    if attempt < self.max_retries:
+                        wait_time = self.base_backoff ** attempt
+                        logger.warning(f"⚠️  Error de red ({e}). Reintentando en {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"❌ Error de red persistente: {e}")
+                        
+            except Exception as e:
+                last_exception = e
+                # Otros errores no se reintentan
+                logger.error(f"❌ Error no recuperable: {type(e).__name__}: {e}")
+                break
+        
+        # Si llegamos aquí, todos los reintentos fallaron
+        if last_exception:
+            raise last_exception
+        
+        return None
     
     def enrich_all_repositories(self, max_repos: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -71,12 +260,17 @@ class EnrichmentEngine:
         
         self.stats["start_time"] = datetime.now()
         
+        # Verificar rate limit inicial
+        logger.info("\n🔍 Verificando rate limit inicial...")
+        self._check_and_display_rate_limit(force_display=True)
+        
         # Obtener repositorios de MongoDB
+        logger.info("\n📂 Consultando repositorios en MongoDB...")
         query = {}
         repos = list(self.repos_repository.collection.find(query).limit(max_repos or 0))
         total_repos = len(repos)
         
-        logger.info(f"📊 Repositorios a enriquecer: {total_repos}")
+        logger.info(f"✅ Encontrados {total_repos} repositorios para procesar")
         
         if total_repos == 0:
             logger.warning("⚠️  No hay repositorios para enriquecer")
@@ -88,22 +282,38 @@ class EnrichmentEngine:
             batch_num = (i // self.batch_size) + 1
             total_batches = (total_repos + self.batch_size - 1) // self.batch_size
             
-            logger.info(f"\n🔄 Procesando lote {batch_num}/{total_batches} ({len(batch)} repos)...")
+            logger.info("\n" + "=" * 80)
+            logger.info(f"📦 LOTE {batch_num}/{total_batches} - Procesando {len(batch)} repositorios")
+            logger.info(f"📊 Progreso global: {self.stats['total_processed']}/{total_repos} ({self.stats['total_processed']/total_repos*100:.1f}%)")
+            logger.info("=" * 80)
             
-            for repo in batch:
+            # Verificar rate limit al inicio de cada lote
+            self._check_and_display_rate_limit()
+            
+            for idx, repo in enumerate(batch, 1):
+                repo_name = repo.get('name_with_owner', 'unknown')
+                logger.info(f"\n🔄 [{batch_num}.{idx}] Procesando: {repo_name}")
+                
                 try:
                     self._enrich_repository(repo)
                     self.stats["total_enriched"] += 1
+                    logger.info(f"✅ [{batch_num}.{idx}] Completado: {repo_name}")
                 except Exception as e:
-                    logger.error(f"❌ Error enriqueciendo {repo.get('name_with_owner', 'unknown')}: {e}")
+                    logger.error(f"❌ [{batch_num}.{idx}] Error en {repo_name}: {type(e).__name__}: {e}")
                     self.stats["total_errors"] += 1
                 
                 self.stats["total_processed"] += 1
             
-            # Respetar rate limits
+            # Mostrar resumen del lote
+            logger.info(f"\n📊 Lote {batch_num} completado:")
+            logger.info(f"  ✅ Enriquecidos: {self.stats['total_enriched']}")
+            logger.info(f"  ❌ Errores: {self.stats['total_errors']}")
+            logger.info(f"  🔄 Reintentos totales: {self.stats['total_retries']}")
+            
+            # Respetar rate limits entre lotes
             if i + self.batch_size < total_repos:
-                logger.debug("⏳ Esperando 1s entre lotes...")
-                time.sleep(1)
+                logger.debug("⏳ Pausa de 2s entre lotes...")
+                time.sleep(2)
         
         self.stats["end_time"] = datetime.now()
         duration = (self.stats["end_time"] - self.stats["start_time"]).total_seconds()
@@ -119,16 +329,35 @@ class EnrichmentEngine:
         logger.info("\n" + "=" * 80)
         logger.info("✅ ENRIQUECIMIENTO COMPLETADO")
         logger.info("=" * 80)
-        logger.info(f"📊 Estadísticas:")
+        
+        # Verificar rate limit final
+        logger.info("\n🔍 Rate limit final:")
+        self._check_and_display_rate_limit(force_display=True)
+        
+        logger.info(f"\n📊 Estadísticas del Proceso:")
         logger.info(f"  • Repositorios procesados: {self.stats['total_processed']}")
         logger.info(f"  • Repositorios enriquecidos: {self.stats['total_enriched']}")
         logger.info(f"  • Errores: {self.stats['total_errors']}")
-        logger.info(f"  • Duración: {duration:.2f}s")
+        logger.info(f"  • Total de reintentos: {self.stats['total_retries']}")
+        logger.info(f"  • Pausas por rate limit: {self.stats['total_rate_limit_waits']}")
+        logger.info(f"  • Duración total: {duration:.2f}s ({duration/60:.1f} minutos)")
+        
+        if self.stats['total_processed'] > 0:
+            avg_time = duration / self.stats['total_processed']
+            success_rate = (self.stats['total_enriched'] / self.stats['total_processed']) * 100
+            logger.info(f"  • Tiempo promedio por repo: {avg_time:.2f}s")
+            logger.info(f"  • Tasa de éxito: {success_rate:.1f}%")
+        
         logger.info(f"\n📊 Estado del Dataset:")
         logger.info(f"  • Completamente enriquecidos: {complete_count}")
         logger.info(f"  • Con campos faltantes: {incomplete_count}")
-        logger.info(f"\n📝 Campos enriquecidos:")
-        for field, count in sorted(self.stats['fields_enriched'].items()):
+        
+        if complete_count + incomplete_count > 0:
+            complete_percentage = (complete_count / (complete_count + incomplete_count)) * 100
+            logger.info(f"  • Porcentaje completo: {complete_percentage:.1f}%")
+        
+        logger.info(f"\n📝 Campos Enriquecidos:")
+        for field, count in sorted(self.stats['fields_enriched'].items(), key=lambda x: x[1], reverse=True):
             logger.info(f"  • {field}: {count}")
         
         return self.stats
@@ -158,12 +387,14 @@ class EnrichmentEngine:
                 
                 # Si fue enriquecido hace menos de 7 días y está completo, saltar
                 if days_since < 7 and enrichment_status.get("is_complete"):
-                    logger.debug(f"⏭️ Saltando {name_with_owner}: enriquecido hace {days_since} días")
+                    logger.info(f"  ⏭️  SALTADO: Enriquecido hace {days_since} días y completo")
                     return
+                elif enrichment_status.get("is_complete") == False:
+                    logger.info(f"  🔄 RE-ENRIQUECIENDO: Campos incompletos detectados")
             except (ValueError, TypeError):
                 pass  # Si hay error parseando fecha, continuar con enriquecimiento
         
-        logger.debug(f"🔍 Enriqueciendo {name_with_owner}...")
+        logger.info(f"  🔧 Iniciando enriquecimiento de 18 estrategias...")
         
         updates = {}
         fields_enriched = []
@@ -186,7 +417,8 @@ class EnrichmentEngine:
         
         # 4. README text (si está en la query pero no se parseó)
         if not repo.get("readme_text"):
-            readme = self._fetch_readme_rest(name_with_owner)
+            logger.debug(f"  ├─ Obteniendo README...")
+            readme = self._retry_with_backoff(self._fetch_readme_rest, name_with_owner)
             if readme:
                 updates["readme_text"] = readme
                 updates["has_readme"] = True
@@ -194,11 +426,13 @@ class EnrichmentEngine:
                 self._increment_field_stat("readme_text")
                 self._increment_field_stat("has_readme")
             else:
-                fields_missing.append("readme_text")
+                # No marcar como faltante - ya pasó filtro has_readme en ingesta
+                logger.debug(f"    ℹ️  Sin README (campo opcional)")
         
-        # 5. Releases (REST API)
+        # 5. Releases (REST API) - OPCIONAL: No todos los repos tienen releases
         if not repo.get("releases") or repo.get("releases_count", 0) == 0:
-            releases_data = self._fetch_releases_rest(name_with_owner)
+            logger.debug(f"  ├─ Obteniendo releases...")
+            releases_data = self._retry_with_backoff(self._fetch_releases_rest, name_with_owner)
             if releases_data:
                 updates["releases"] = releases_data["releases"]
                 updates["releases_count"] = releases_data["count"]
@@ -211,27 +445,31 @@ class EnrichmentEngine:
                 if releases_data["latest"]:
                     self._increment_field_stat("latest_release")
             else:
-                fields_missing.append("releases")
+                # No marcar como faltante - es normal que repos no tengan releases
+                logger.debug(f"    ℹ️  Sin releases (campo opcional)")
         
         # 6. Branches count (REST API)
         if repo.get("branches_count", 0) == 0:
-            branches_count = self._fetch_branches_count_rest(name_with_owner)
-            if branches_count > 0:
+            logger.debug(f"  ├─ Contando branches...")
+            branches_count = self._retry_with_backoff(self._fetch_branches_count_rest, name_with_owner)
+            if branches_count and branches_count > 0:
                 updates["branches_count"] = branches_count
                 fields_enriched.append("branches_count")
                 self._increment_field_stat("branches_count")
         
         # 7. Tags count (REST API)
         if repo.get("tags_count", 0) == 0:
-            tags_count = self._fetch_tags_count_rest(name_with_owner)
-            if tags_count > 0:
+            logger.debug(f"  ├─ Contando tags...")
+            tags_count = self._retry_with_backoff(self._fetch_tags_count_rest, name_with_owner)
+            if tags_count and tags_count > 0:
                 updates["tags_count"] = tags_count
                 fields_enriched.append("tags_count")
                 self._increment_field_stat("tags_count")
         
         # 8. Recent commits (GraphQL)
         if not repo.get("recent_commits"):
-            recent_commits = self._fetch_recent_commits_graphql(name_with_owner)
+            logger.debug(f"  ├─ Obteniendo commits recientes...")
+            recent_commits = self._retry_with_backoff(self._fetch_recent_commits_graphql, name_with_owner)
             if recent_commits:
                 updates["recent_commits"] = recent_commits
                 fields_enriched.append("recent_commits")
@@ -244,7 +482,8 @@ class EnrichmentEngine:
         
         # 9. Recent issues (GraphQL)
         if not repo.get("recent_issues"):
-            recent_issues = self._fetch_recent_issues_graphql(name_with_owner)
+            logger.debug(f"  ├─ Obteniendo issues recientes...")
+            recent_issues = self._retry_with_backoff(self._fetch_recent_issues_graphql, name_with_owner)
             if recent_issues:
                 updates["recent_issues"] = recent_issues
                 fields_enriched.append("recent_issues")
@@ -252,14 +491,16 @@ class EnrichmentEngine:
         
         # 10. Recent pull requests (GraphQL)
         if not repo.get("recent_pull_requests"):
-            recent_prs = self._fetch_recent_pull_requests_graphql(name_with_owner)
+            logger.debug(f"  ├─ Obteniendo pull requests recientes...")
+            recent_prs = self._retry_with_backoff(self._fetch_recent_pull_requests_graphql, name_with_owner)
             if recent_prs:
                 updates["recent_pull_requests"] = recent_prs
                 fields_enriched.append("recent_pull_requests")
                 self._increment_field_stat("recent_pull_requests")
         
         # 11. Pull requests detallados (REST API)
-        pr_counts = self._fetch_pull_request_counts_rest(name_with_owner)
+        logger.debug(f"  ├─ Contando pull requests...")
+        pr_counts = self._retry_with_backoff(self._fetch_pull_request_counts_rest, name_with_owner)
         if pr_counts:
             updates.update(pr_counts)
             fields_enriched.extend(pr_counts.keys())
@@ -273,7 +514,8 @@ class EnrichmentEngine:
         
         # 13. Owner type (REST API)
         if not repo.get("owner", {}).get("type"):
-            owner_type = self._fetch_owner_type_rest(name_with_owner)
+            logger.debug(f"  ├─ Obteniendo tipo de owner...")
+            owner_type = self._retry_with_backoff(self._fetch_owner_type_rest, name_with_owner)
             if owner_type:
                 owner = repo.get("owner", {})
                 owner["type"] = owner_type
@@ -290,7 +532,8 @@ class EnrichmentEngine:
         # 14. License info completa (REST API)
         license_info = repo.get("license_info", {})
         if license_info and (not license_info.get("key") or not license_info.get("url")):
-            complete_license = self._fetch_license_info_rest(name_with_owner)
+            logger.debug(f"  ├─ Obteniendo licencia completa...")
+            complete_license = self._retry_with_backoff(self._fetch_license_info_rest, name_with_owner)
             if complete_license:
                 updates["license_info"] = complete_license
                 fields_enriched.extend(["license_info.key", "license_info.url"])
@@ -298,7 +541,8 @@ class EnrichmentEngine:
                 self._increment_field_stat("license_info.url")
         
         # 15. Campos adicionales desde REST API
-        additional_fields = self._fetch_additional_fields_rest(name_with_owner, repo)
+        logger.debug(f"  ├─ Obteniendo campos adicionales (REST)...")
+        additional_fields = self._retry_with_backoff(self._fetch_additional_fields_rest, name_with_owner, repo)
         if additional_fields:
             updates.update(additional_fields)
             fields_enriched.extend(additional_fields.keys())
@@ -306,7 +550,8 @@ class EnrichmentEngine:
                 self._increment_field_stat(field)
         
         # 16. Campos adicionales desde GraphQL
-        graphql_fields = self._fetch_additional_fields_graphql(name_with_owner, repo)
+        logger.debug(f"  ├─ Obteniendo campos adicionales (GraphQL)...")
+        graphql_fields = self._retry_with_backoff(self._fetch_additional_fields_graphql, name_with_owner, repo)
         if graphql_fields:
             updates.update(graphql_fields)
             fields_enriched.extend(graphql_fields.keys())
@@ -315,15 +560,17 @@ class EnrichmentEngine:
         
         # 17. Merged PRs count desde REST API (búsqueda)
         if repo.get("merged_pull_requests_count", 0) == 0:
-            merged_count = self._fetch_merged_prs_count_rest(name_with_owner)
-            if merged_count > 0:
+            logger.debug(f"  ├─ Contando PRs merged...")
+            merged_count = self._retry_with_backoff(self._fetch_merged_prs_count_rest, name_with_owner)
+            if merged_count and merged_count > 0:
                 updates["merged_pull_requests_count"] = merged_count
                 fields_enriched.append("merged_pull_requests_count")
                 self._increment_field_stat("merged_pull_requests_count")
         
         # 18. Colaboradores completos (contributors + mentionableUsers)
         if not repo.get("collaborators") or len(repo.get("collaborators", [])) == 0:
-            collaborators_data = self._fetch_collaborators_combined(name_with_owner)
+            logger.debug(f"  └─ Obteniendo colaboradores (puede tardar)...")
+            collaborators_data = self._retry_with_backoff(self._fetch_collaborators_combined, name_with_owner)
             if collaborators_data:
                 updates["collaborators"] = collaborators_data["collaborators"]
                 updates["collaborators_count"] = collaborators_data["count"]
@@ -334,8 +581,9 @@ class EnrichmentEngine:
                 fields_missing.append("collaborators")
         
         # Agregar enrichment_status
+        is_complete = len(fields_missing) == 0
         updates["enrichment_status"] = {
-            "is_complete": len(fields_missing) == 0,
+            "is_complete": is_complete,
             "last_enriched": datetime.now().isoformat(),
             "fields_enriched": list(set(fields_enriched)),
             "fields_missing": list(set(fields_missing)),
@@ -349,9 +597,17 @@ class EnrichmentEngine:
                 {"id": repo_id},
                 {"$set": updates}
             )
-            logger.debug(f"✅ {name_with_owner}: {len(updates)} campos actualizados ({len(set(fields_enriched))} enriquecidos)")
+            
+            # Logging detallado
+            status_icon = "✅" if is_complete else "⚠️"
+            logger.info(f"  {status_icon} COMPLETADO: {len(updates)} campos actualizados, {len(set(fields_enriched))} enriquecidos")
+            
+            if fields_missing:
+                logger.warning(f"  ❌ Campos faltantes: {', '.join(fields_missing)}")
+            else:
+                logger.info(f"  🎉 Repositorio completamente enriquecido!")
         else:
-            logger.debug(f"ℹ️  {name_with_owner}: Sin cambios")
+            logger.info(f"  ℹ️  Sin cambios necesarios")
     
     def _calculate_fields(self, repo: Dict[str, Any]) -> Dict[str, Any]:
         """Calcula campos derivados de datos existentes."""
@@ -438,15 +694,29 @@ class EnrichmentEngine:
                 # El contenido viene en base64
                 import base64
                 content = base64.b64decode(data.get("content", "")).decode("utf-8")
+                logger.debug(f"    ✓ README obtenido ({len(content)} caracteres)")
                 return content
             elif response.status_code == 404:
-                logger.debug(f"ℹ️  {name_with_owner}: Sin README")
+                logger.debug(f"    ℹ️  Sin README disponible")
                 return None
+            elif response.status_code == 403:
+                # Rate limit o acceso denegado - propagar para reintentar
+                raise requests.exceptions.RequestException(f"HTTP 403: {response.text[:100]}")
+            elif response.status_code >= 500:
+                # Error de servidor - propagar para reintentar
+                raise requests.exceptions.RequestException(f"HTTP {response.status_code}: Error de servidor GitHub")
             else:
-                logger.warning(f"⚠️  Error obteniendo README de {name_with_owner}: {response.status_code}")
+                logger.warning(f"    ⚠️  Error HTTP {response.status_code}")
                 return None
+        except requests.exceptions.Timeout:
+            # Propagar timeout para que se reintente
+            logger.debug(f"    ⏱️  Timeout obteniendo README")
+            raise
+        except requests.exceptions.RequestException:
+            # Propagar errores de red para que se reintenten
+            raise
         except Exception as e:
-            logger.error(f"❌ Error en _fetch_readme_rest para {name_with_owner}: {e}")
+            logger.error(f"    ❌ Error inesperado: {type(e).__name__}: {e}")
             return None
     
     def _fetch_releases_rest(self, name_with_owner: str, max_releases: int = 10) -> Optional[Dict[str, Any]]:
@@ -480,11 +750,26 @@ class EnrichmentEngine:
                     "count": len(formatted_releases),
                     "latest": formatted_releases[0] if formatted_releases else None
                 }
-            else:
-                logger.debug(f"ℹ️  {name_with_owner}: Sin releases o error {response.status_code}")
+            elif response.status_code == 404:
+                # Repo sin releases - normal
+                logger.debug(f"    ℹ️  Sin releases disponibles")
                 return None
+            elif response.status_code == 403:
+                # Rate limit - propagar para reintentar
+                raise requests.exceptions.RequestException(f"HTTP 403: {response.text[:100]}")
+            elif response.status_code >= 500:
+                # Error de servidor - propagar para reintentar
+                raise requests.exceptions.RequestException(f"HTTP {response.status_code}: Error de servidor")
+            else:
+                logger.warning(f"    ⚠️  Error HTTP {response.status_code}")
+                return None
+        except requests.exceptions.Timeout:
+            logger.debug(f"    ⏱️  Timeout obteniendo releases")
+            raise
+        except requests.exceptions.RequestException:
+            raise
         except Exception as e:
-            logger.error(f"❌ Error en _fetch_releases_rest para {name_with_owner}: {e}")
+            logger.error(f"    ❌ Error inesperado: {type(e).__name__}: {e}")
             return None
     
     def _fetch_branches_count_rest(self, name_with_owner: str) -> int:

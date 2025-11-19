@@ -110,7 +110,11 @@
     "wait_on_exhaustion": true
   },
   "enrichment": {
-    "max_collaborator_pages": 1000,
-    "log_progress_every_n_pages": 100
+    "max_collaborator_pages": 10000,
+    "log_progress_every_n_pages": 100,
+    "max_retries": 3,
+    "base_backoff_seconds": 2,
+    "rate_limit_threshold": 100,
+    "batch_size": 10
   }
 }
