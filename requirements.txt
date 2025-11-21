@@ -1,0 +1,29 @@
+# Dependencias del proyecto TFG Backend
+
+# Framework Web
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+
+# Base de datos
+pymongo==4.10.1
+
+# Cliente HTTP
+requests==2.32.3
+
+# Utilidades
+python-dotenv==1.0.1
+
+# Testing
+pytest==8.3.3
+pytest-cov==6.0.0
+pytest-mock==3.14.0
+
+# Linting y formateo
+black==24.10.0
+flake8==7.1.1
+mypy==1.13.0
+
+# Documentación
+mkdocs==1.6.1
+mkdocs-material==9.5.44

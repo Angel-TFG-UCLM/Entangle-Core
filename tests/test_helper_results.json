@@ -1,0 +1,727 @@
+{
+  "metadata": {
+    "ingestion_date": "2025-10-14T13:49:19.560318+00:00",
+    "total_repositories": 8,
+    "config_version": "1.0",
+    "criteria": {
+      "keywords": [
+        "quantum",
+        "qiskit",
+        "braket",
+        "cirq",
+        "pennylane",
+        "quantum computing",
+        "quantum algorithms",
+        "quantum machine learning",
+        "qml",
+        "qubit",
+        "quantum simulator",
+        "quantum circuit"
+      ],
+      "languages": [
+        "Python",
+        "C++",
+        "Q#",
+        "Rust",
+        "Julia",
+        "JavaScript"
+      ],
+      "min_stars": 10,
+      "max_inactivity_days": 365,
+      "exclude_forks": true
+    }
+  },
+  "repositories": [
+    {
+      "id": "MDEwOlJlcG9zaXRvcnk4MzgyMTY2OQ==",
+      "name": "qiskit",
+      "nameWithOwner": "Qiskit/qiskit",
+      "owner": {
+        "login": "Qiskit",
+        "name": "Qiskit",
+        "email": "qiskit@us.ibm.com"
+      },
+      "description": "Qiskit is an open-source SDK for working with quantum computers at the level of extended quantum circuits, operators, and primitives.",
+      "url": "https://github.com/Qiskit/qiskit",
+      "homepageUrl": "https://www.ibm.com/quantum/qiskit",
+      "createdAt": "2017-03-03T17:02:42Z",
+      "updatedAt": "2025-10-14T13:01:10Z",
+      "pushedAt": "2025-10-14T13:01:05Z",
+      "stargazerCount": 6563,
+      "forkCount": 2654,
+      "watchers": {
+        "totalCount": 227
+      },
+      "primaryLanguage": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": {
+        "edges": [
+          {
+            "node": {
+              "name": "Python"
+            },
+            "size": 12548995
+          },
+          {
+            "node": {
+              "name": "Makefile"
+            },
+            "size": 5225
+          },
+          {
+            "node": {
+              "name": "Jupyter Notebook"
+            },
+            "size": 1320
+          },
+          {
+            "node": {
+              "name": "OpenQASM"
+            },
+            "size": 22803
+          },
+          {
+            "node": {
+              "name": "Shell"
+            },
+            "size": 9615
+          },
+          {
+            "node": {
+              "name": "Rust"
+            },
+            "size": 3997975
+          },
+          {
+            "node": {
+              "name": "CMake"
+            },
+            "size": 3230
+          },
+          {
+            "node": {
+              "name": "C"
+            },
+            "size": 174528
+          },
+          {
+            "node": {
+              "name": "C++"
+            },
+            "size": 1850
+          }
+        ]
+      },
+      "isFork": false,
+      "isArchived": false,
+      "isPrivate": false,
+      "licenseInfo": {
+        "name": "Apache License 2.0",
+        "spdxId": "Apache-2.0"
+      },
+      "repositoryTopics": {
+        "nodes": [
+          {
+            "topic": {
+              "name": "quantum-computing"
+            }
+          },
+          {
+            "topic": {
+              "name": "qiskit"
+            }
+          },
+          {
+            "topic": {
+              "name": "sdk"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-programming-language"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-circuit"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum"
+            }
+          },
+          {
+            "topic": {
+              "name": "python"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "MDEwOlJlcG9zaXRvcnkxMTQzMDY3NTg=",
+      "name": "Cirq",
+      "nameWithOwner": "quantumlib/Cirq",
+      "owner": {
+        "login": "quantumlib",
+        "name": "quantumlib",
+        "email": "quantum-oss-maintainers@google.com"
+      },
+      "description": "Python framework for creating, editing, and invoking Noisy Intermediate-Scale Quantum (NISQ) circuits.",
+      "url": "https://github.com/quantumlib/Cirq",
+      "homepageUrl": "https://quantumai.google/cirq",
+      "createdAt": "2017-12-14T23:41:49Z",
+      "updatedAt": "2025-10-14T04:25:50Z",
+      "pushedAt": "2025-10-14T01:07:41Z",
+      "stargazerCount": 4726,
+      "forkCount": 1143,
+      "watchers": {
+        "totalCount": 187
+      },
+      "primaryLanguage": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": {
+        "edges": [
+          {
+            "node": {
+              "name": "Python"
+            },
+            "size": 10196653
+          },
+          {
+            "node": {
+              "name": "Shell"
+            },
+            "size": 62652
+          },
+          {
+            "node": {
+              "name": "Jupyter Notebook"
+            },
+            "size": 672285
+          },
+          {
+            "node": {
+              "name": "Scilab"
+            },
+            "size": 1447
+          },
+          {
+            "node": {
+              "name": "JavaScript"
+            },
+            "size": 58
+          },
+          {
+            "node": {
+              "name": "TypeScript"
+            },
+            "size": 95096
+          }
+        ]
+      },
+      "isFork": false,
+      "isArchived": false,
+      "isPrivate": false,
+      "licenseInfo": {
+        "name": "Apache License 2.0",
+        "spdxId": "Apache-2.0"
+      },
+      "repositoryTopics": {
+        "nodes": [
+          {
+            "topic": {
+              "name": "nisq"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-algorithms"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-computing"
+            }
+          },
+          {
+            "topic": {
+              "name": "cirq"
+            }
+          },
+          {
+            "topic": {
+              "name": "algorithms"
+            }
+          },
+          {
+            "topic": {
+              "name": "api"
+            }
+          },
+          {
+            "topic": {
+              "name": "google-quantum"
+            }
+          },
+          {
+            "topic": {
+              "name": "python"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-circuit"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "MDEwOlJlcG9zaXRvcnkxMjk5MzYzNjA=",
+      "name": "pennylane",
+      "nameWithOwner": "PennyLaneAI/pennylane",
+      "owner": {
+        "login": "PennyLaneAI",
+        "name": "PennyLaneAI",
+        "email": null
+      },
+      "description": "PennyLane is a cross-platform Python library for quantum computing, quantum machine learning, and quantum chemistry. Built by researchers, for research. ",
+      "url": "https://github.com/PennyLaneAI/pennylane",
+      "homepageUrl": "https://pennylane.ai",
+      "createdAt": "2018-04-17T16:45:42Z",
+      "updatedAt": "2025-10-14T09:51:31Z",
+      "pushedAt": "2025-10-14T13:34:41Z",
+      "stargazerCount": 2840,
+      "forkCount": 705,
+      "watchers": {
+        "totalCount": 49
+      },
+      "primaryLanguage": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": {
+        "edges": [
+          {
+            "node": {
+              "name": "Python"
+            },
+            "size": 23929619
+          },
+          {
+            "node": {
+              "name": "Makefile"
+            },
+            "size": 3914
+          },
+          {
+            "node": {
+              "name": "Shell"
+            },
+            "size": 5145
+          },
+          {
+            "node": {
+              "name": "Dockerfile"
+            },
+            "size": 6830
+          },
+          {
+            "node": {
+              "name": "OpenQASM"
+            },
+            "size": 7642
+          }
+        ]
+      },
+      "isFork": false,
+      "isArchived": false,
+      "isPrivate": false,
+      "licenseInfo": {
+        "name": "Apache License 2.0",
+        "spdxId": "Apache-2.0"
+      },
+      "repositoryTopics": {
+        "nodes": [
+          {
+            "topic": {
+              "name": "quantum"
+            }
+          },
+          {
+            "topic": {
+              "name": "machine-learning"
+            }
+          },
+          {
+            "topic": {
+              "name": "deep-learning"
+            }
+          },
+          {
+            "topic": {
+              "name": "neural-network"
+            }
+          },
+          {
+            "topic": {
+              "name": "optimization"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-computing"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-machine-learning"
+            }
+          },
+          {
+            "topic": {
+              "name": "automatic-differentiation"
+            }
+          },
+          {
+            "topic": {
+              "name": "tensorflow"
+            }
+          },
+          {
+            "topic": {
+              "name": "pytorch"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "MDEwOlJlcG9zaXRvcnkxNTk3Mjk3OTA=",
+      "name": "pennylane-qiskit",
+      "nameWithOwner": "PennyLaneAI/pennylane-qiskit",
+      "owner": {
+        "login": "PennyLaneAI",
+        "name": "PennyLaneAI",
+        "email": null
+      },
+      "description": "The PennyLane-Qiskit plugin integrates the Qiskit quantum computing framework and IBM Q with PennyLane.",
+      "url": "https://github.com/PennyLaneAI/pennylane-qiskit",
+      "homepageUrl": "https://docs.pennylane.ai/projects/qiskit",
+      "createdAt": "2018-11-29T21:29:30Z",
+      "updatedAt": "2025-09-19T16:28:08Z",
+      "pushedAt": "2025-10-08T18:45:48Z",
+      "stargazerCount": 217,
+      "forkCount": 76,
+      "watchers": {
+        "totalCount": 15
+      },
+      "primaryLanguage": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": {
+        "edges": [
+          {
+            "node": {
+              "name": "Python"
+            },
+            "size": 369886
+          },
+          {
+            "node": {
+              "name": "Makefile"
+            },
+            "size": 1386
+          }
+        ]
+      },
+      "isFork": false,
+      "isArchived": false,
+      "isPrivate": false,
+      "licenseInfo": {
+        "name": "Apache License 2.0",
+        "spdxId": "Apache-2.0"
+      },
+      "repositoryTopics": {
+        "nodes": []
+      }
+    },
+    {
+      "id": "R_kgDOG46iCg",
+      "name": "qiskit-braket-provider",
+      "nameWithOwner": "qiskit-community/qiskit-braket-provider",
+      "owner": {
+        "login": "qiskit-community",
+        "name": "Qiskit Community",
+        "email": null
+      },
+      "description": "Qiskit-Braket provider to execute Qiskit programs on quantum computing hardware devices through Amazon Braket.",
+      "url": "https://github.com/qiskit-community/qiskit-braket-provider",
+      "homepageUrl": "https://qiskit-community.github.io/qiskit-braket-provider/",
+      "createdAt": "2022-02-22T14:24:07Z",
+      "updatedAt": "2025-10-10T01:08:29Z",
+      "pushedAt": "2025-10-14T01:34:07Z",
+      "stargazerCount": 68,
+      "forkCount": 58,
+      "watchers": {
+        "totalCount": 12
+      },
+      "primaryLanguage": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": {
+        "edges": [
+          {
+            "node": {
+              "name": "Python"
+            },
+            "size": 164568
+          }
+        ]
+      },
+      "isFork": false,
+      "isArchived": false,
+      "isPrivate": false,
+      "licenseInfo": {
+        "name": "Apache License 2.0",
+        "spdxId": "Apache-2.0"
+      },
+      "repositoryTopics": {
+        "nodes": [
+          {
+            "topic": {
+              "name": "qiskit"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-computing"
+            }
+          },
+          {
+            "topic": {
+              "name": "amazon-braket"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "MDEwOlJlcG9zaXRvcnkzNDI4ODU0MjI=",
+      "name": "qiskit-machine-learning",
+      "nameWithOwner": "qiskit-community/qiskit-machine-learning",
+      "owner": {
+        "login": "qiskit-community",
+        "name": "Qiskit Community",
+        "email": null
+      },
+      "description": "Quantum Machine Learning",
+      "url": "https://github.com/qiskit-community/qiskit-machine-learning",
+      "homepageUrl": "https://qiskit-community.github.io/qiskit-machine-learning/",
+      "createdAt": "2021-02-27T15:10:30Z",
+      "updatedAt": "2025-10-14T07:48:06Z",
+      "pushedAt": "2025-09-12T16:05:02Z",
+      "stargazerCount": 871,
+      "forkCount": 390,
+      "watchers": {
+        "totalCount": 18
+      },
+      "primaryLanguage": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": {
+        "edges": [
+          {
+            "node": {
+              "name": "Makefile"
+            },
+            "size": 2319
+          },
+          {
+            "node": {
+              "name": "Python"
+            },
+            "size": 1202524
+          },
+          {
+            "node": {
+              "name": "Shell"
+            },
+            "size": 1465
+          }
+        ]
+      },
+      "isFork": false,
+      "isArchived": false,
+      "isPrivate": false,
+      "licenseInfo": {
+        "name": "Apache License 2.0",
+        "spdxId": "Apache-2.0"
+      },
+      "repositoryTopics": {
+        "nodes": [
+          {
+            "topic": {
+              "name": "qiskit"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "MDEwOlJlcG9zaXRvcnkzMDE1MTg3NzY=",
+      "name": "amazon-braket-examples",
+      "nameWithOwner": "amazon-braket/amazon-braket-examples",
+      "owner": {
+        "login": "amazon-braket",
+        "name": "Amazon Braket",
+        "email": null
+      },
+      "description": "Example notebooks that show how to apply quantum computing with Amazon Braket.",
+      "url": "https://github.com/amazon-braket/amazon-braket-examples",
+      "homepageUrl": "https://aws.amazon.com/braket/",
+      "createdAt": "2020-10-05T19:31:03Z",
+      "updatedAt": "2025-10-13T20:52:09Z",
+      "pushedAt": "2025-10-13T20:53:14Z",
+      "stargazerCount": 551,
+      "forkCount": 247,
+      "watchers": {
+        "totalCount": 38
+      },
+      "primaryLanguage": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": {
+        "edges": [
+          {
+            "node": {
+              "name": "Python"
+            },
+            "size": 57894
+          },
+          {
+            "node": {
+              "name": "Shell"
+            },
+            "size": 6692
+          }
+        ]
+      },
+      "isFork": false,
+      "isArchived": false,
+      "isPrivate": false,
+      "licenseInfo": {
+        "name": "Apache License 2.0",
+        "spdxId": "Apache-2.0"
+      },
+      "repositoryTopics": {
+        "nodes": [
+          {
+            "topic": {
+              "name": "amazon-braket"
+            }
+          },
+          {
+            "topic": {
+              "name": "amazon-web-services"
+            }
+          },
+          {
+            "topic": {
+              "name": "python"
+            }
+          },
+          {
+            "topic": {
+              "name": "quantum-computing"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "MDEwOlJlcG9zaXRvcnkzMjk3MDA1MzQ=",
+      "name": "qiskit-optimization",
+      "nameWithOwner": "qiskit-community/qiskit-optimization",
+      "owner": {
+        "login": "qiskit-community",
+        "name": "Qiskit Community",
+        "email": null
+      },
+      "description": "Quantum Optimization",
+      "url": "https://github.com/qiskit-community/qiskit-optimization",
+      "homepageUrl": "https://qiskit-community.github.io/qiskit-optimization/",
+      "createdAt": "2021-01-14T18:25:46Z",
+      "updatedAt": "2025-09-29T05:06:22Z",
+      "pushedAt": "2025-09-29T06:00:12Z",
+      "stargazerCount": 267,
+      "forkCount": 143,
+      "watchers": {
+        "totalCount": 8
+      },
+      "primaryLanguage": {
+        "name": "Python",
+        "color": "#3572A5"
+      },
+      "languages": {
+        "edges": [
+          {
+            "node": {
+              "name": "Python"
+            },
+            "size": 1310957
+          },
+          {
+            "node": {
+              "name": "Makefile"
+            },
+            "size": 2309
+          },
+          {
+            "node": {
+              "name": "Shell"
+            },
+            "size": 1465
+          },
+          {
+            "node": {
+              "name": "Linear Programming"
+            },
+            "size": 1331
+          }
+        ]
+      },
+      "isFork": false,
+      "isArchived": false,
+      "isPrivate": false,
+      "licenseInfo": {
+        "name": "Apache License 2.0",
+        "spdxId": "Apache-2.0"
+      },
+      "repositoryTopics": {
+        "nodes": [
+          {
+            "topic": {
+              "name": "qiskit"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
