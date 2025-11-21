@@ -23,13 +23,17 @@ class Config:
     MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "quantum_github")
     
-    # API
-    #API_HOST = os.getenv("API_HOST", "0.0.0.0")
-    #API_PORT = int(os.getenv("API_PORT", "8000"))
+    # API Configuration
+    # Azure Container Apps uses PORT environment variable
+    API_HOST = os.getenv("API_HOST", "0.0.0.0")
+    API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
     
     # Entorno
     ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
     DEBUG = os.getenv("DEBUG", "True").lower() == "true"
+    
+    # Logging
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     
     @classmethod
     def validate(cls):

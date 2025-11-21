@@ -143,7 +143,8 @@ class User(BaseModel):
     
     # ==================== REPOSITORIOS STARRED ====================
     starred_repositories: List[StarredRepository] = Field(default_factory=list)
-    starred_repositories_count: int = Field(0, alias="starredRepositoriesCount")
+    starred_repos_count: Optional[int] = Field(None, alias="starredReposCount")
+    starred_repositories_count: Optional[int] = Field(None, alias="starredRepositoriesCount")
     
     # ==================== ORGANIZACIONES ====================
     organizations: List[UserOrganization] = Field(default_factory=list)
@@ -152,6 +153,11 @@ class User(BaseModel):
     # ==================== CONTRIBUCIONES ====================
     contributions: Optional[ContributionsCollection] = Field(None, alias="contributionsCollection")
     contributions_by_repository: List[CommitContributionsByRepository] = Field(default_factory=list)
+    total_commit_contributions: Optional[int] = Field(None, alias="totalCommitContributions")
+    total_issue_contributions: Optional[int] = Field(None, alias="totalIssueContributions")
+    total_pr_contributions: Optional[int] = Field(None, alias="totalPrContributions")
+    total_pr_review_contributions: Optional[int] = Field(None, alias="totalPrReviewContributions")
+    watching_count: Optional[int] = Field(None, alias="watchingCount")
     
     # ==================== ISSUES Y PULL REQUESTS ====================
     issues_count: int = Field(0, alias="issuesCount")
@@ -159,8 +165,8 @@ class User(BaseModel):
     
     # ==================== GISTS ====================
     gists: List[Gist] = Field(default_factory=list)
-    gists_count: int = Field(0, alias="gistsCount")
-    public_gists_count: int = Field(0, alias="publicGistsCount")
+    gists_count: Optional[int] = Field(None, alias="gistsCount")
+    public_gists_count: Optional[int] = Field(None, alias="publicGistsCount")
     
     # ==================== PACKAGES ====================
     packages_count: int = Field(0, alias="packagesCount")

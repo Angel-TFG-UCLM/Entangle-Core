@@ -82,15 +82,39 @@ class GitHubGraphQLClient:
                 logger.debug("Query ejecutada exitosamente")
                 return data
                 
-            except requests.exceptions.HTTPError as http_err:
-                # Reintentar solo en errores 502/503 (server errors temporales)
-                if response.status_code in [502, 503] and attempt < max_retries - 1:
-                    logger.warning(f"⚠️ Error {response.status_code}, reintentando en {retry_delay}s (intento {attempt + 1}/{max_retries})...")
+            except requests.exceptions.Timeout as timeout_err:
+                # Timeout de la petición
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Timeout después de 30s, reintentando en {retry_delay}s (intento {attempt + 1}/{max_retries})...")
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay *= 2
                     continue
                 else:
-                    logger.error(f"Error en la petición GraphQL: {http_err}")
+                    logger.error(f"Error en la petición GraphQL: {timeout_err}")
+                    raise
+                    
+            except requests.exceptions.HTTPError as http_err:
+                # Reintentar en errores de servidor temporal (408, 502, 503, 504)
+                if hasattr(http_err, 'response') and http_err.response is not None:
+                    status_code = http_err.response.status_code
+                    if status_code in [408, 502, 503, 504] and attempt < max_retries - 1:
+                        logger.warning(f"⚠️ Error {status_code}, reintentando en {retry_delay}s (intento {attempt + 1}/{max_retries})...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                
+                logger.error(f"Error en la petición GraphQL: {http_err}")
+                raise
+                    
+            except requests.exceptions.ConnectionError as conn_err:
+                # Error de conexión
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Error de conexión, reintentando en {retry_delay}s (intento {attempt + 1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                else:
+                    logger.error(f"Error en la petición GraphQL: {conn_err}")
                     raise
                     
             except requests.exceptions.RequestException as e:
