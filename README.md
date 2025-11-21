@@ -122,10 +122,59 @@ python scripts/run_ingestion_segmented.py
 
 ---
 
+## 🚀 Despliegue en Azure
+
+Este proyecto está **100% preparado** para desplegarse en **Azure Container Apps** usando infraestructura como código (Bicep).
+
+### 📦 Documentación de Despliegue
+
+| Documento | Descripción | Tiempo |
+|-----------|-------------|---------|
+| [`INSTALL_TOOLS.md`](INSTALL_TOOLS.md) | Instalación de herramientas necesarias | 10 min |
+| [`QUICKSTART.md`](QUICKSTART.md) | Despliegue rápido paso a paso | 5 min |
+| [`DEPLOYMENT.md`](DEPLOYMENT.md) | Guía completa con todas las opciones | - |
+| [`AZURE_SETUP_SUMMARY.md`](AZURE_SETUP_SUMMARY.md) | Resumen de archivos y configuración | - |
+
+### ⚡ Despliegue Rápido
+
+```powershell
+# 1. Instalar herramientas (una sola vez)
+winget install microsoft.azd
+
+# 2. Verificar que todo está listo
+python .\scripts\verify_deployment_ready.py
+
+# 3. Autenticarse
+azd auth login
+
+# 4. Desplegar (provisionar + deploy)
+azd up
+```
+
+### ✅ Incluido en el Proyecto
+
+- ✅ `Dockerfile` optimizado para Azure Container Apps
+- ✅ `.dockerignore` para builds eficientes
+- ✅ `azure.yaml` - Configuración de Azure Developer CLI
+- ✅ Infraestructura Bicep completa (`infra/`)
+- ✅ GitHub Actions workflow para CI/CD
+- ✅ Scripts de verificación y utilidades
+- ✅ Health checks y monitoreo configurados
+- ✅ Variables de entorno documentadas
+
+### 📋 Requisitos
+
+- **Herramientas**: Azure Developer CLI (azd), Docker Desktop
+- **Azure**: Suscripción activa con permisos de creación
+- **GitHub**: Token con permisos `repo`, `read:org`, `read:user`
+- **Base de Datos**: MongoDB (CosmosDB o MongoDB Atlas)
+
+---
+
 ## 🧑‍💻 Autor
 
-**Autor:** Ángel Luis Lara Martín
-**Tutorizado por:** Ricardo Pérez del Castillo
+**Autor:** Ángel Luis Lara Martín  
+**Tutorizado por:** Ricardo Pérez del Castillo  
 **Grado:** Ingeniería Informática  
-**Universidad:** Universidad de Castilla La-Mancha
+**Universidad:** Universidad de Castilla La-Mancha  
 **Año:** 2025

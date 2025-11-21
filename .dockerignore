@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+pip-wheel-metadata/
+
+# Entornos virtuales
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Tests
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Git
+.git/
+.gitignore
+
+# Documentación
+docs/
+*.md
+!README.md
+
+# Logs y resultados locales
+logs/
+results/
+*.log
+
+# Archivos de configuración local
+.env
+.env.local
+.env.*.local
+
+# Scripts de desarrollo
+scripts/
+
+# Archivos temporales
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db

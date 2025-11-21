@@ -1,0 +1,18 @@
+# Azure Developer CLI (azd) Configuration
+name: tfg-backend
+metadata:
+  template: tfg-backend-api@0.0.1
+
+services:
+  api:
+    project: .
+    language: python
+    host: containerapp
+    docker:
+      path: ./Dockerfile
+      context: .
+
+# Azure resources to provision
+infra:
+  provider: bicep
+  path: ./infra

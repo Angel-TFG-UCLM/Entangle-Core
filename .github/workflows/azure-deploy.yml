@@ -1,0 +1,75 @@
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [ main, Ingesta_MongoDB ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AZURE_CONTAINER_REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+  CONTAINER_APP_NAME: tfg-backend-api
+  RESOURCE_GROUP: rg-tfg-backend
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run tests
+      run: |
+        pip install pytest pytest-cov
+        pytest tests/ -v --cov=src --cov-report=xml || true
+    
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Build and push Docker image
+      if: github.event_name == 'push'
+      run: |
+        az acr build \
+          --registry ${{ secrets.AZURE_CONTAINER_REGISTRY_NAME }} \
+          --image tfg-backend:${{ github.sha }} \
+          --image tfg-backend:latest \
+          --file Dockerfile \
+          .
+    
+    - name: Deploy to Azure Container Apps
+      if: github.event_name == 'push'
+      run: |
+        az containerapp update \
+          --name ${{ env.CONTAINER_APP_NAME }} \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --image ${{ env.AZURE_CONTAINER_REGISTRY }}/tfg-backend:${{ github.sha }}
+    
+    - name: Verify deployment
+      if: github.event_name == 'push'
+      run: |
+        APP_URL=$(az containerapp show \
+          --name ${{ env.CONTAINER_APP_NAME }} \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --query properties.configuration.ingress.fqdn -o tsv)
+        
+        echo "Application deployed to: https://$APP_URL"
+        
+        # Wait for app to be ready
+        sleep 30
+        
+        # Health check
+        curl -f https://$APP_URL/api/v1/health || exit 1
