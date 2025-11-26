@@ -11,12 +11,12 @@ param location string
 
 // Optional parameters
 @description('Id of the user or app to assign application roles')
-param principalId string = ''
+//param principalId string = ''
 
 // Tags
 var tags = {
   'azd-env-name': environmentName
-  'project': 'tfg-backend'
+  project: 'tfg-backend'
 }
 
 // Resource group
@@ -34,6 +34,8 @@ module containerAppsEnvironment './core/host/container-apps-environment.bicep' =
     name: 'cae-${environmentName}'
     location: location
     tags: tags
+    logAnalyticsCustomerId: logAnalytics.outputs.customerId
+    logAnalyticsSharedKey: logAnalytics.outputs.sharedKey
   }
 }
 
@@ -102,11 +104,11 @@ module api './core/host/container-app.bicep' = {
     secrets: [
       {
         name: 'github-token'
-        value: '' // Se configura después del despliegue
+        value: 'cambiar-esto-en-portal' // Se configura después del despliegue
       }
       {
         name: 'mongo-uri'
-        value: '' // Se configura después del despliegue
+        value: 'cambiar-esto-en-portal' // Se configura después del despliegue
       }
     ]
     targetPort: 8000
