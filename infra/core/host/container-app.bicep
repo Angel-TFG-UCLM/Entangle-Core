@@ -59,6 +59,17 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             memory: containerMemory
           }
           env: env
+          probes: [
+            {
+              type: 'Liveness'
+              httpGet: {
+                path: '/api/v1/health'
+                port: targetPort
+              }
+              initialDelaySeconds: 15
+              periodSeconds: 30
+            }
+          ]
         }
       ]
       scale: {

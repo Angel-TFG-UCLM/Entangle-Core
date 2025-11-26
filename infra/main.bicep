@@ -90,6 +90,14 @@ module api './core/host/container-app.bicep' = {
         name: 'MONGO_DB_NAME'
         value: 'quantum_github'
       }
+      {
+        name: 'MONGO_URI'      
+        secretRef: 'mongo-uri' 
+      }
+      {
+        name: 'GITHUB_TOKEN'
+        secretRef: 'github-token'
+      }
     ]
     secrets: [
       {
