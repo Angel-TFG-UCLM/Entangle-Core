@@ -47,7 +47,7 @@ class Database:
                 connectTimeoutMS=10000,
                 socketTimeoutMS=10000,
                 retryReads=True,
-                retryWrites=True
+                retryWrites=False
             )
             
             # Verificar la conexión con ping
