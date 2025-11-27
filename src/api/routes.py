@@ -423,14 +423,21 @@ def _run_repository_ingestion(
     try:
         background_tasks_status[task_id]["progress"] = "Creando motor de ingesta..."
         
+        # 1. Creamos el motor
         engine = IngestionEngine(incremental=incremental)
+        
+        # 2. Forzamos la configuración de segmentación según lo que pidió el usuario
+        # (Esto asegura que el motor use segmentación si use_segmentation=True)
+        if use_segmentation:
+            # Inyectamos la preferencia en la configuración del motor
+            if hasattr(engine.config, '_config_data'):
+                engine.config._config_data['enable_segmentation'] = True
         
         background_tasks_status[task_id]["progress"] = "Ejecutando ingesta..."
         
-        if use_segmentation and ingestion_config.enable_segmentation:
-            stats = engine.run_segmented_ingestion(max_results_per_segment=max_results)
-        else:
-            stats = engine.run(max_results=max_results)
+        # 3. LLAMADA ÚNICA Y CORRECTA
+        # El método run() ya decide internamente si usa segmentación o no
+        stats = engine.run(max_results=max_results)
         
         background_tasks_status[task_id]["status"] = "completed"
         background_tasks_status[task_id]["progress"] = "Ingesta completada exitosamente"
@@ -445,7 +452,6 @@ def _run_repository_ingestion(
         background_tasks_status[task_id]["progress"] = f"Error: {str(e)}"
         background_tasks_status[task_id]["error"] = str(e)
         background_tasks_status[task_id]["failed_at"] = datetime.now().isoformat()
-
 
 def _run_user_ingestion(
     task_id: str,
