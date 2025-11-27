@@ -76,8 +76,41 @@ class GitHubGraphQLClient:
                 
                 # Verificar si hay errores en la respuesta
                 if "errors" in data:
-                    logger.error(f"Errores en la respuesta de GraphQL: {data['errors']}")
-                    raise Exception(f"GraphQL errors: {data['errors']}")
+                    errors = data['errors']
+                    
+                    # Detectar específicamente errores de RATE_LIMIT
+                    for error in errors:
+                        if error.get('type') == 'RATE_LIMIT' or 'rate limit' in str(error).lower():
+                            logger.warning(f"⚠️ Rate limit de GitHub alcanzado: {error.get('message')}")
+                            
+                            # Obtener información del rate limit
+                            try:
+                                rate_info = self.get_rate_limit()
+                                reset_at = rate_info.get('resetAt')
+                                if reset_at:
+                                    reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
+                                    now = datetime.now(reset_time.tzinfo)
+                                    wait_seconds = max(0, (reset_time - now).total_seconds()) + 60  # +60s de margen
+                                    
+                                    logger.info(f"⏳ Esperando {wait_seconds/60:.1f} minutos hasta que se resetee el rate limit...")
+                                    time.sleep(wait_seconds)
+                                    logger.info("✅ Rate limit reseteado. Reintentando...")
+                                    
+                                    # Reintentar la query después de esperar
+                                    if attempt < max_retries - 1:
+                                        continue
+                            except Exception as rate_err:
+                                logger.error(f"Error obteniendo rate limit: {rate_err}")
+                                # Esperar un tiempo fijo si no podemos obtener el reset time
+                                wait_seconds = 3600  # 1 hora por defecto
+                                logger.info(f"⏳ Esperando {wait_seconds/60:.0f} minutos (tiempo por defecto)...")
+                                time.sleep(wait_seconds)
+                                if attempt < max_retries - 1:
+                                    continue
+                    
+                    # Si no es rate limit o ya agotamos reintentos, lanzar error
+                    logger.error(f"Errores en la respuesta de GraphQL: {errors}")
+                    raise Exception(f"GraphQL errors: {errors}")
                 
                 logger.debug("Query ejecutada exitosamente")
                 return data
