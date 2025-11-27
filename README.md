@@ -169,6 +169,7 @@ Este proyecto está **100% preparado** para desplegarse en **Azure Container App
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Guía completa con todas las opciones | - |
 | [`AZURE_SETUP_SUMMARY.md`](AZURE_SETUP_SUMMARY.md) | Resumen de archivos y configuración | - |
 | [`docs/API_ENDPOINTS.md`](docs/API_ENDPOINTS.md) | Documentación de API REST | - |
+| [`docs/AZURE_COSMOS_DB_OPTIMIZATIONS.md`](docs/AZURE_COSMOS_DB_OPTIMIZATIONS.md) | Optimizaciones para Cosmos DB Free Tier | - |
 
 ### ⚡ Despliegue Rápido
 

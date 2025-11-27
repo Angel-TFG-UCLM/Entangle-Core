@@ -160,7 +160,7 @@ async def ingest_repositories(
     background_tasks: BackgroundTasks,
     max_results: Optional[int] = Query(None, description="Máximo de repositorios a ingerir"),
     incremental: bool = Query(False, description="Modo incremental (solo actualizar cambios)"),
-    use_segmentation: bool = Query(False, description="Usar segmentación dinámica para más de 1000 repos")
+    use_segmentation: bool = Query(True, description="Usar segmentación dinámica para más de 1000 repos")
 ):
     """
     Ejecuta la ingesta de repositorios usando la configuración de ingestion_config.json.
