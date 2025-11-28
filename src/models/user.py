@@ -104,7 +104,6 @@ class User(BaseModel):
     """
     # ==================== IDENTIFICACIÓN ====================
     id: str  # ID único de GitHub
-    node_id: Optional[str] = Field(None, alias="nodeId")
     login: str
     name: Optional[str] = None
     
@@ -122,7 +121,7 @@ class User(BaseModel):
     
     # ==================== REDES SOCIALES ====================
     twitter_username: Optional[str] = Field(None, alias="twitterUsername")
-    social_accounts: List[SocialAccount] = Field(default_factory=list)
+    social_accounts: Optional[List[SocialAccount]] = None
     
     # ==================== FECHAS ====================
     created_at: Optional[datetime] = Field(None, alias="createdAt")
@@ -134,38 +133,31 @@ class User(BaseModel):
     following_count: int = Field(0, alias="followingCount")
     
     # ==================== REPOSITORIOS ====================
-    repositories: List[UserRepository] = Field(default_factory=list)
-    repositories_count: int = Field(0, alias="repositoriesCount")
+    repositories: Optional[List[UserRepository]] = None
     public_repos_count: int = Field(0, alias="publicReposCount")
     private_repos_count: int = Field(0, alias="privateReposCount")
     owned_private_repos_count: int = Field(0, alias="ownedPrivateReposCount")
-    pinned_repositories: List[UserRepository] = Field(default_factory=list)
+    pinned_repositories: Optional[List[UserRepository]] = None
     
     # ==================== REPOSITORIOS STARRED ====================
-    starred_repositories: List[StarredRepository] = Field(default_factory=list)
+    starred_repositories: Optional[List[StarredRepository]] = None
     starred_repos_count: Optional[int] = Field(None, alias="starredReposCount")
-    starred_repositories_count: Optional[int] = Field(None, alias="starredRepositoriesCount")
     
     # ==================== ORGANIZACIONES ====================
-    organizations: List[UserOrganization] = Field(default_factory=list)
+    organizations: Optional[List[UserOrganization]] = None
     organizations_count: int = Field(0, alias="organizationsCount")
     
     # ==================== CONTRIBUCIONES ====================
     contributions: Optional[ContributionsCollection] = Field(None, alias="contributionsCollection")
-    contributions_by_repository: List[CommitContributionsByRepository] = Field(default_factory=list)
+    contributions_by_repository: Optional[List[CommitContributionsByRepository]] = None
     total_commit_contributions: Optional[int] = Field(None, alias="totalCommitContributions")
     total_issue_contributions: Optional[int] = Field(None, alias="totalIssueContributions")
     total_pr_contributions: Optional[int] = Field(None, alias="totalPrContributions")
     total_pr_review_contributions: Optional[int] = Field(None, alias="totalPrReviewContributions")
     watching_count: Optional[int] = Field(None, alias="watchingCount")
     
-    # ==================== ISSUES Y PULL REQUESTS ====================
-    issues_count: int = Field(0, alias="issuesCount")
-    pull_requests_count: int = Field(0, alias="pullRequestsCount")
-    
     # ==================== GISTS ====================
-    gists: List[Gist] = Field(default_factory=list)
-    gists_count: Optional[int] = Field(None, alias="gistsCount")
+    gists: Optional[List[Gist]] = None
     public_gists_count: Optional[int] = Field(None, alias="publicGistsCount")
     
     # ==================== PACKAGES ====================
@@ -205,14 +197,74 @@ class User(BaseModel):
     status: Optional[Dict[str, Any]] = None  # Emoji status del usuario
     
     # ==================== METADATA ADICIONAL ====================
-    any_pinnable_items: bool = Field(False, alias="anyPinnableItems")
     estimated_next_sponsors_payout_in_cents: Optional[int] = Field(
         None, 
         alias="estimatedNextSponsorsPayoutInCents"
     )
     
+    # ==================== ENRIQUECIMIENTO - CAMPOS ADICIONALES ====================
+    # Perfil social enriquecido
+    social_profile_enriched: bool = Field(False)
+    status_message: Optional[str] = None
+    status_emoji: Optional[str] = None
+    
+    # Sponsors detallados
+    sponsors: Optional[List[Dict[str, Any]]] = None
+    
+    # Gists quantum
+    quantum_gists: Optional[List[Dict[str, Any]]] = None
+    quantum_gists_count: int = Field(0)
+    
+    # Lenguajes detallados con bytes
+    languages_detailed: Optional[List[Dict[str, Any]]] = None
+    
+    # Top repositorios por contribución
+    top_contributed_repos: Optional[List[Dict[str, Any]]] = None
+    
+    # Issues y PRs notables
+    notable_issues_prs: Optional[Dict[str, Any]] = None
+    
+    # Paquetes
+    packages: Optional[List[Dict[str, Any]]] = None
+    
+    # Proyectos
+    projects: Optional[List[Dict[str, Any]]] = None
+    
+    # Red social (muestra)
+    social_network_sample: Optional[Dict[str, Any]] = None
+    
+    # Repositorios quantum relacionados
+    quantum_repositories: Optional[List[Dict[str, Any]]] = None
+    is_quantum_contributor: bool = Field(False)
+    
+    # Top lenguajes
+    top_languages: Optional[List[Dict[str, Any]]] = None
+    
+    # Actividad reciente (30 días)
+    recent_commits_30d: Optional[int] = None
+    recent_issues_30d: Optional[int] = None
+    recent_prs_30d: Optional[int] = None
+    recent_reviews_30d: Optional[int] = None
+    
+    # Métricas sociales calculadas
+    follower_following_ratio: Optional[float] = None
+    stars_per_repo: Optional[float] = None
+    
+    # Quantum expertise score (0-100)
+    quantum_expertise_score: Optional[float] = None
+    
+    # Referencias a colección de repositorios
+    repository_references: Optional[Dict[str, Any]] = None
+    
+    # Flags de detección
+    is_bot: bool = Field(False)
+    extracted_from: List[Dict[str, Any]] = Field(default_factory=list)  # Mantener: siempre tiene al menos 1 elemento
+    
     # ==================== CAMPOS PERSONALIZADOS ====================
     custom_properties: Dict[str, Any] = Field(default_factory=dict)
+    
+    # ==================== TRACKING DE ENRIQUECIMIENTO ====================
+    enrichment_status: Optional[Dict[str, Any]] = None  # {is_complete, last_enriched, fields_enriched, fields_missing, total_fields_enriched}
     
     class Config:
         populate_by_name = True
@@ -255,7 +307,6 @@ class User(BaseModel):
         repos_data = data.get("repositories", {})
         repos_nodes = repos_data.get("nodes", [])
         repositories = [UserRepository(**repo) for repo in repos_nodes]
-        repositories_count = repos_data.get("totalCount", 0)
         
         # Repositorios públicos/privados
         public_repos_count = data.get("publicRepositories", {}).get("totalCount", 0)
@@ -280,7 +331,7 @@ class User(BaseModel):
                 starredAt=edge.get("starredAt")
             )
             starred_repositories.append(starred_repo)
-        starred_repositories_count = starred_data.get("totalCount", 0)
+        starred_repos_count = starred_data.get("totalCount", 0)
         
         # ==================== PROCESAR ORGANIZACIONES ====================
         orgs_data = data.get("organizations", {})
@@ -312,15 +363,10 @@ class User(BaseModel):
                 )
                 contributions_by_repository.append(contrib_by_repo)
         
-        # ==================== PROCESAR ISSUES Y PRS ====================
-        issues_count = data.get("issues", {}).get("totalCount", 0)
-        pull_requests_count = data.get("pullRequests", {}).get("totalCount", 0)
-        
         # ==================== PROCESAR GISTS ====================
         gists_data = data.get("gists", {})
         gists_nodes = gists_data.get("nodes", [])
         gists = [Gist(**gist) for gist in gists_nodes]
-        gists_count = gists_data.get("totalCount", 0)
         public_gists_count = data.get("publicGists", {}).get("totalCount", 0)
         
         # ==================== PROCESAR CONTADORES ADICIONALES ====================
@@ -358,23 +404,19 @@ class User(BaseModel):
         user_data = {
             **data,
             "repositories": repositories,
-            "repositoriesCount": repositories_count,
             "publicReposCount": public_repos_count,
             "privateReposCount": private_repos_count,
             "ownedPrivateReposCount": owned_private_repos_count,
             "pinnedRepositories": pinned_repositories,
             "starredRepositories": starred_repositories,
-            "starredRepositoriesCount": starred_repositories_count,
+            "starredReposCount": starred_repos_count,
             "organizations": organizations,
             "organizationsCount": organizations_count,
             "followersCount": followers_count,
             "followingCount": following_count,
             "contributionsCollection": contributions,
             "contributionsByRepository": contributions_by_repository,
-            "issuesCount": issues_count,
-            "pullRequestsCount": pull_requests_count,
             "gists": gists,
-            "gistsCount": gists_count,
             "publicGistsCount": public_gists_count,
             "packagesCount": packages_count,
             "projectsCount": projects_count,
