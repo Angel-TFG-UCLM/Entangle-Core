@@ -770,7 +770,7 @@ class UserEnrichmentEngine:
             if orgs:
                 quantum_orgs = [
                     org for org in orgs 
-                    if any(keyword in (org.get("name", "") + org.get("description", "")).lower() 
+                    if any(keyword in ((org.get("name") or "") + (org.get("description") or "")).lower() 
                            for keyword in ["quantum", "qiskit", "cirq", "pennylane"])
                 ]
                 score += len(quantum_orgs) * 10.0
