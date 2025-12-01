@@ -30,16 +30,11 @@ from .organization import (
     SponsorListing
 )
 
-# User models
+# User models v3.0 - LIMPIO (solo clases que existen)
 from .user import (
     User,
     UserRepository,
-    UserOrganization,
-    ContributionsCollection,
-    CommitContributionsByRepository,
-    StarredRepository,
-    Gist,
-    SocialAccount
+    UserOrganization
 )
 
 # Relation models
@@ -74,15 +69,10 @@ __all__ = [
     "Team",
     "SponsorListing",
     
-    # User
+    # User v3.0
     "User",
     "UserRepository",
     "UserOrganization",
-    "ContributionsCollection",
-    "CommitContributionsByRepository",
-    "StarredRepository",
-    "Gist",
-    "SocialAccount",
     
     # Relation
     "Relation",
