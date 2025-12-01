@@ -157,7 +157,7 @@ class User(BaseModel):
     watching_count: Optional[int] = Field(None, alias="watchingCount")
     
     # ==================== GISTS ====================
-    gists: Optional[List[Gist]] = None
+    # gists: Lista eliminada - solo mantenemos el contador
     public_gists_count: Optional[int] = Field(None, alias="publicGistsCount")
     
     # ==================== PACKAGES ====================
@@ -208,37 +208,23 @@ class User(BaseModel):
     status_message: Optional[str] = None
     status_emoji: Optional[str] = None
     
-    # Sponsors detallados
-    sponsors: Optional[List[Dict[str, Any]]] = None
+    # CAMPOS ELIMINADOS (solo mantener contadores):
+    # - sponsors: List - ELIMINADO (mantener sponsors_count)
+    # - quantum_gists: List - ELIMINADO (no usado)
+    # - quantum_gists_count - ELIMINADO (no usado)
+    # - languages_detailed: List - ELIMINADO (reemplazado por top_languages simplificado)
+    # - top_contributed_repos: List - ELIMINADO (no usado)
+    # - notable_issues_prs: Dict - ELIMINADO (no usado)
+    # - packages: List - ELIMINADO (mantener packages_count)
+    # - projects: List - ELIMINADO (mantener projects_count)
+    # - social_network_sample: Dict - ELIMINADO (no usado)
     
-    # Gists quantum
-    quantum_gists: Optional[List[Dict[str, Any]]] = None
-    quantum_gists_count: int = Field(0)
-    
-    # Lenguajes detallados con bytes
-    languages_detailed: Optional[List[Dict[str, Any]]] = None
-    
-    # Top repositorios por contribución
-    top_contributed_repos: Optional[List[Dict[str, Any]]] = None
-    
-    # Issues y PRs notables
-    notable_issues_prs: Optional[Dict[str, Any]] = None
-    
-    # Paquetes
-    packages: Optional[List[Dict[str, Any]]] = None
-    
-    # Proyectos
-    projects: Optional[List[Dict[str, Any]]] = None
-    
-    # Red social (muestra)
-    social_network_sample: Optional[Dict[str, Any]] = None
-    
-    # Repositorios quantum relacionados
+    # Repositorios quantum relacionados (CORE TFG - MANTENER)
     quantum_repositories: Optional[List[Dict[str, Any]]] = None
     is_quantum_contributor: bool = Field(False)
     
-    # Top lenguajes
-    top_languages: Optional[List[Dict[str, Any]]] = None
+    # Top lenguajes simplificado (CORE TFG - MANTENER)
+    top_languages: Optional[List[str]] = None  # Lista simple de strings ["Python", "JavaScript", "Go"]
     
     # Actividad reciente (30 días)
     recent_commits_30d: Optional[int] = None
@@ -268,6 +254,7 @@ class User(BaseModel):
     
     class Config:
         populate_by_name = True
+        extra = "ignore"  # Ignorar campos adicionales de BD para retrocompatibilidad
         json_encoders = {
             datetime: lambda v: v.isoformat() if v else None
         }
@@ -364,9 +351,7 @@ class User(BaseModel):
                 contributions_by_repository.append(contrib_by_repo)
         
         # ==================== PROCESAR GISTS ====================
-        gists_data = data.get("gists", {})
-        gists_nodes = gists_data.get("nodes", [])
-        gists = [Gist(**gist) for gist in gists_nodes]
+        # Solo extraer el contador, no la lista completa
         public_gists_count = data.get("publicGists", {}).get("totalCount", 0)
         
         # ==================== PROCESAR CONTADORES ADICIONALES ====================
@@ -416,7 +401,6 @@ class User(BaseModel):
             "followingCount": following_count,
             "contributionsCollection": contributions,
             "contributionsByRepository": contributions_by_repository,
-            "gists": gists,
             "publicGistsCount": public_gists_count,
             "packagesCount": packages_count,
             "projectsCount": projects_count,
