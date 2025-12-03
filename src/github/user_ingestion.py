@@ -278,7 +278,15 @@ class UserIngestionEngine:
                     error_str = str(e)
                     
                     # Distinguir tipos de errores
-                    if "NOT_FOUND" in error_str or "Could not resolve" in error_str:
+                    if "RATE_LIMIT" in error_str or "rate limit" in error_str.lower():
+                        # El error de rate limit ya fue manejado en graphql_client con espera
+                        # Si llegamos aquí, significa que se agotaron los reintentos
+                        logger.error(f"❌ Usuario {login}: Rate limit persistente después de esperar - Abortando lote")
+                        self.stats["total_errors"] += 1
+                        # Detener el procesamiento del lote actual para no seguir golpeando la API
+                        logger.warning("⏸️ Pausando procesamiento por rate limit. Continuar en próxima ejecución.")
+                        return  # Salir del método completamente
+                    elif "NOT_FOUND" in error_str or "Could not resolve" in error_str:
                         logger.warning(f"⚠️  Usuario {login}: Cuenta eliminada o no existe")
                     elif "timeout" in error_str.lower() or "Timeout" in error_str:
                         logger.warning(f"⚠️  Usuario {login}: Timeout después de 5 reintentos - Saltando y continuando")
@@ -292,9 +300,10 @@ class UserIngestionEngine:
                     self.stats["total_errors"] += 1
                     continue  # Continuar con siguiente usuario
             
-            # Pausa entre lotes
+            # Pausa entre lotes (más larga para prevenir rate limit)
             if i + self.batch_size < total:
-                time.sleep(1)
+                logger.debug("⏸️ Pausa de 2 segundos entre lotes para prevenir rate limit...")
+                time.sleep(2)
     
     def _fetch_and_save_single_user(self, user_stub: Dict[str, Any]) -> None:
         """

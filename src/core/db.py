@@ -45,7 +45,9 @@ class Database:
                 config.MONGO_URI,
                 serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=10000,
-                socketTimeoutMS=10000
+                socketTimeoutMS=10000,
+                retryReads=True,
+                retryWrites=False
             )
             
             # Verificar la conexión con ping
