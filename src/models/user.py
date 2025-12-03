@@ -67,17 +67,17 @@ class User(BaseModel):
     followers_count: int = Field(0, alias="followersCount")
     following_count: int = Field(0, alias="followingCount")
     public_repos_count: int = Field(0, alias="publicReposCount")
-    starred_repos_count: int = Field(0, alias="starredReposCount")
-    public_gists_count: int = Field(0, alias="publicGistsCount")
-    packages_count: int = Field(0, alias="packagesCount")
-    sponsors_count: int = Field(0, alias="sponsorsCount")
-    sponsoring_count: int = Field(0, alias="sponsoringCount")
+    starred_repos_count: Optional[int] = Field(None, alias="starredReposCount")  # Enriquecido después
+    public_gists_count: Optional[int] = Field(None, alias="publicGistsCount")  # Enriquecido después
+    packages_count: Optional[int] = Field(None, alias="packagesCount")  # Enriquecido después
+    sponsors_count: Optional[int] = Field(None, alias="sponsorsCount")  # Enriquecido después
+    sponsoring_count: Optional[int] = Field(None, alias="sponsoringCount")  # Enriquecido después
     
     # ==================== CONTADORES DE CONTRIBUCIONES ====================
-    total_commit_contributions: int = Field(0, alias="totalCommitContributions")
-    total_issue_contributions: int = Field(0, alias="totalIssueContributions")
-    total_pr_contributions: int = Field(0, alias="totalPrContributions")
-    total_pr_review_contributions: int = Field(0, alias="totalPrReviewContributions")
+    total_commit_contributions: Optional[int] = Field(None, alias="totalCommitContributions")  # Enriquecido después
+    total_issue_contributions: Optional[int] = Field(None, alias="totalIssueContributions")  # Enriquecido después
+    total_pr_contributions: Optional[int] = Field(None, alias="totalPrContributions")  # Enriquecido después
+    total_pr_review_contributions: Optional[int] = Field(None, alias="totalPrReviewContributions")  # Enriquecido después
     
     # ==================== LISTAS ESENCIALES (con validación automática) ====================
     organizations: List[UserOrganization] = Field(default_factory=list)
@@ -153,22 +153,24 @@ class User(BaseModel):
             if repo.get("__typename") == "Repository"
         ] if pinned_nodes else []
         
-        # Contadores
+        # Contadores básicos (disponibles en ingesta)
         followers_count = data.get("followers", {}).get("totalCount", 0)
         following_count = data.get("following", {}).get("totalCount", 0)
         public_repos_count = data.get("repositories", {}).get("totalCount", 0)
-        starred_repos_count = data.get("starredRepositories", {}).get("totalCount", 0)
-        public_gists_count = data.get("gists", {}).get("totalCount", 0)
-        packages_count = data.get("packages", {}).get("totalCount", 0)
-        sponsors_count = data.get("sponsorshipsAsMaintainer", {}).get("totalCount", 0)
-        sponsoring_count = data.get("sponsorshipsAsSponsor", {}).get("totalCount", 0)
         
-        # Contribuciones
+        # Contadores que se enriquecen después (pueden ser None en ingesta)
+        starred_repos_count = data.get("starredRepositories", {}).get("totalCount") if data.get("starredRepositories") else None
+        public_gists_count = data.get("gists", {}).get("totalCount") if data.get("gists") else None
+        packages_count = data.get("packages", {}).get("totalCount") if data.get("packages") else None
+        sponsors_count = data.get("sponsorshipsAsMaintainer", {}).get("totalCount") if data.get("sponsorshipsAsMaintainer") else None
+        sponsoring_count = data.get("sponsorshipsAsSponsor", {}).get("totalCount") if data.get("sponsorshipsAsSponsor") else None
+        
+        # Contribuciones (se enriquecen después, pueden ser None en ingesta)
         contrib = data.get("contributionsCollection", {})
-        total_commit_contributions = contrib.get("totalCommitContributions", 0)
-        total_issue_contributions = contrib.get("totalIssueContributions", 0)
-        total_pr_contributions = contrib.get("totalPullRequestContributions", 0)
-        total_pr_review_contributions = contrib.get("totalPullRequestReviewContributions", 0)
+        total_commit_contributions = contrib.get("totalCommitContributions") if contrib else None
+        total_issue_contributions = contrib.get("totalIssueContributions") if contrib else None
+        total_pr_contributions = contrib.get("totalPullRequestContributions") if contrib else None
+        total_pr_review_contributions = contrib.get("totalPullRequestReviewContributions") if contrib else None
         
         # Construir diccionario limpio
         user_data = {

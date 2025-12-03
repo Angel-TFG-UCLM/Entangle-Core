@@ -32,7 +32,6 @@ class SchemaFixEngine:
     # Campos obsoletos que ya NO existen en User v3.0
     OBSOLETE_FIELDS = [
         "projects",
-        "projects_count",
         "sponsors",  # Lista (mantener sponsors_count)
         "packages",  # Lista (mantener packages_count)
         "social_network_sample",
@@ -52,8 +51,6 @@ class SchemaFixEngine:
         "contributions_by_repository",
         "private_repos_count",
         "owned_private_repos_count",
-        "organizations_count",
-        "watching_count",
         "is_bounty_hunter",
         "is_campus_expert",
         "is_developer_program_member",
