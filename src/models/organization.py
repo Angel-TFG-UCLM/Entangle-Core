@@ -49,6 +49,22 @@ class Organization(BaseModel):
     ingested_at: Optional[datetime] = None
     enriched_at: Optional[datetime] = None
     
+    # ==================== RELEVANCIA Y TRAZABILIDAD ====================
+    is_relevant: bool = Field(
+        False,
+        description="True si tenemos repositorios quantum ingestados de esta organización"
+    )
+    
+    discovered_from_repos: List[str] = Field(
+        default_factory=list,
+        description="IDs de repositorios quantum de nuestra BD que pertenecen a esta org"
+    )
+    
+    discovered_from_repo_names: List[str] = Field(
+        default_factory=list,
+        description="Nombres legibles de los repos (owner/name) para debugging"
+    )
+    
     # ==================== MÉTRICAS BÁSICAS (Ingesta) ====================
     public_repos_count: Optional[int] = Field(
         None,
@@ -119,7 +135,7 @@ class Organization(BaseModel):
         populate_by_name = True
         extra = "ignore"  # Ignora campos desconocidos de la API
     
-    @validator('quantum_repositories', 'top_quantum_contributors', pre=True)
+    @validator('quantum_repositories', 'top_quantum_contributors', 'discovered_from_repos', 'discovered_from_repo_names', pre=True)
     def convert_none_to_empty_list(cls, v):
         """Convierte None a lista vacía automáticamente."""
         return v if v is not None else []

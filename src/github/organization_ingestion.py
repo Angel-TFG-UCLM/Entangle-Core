@@ -231,20 +231,31 @@ class OrganizationIngestionEngine:
             # Crear modelo
             organization = Organization.from_graphql_response(org_data)
             
+            # Calcular relevancia basándose en repos existentes
+            relevance_data = self._calculate_organization_relevance(login)
+            
+            # Actualizar campos de relevancia
+            org_dict = organization.model_dump(by_alias=False, exclude_none=False)
+            org_dict.update(relevance_data)
+            
+            # Log de relevancia
+            if relevance_data["is_relevant"]:
+                logger.debug(f"   ✅ Organización {login} ES RELEVANTE ({len(relevance_data['discovered_from_repos'])} repos quantum)")
+            else:
+                logger.debug(f"   ⚠️  Organización {login} NO es relevante (sin repos quantum ingestados)")
+            
             # Guardar en BD
             if existing:
                 # Actualizar
                 self.organizations_repository.collection.update_one(
                     {"login": login},
-                    {"$set": organization.model_dump(by_alias=False, exclude_none=False)}
+                    {"$set": org_dict}
                 )
                 logger.debug(f"   ↻ Organización {login} actualizada")
                 self.stats["total_updated"] += 1
             else:
                 # Insertar
-                self.organizations_repository.collection.insert_one(
-                    organization.model_dump(by_alias=False, exclude_none=False)
-                )
+                self.organizations_repository.collection.insert_one(org_dict)
                 logger.debug(f"   ✨ Organización {login} insertada")
                 self.stats["total_inserted"] += 1
             
@@ -255,6 +266,49 @@ class OrganizationIngestionEngine:
             logger.error(f"   ❌ Error procesando {login}: {e}")
             self.stats["total_errors"] += 1
             return False
+    
+    def _calculate_organization_relevance(self, org_login: str) -> Dict[str, Any]:
+        """
+        Calcula la relevancia de una organización basándose en repos quantum ingestados.
+        
+        Args:
+            org_login: Login de la organización
+            
+        Returns:
+            Dict con is_relevant, discovered_from_repos, discovered_from_repo_names
+        """
+        try:
+            # Buscar repos de esta organización en nuestra BD
+            # Si está en la colección repositories, ya es quantum-related (pasó filtros)
+            repos_collection = self.users_repository.collection.database["repositories"]
+            
+            org_repos = list(repos_collection.find({
+                "owner.login": org_login
+            }))
+            
+            is_relevant = len(org_repos) > 0
+            
+            # Extraer IDs y nombres
+            repo_ids = [repo.get("id") for repo in org_repos if repo.get("id")]
+            repo_names = [
+                f"{repo.get('owner', {}).get('login', '')}/{repo.get('name', '')}"
+                for repo in org_repos
+                if repo.get("name")
+            ]
+            
+            return {
+                "is_relevant": is_relevant,
+                "discovered_from_repos": repo_ids,
+                "discovered_from_repo_names": repo_names
+            }
+            
+        except Exception as e:
+            logger.error(f"   ❌ Error calculando relevancia de {org_login}: {e}")
+            return {
+                "is_relevant": False,
+                "discovered_from_repos": [],
+                "discovered_from_repo_names": []
+            }
     
     def _fetch_organization_basic(self, login: str) -> Optional[Dict[str, Any]]:
         """
@@ -300,6 +354,15 @@ class OrganizationIngestionEngine:
             duration = self.stats["end_time"] - self.stats["start_time"]
             self.stats["duration_seconds"] = duration.total_seconds()
         
+        # Calcular organizaciones relevantes vs no relevantes
+        try:
+            total_relevant = self.organizations_repository.collection.count_documents({"is_relevant": True})
+            total_non_relevant = self.organizations_repository.collection.count_documents({"is_relevant": False})
+            self.stats["total_relevant"] = total_relevant
+            self.stats["total_non_relevant"] = total_non_relevant
+        except Exception as e:
+            logger.error(f"Error calculando stats de relevancia: {e}")
+        
         logger.info("\n" + "=" * 80)
         logger.info("📊 RESUMEN DE INGESTA DE ORGANIZACIONES")
         logger.info("=" * 80)
@@ -310,7 +373,15 @@ class OrganizationIngestionEngine:
         logger.info(f"⏭️  Total saltadas: {self.stats['total_skipped']}")
         logger.info(f"❌ Total errores: {self.stats['total_errors']}")
         
+        if "total_relevant" in self.stats:
+            logger.info("\n📊 Análisis de Relevancia:")
+            logger.info(f"   ✅ Organizaciones relevantes (con repos quantum): {self.stats['total_relevant']}")
+            logger.info(f"   ⚠️  Organizaciones no relevantes (sin repos quantum): {self.stats['total_non_relevant']}")
+            if self.stats['total_relevant'] + self.stats['total_non_relevant'] > 0:
+                relevance_pct = (self.stats['total_relevant'] / (self.stats['total_relevant'] + self.stats['total_non_relevant'])) * 100
+                logger.info(f"   📈 % Relevancia: {relevance_pct:.1f}%")
+        
         if "duration_seconds" in self.stats:
-            logger.info(f"⏱️  Duración: {self.stats['duration_seconds']:.2f} segundos")
+            logger.info(f"\n⏱️  Duración: {self.stats['duration_seconds']:.2f} segundos")
         
         return self.stats

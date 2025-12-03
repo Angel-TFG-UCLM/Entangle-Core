@@ -17,6 +17,7 @@ from ..github.user_ingestion import UserIngestionEngine
 from ..github.organization_ingestion import OrganizationIngestionEngine
 from ..github.enrichment import EnrichmentEngine
 from ..github.user_enrichment import UserEnrichmentEngine
+from ..github.organization_enrichment import OrganizationEnrichmentEngine
 from ..github.graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
 from ..core.config import config, ingestion_config
@@ -415,6 +416,58 @@ async def ingest_organizations(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/enrichment/organizations")
+async def enrich_organizations(
+    background_tasks: BackgroundTasks,
+    max_orgs: Optional[int] = Query(None, description="Máximo de organizaciones a enriquecer"),
+    force_reenrich: bool = Query(False, description="Re-enriquecer incluso organizaciones ya enriquecidas"),
+    batch_size: int = Query(5, description="Tamaño del lote para procesamiento")
+):
+    """
+    Ejecuta el enriquecimiento de organizaciones ya ingestadas.
+    Calcula métricas quantum: quantum_focus_score, repos quantum, top contributors.
+    
+    Args:
+        max_orgs: Límite opcional de organizaciones a enriquecer
+        force_reenrich: Si True, re-enriquece todas las organizaciones
+        batch_size: Tamaño del lote para procesamiento (default 5 para Rate Limit)
+        
+    Returns:
+        Estado inicial de la tarea y task_id para consultar progreso
+    """
+    try:
+        task_id = f"org_enrichment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        background_tasks_status[task_id] = {
+            "status": "running",
+            "started_at": datetime.now().isoformat(),
+            "progress": "Inicializando enriquecimiento de organizaciones...",
+            "stats": None,
+            "error": None
+        }
+        
+        background_tasks.add_task(
+            _run_organization_enrichment,
+            task_id,
+            max_orgs,
+            force_reenrich,
+            batch_size
+        )
+        
+        logger.info(f"✅ Tarea de enriquecimiento de organizaciones iniciada: {task_id}")
+        
+        return {
+            "task_id": task_id,
+            "status": "running",
+            "message": "Enriquecimiento de organizaciones iniciado en segundo plano",
+            "check_status_url": f"/api/v1/enrichment/status/{task_id}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error al iniciar enriquecimiento de organizaciones: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============================================================================
 # ENDPOINTS DE ESTADO
 # ============================================================================
@@ -649,6 +702,50 @@ def _run_organization_ingestion(
         
         background_tasks_status[task_id]["status"] = "completed"
         background_tasks_status[task_id]["progress"] = "Ingesta de organizaciones completada"
+        background_tasks_status[task_id]["stats"] = stats
+        background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
+        
+        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        
+    except Exception as e:
+        logger.error(f"❌ Error en tarea {task_id}: {e}")
+        background_tasks_status[task_id]["status"] = "failed"
+        background_tasks_status[task_id]["progress"] = f"Error: {str(e)}"
+        background_tasks_status[task_id]["error"] = str(e)
+        background_tasks_status[task_id]["failed_at"] = datetime.now().isoformat()
+
+
+def _run_organization_enrichment(
+    task_id: str,
+    max_orgs: Optional[int],
+    force_reenrich: bool,
+    batch_size: int
+):
+    """Ejecuta el enriquecimiento de organizaciones en background."""
+    try:
+        background_tasks_status[task_id]["progress"] = "Creando motor de enriquecimiento de organizaciones..."
+        
+        orgs_repo = MongoRepository("organizations")
+        repos_repo = MongoRepository("repositories")
+        users_repo = MongoRepository("users")
+        
+        engine = OrganizationEnrichmentEngine(
+            github_token=config.GITHUB_TOKEN,
+            organizations_repository=orgs_repo,
+            repositories_repository=repos_repo,
+            users_repository=users_repo,
+            batch_size=batch_size
+        )
+        
+        background_tasks_status[task_id]["progress"] = "Ejecutando enriquecimiento de organizaciones..."
+        
+        stats = engine.enrich_all_organizations(
+            max_orgs=max_orgs,
+            force_reenrich=force_reenrich
+        )
+        
+        background_tasks_status[task_id]["status"] = "completed"
+        background_tasks_status[task_id]["progress"] = "Enriquecimiento de organizaciones completado"
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
