@@ -67,6 +67,7 @@ class OrganizationEnrichmentEngine:
         repositories_repository: MongoRepository,
         users_repository: MongoRepository,
         batch_size: int = 5,
+        sleep_time: float = 0.5,
         config: Optional[Dict[str, Any]] = None
     ):
         """
@@ -78,6 +79,7 @@ class OrganizationEnrichmentEngine:
             repositories_repository: Repositorio de repositorios (para buscar quantum repos)
             users_repository: Repositorio de usuarios (para contributors)
             batch_size: Tamaño del lote (default 5 para Rate Limit)
+            sleep_time: Tiempo de espera entre requests (default 0.5s)
             config: Configuración opcional
         """
         self.github_token = github_token
@@ -85,6 +87,7 @@ class OrganizationEnrichmentEngine:
         self.repos_repository = repositories_repository
         self.users_repository = users_repository
         self.batch_size = batch_size
+        self.sleep_time = sleep_time
         self.config = config or {}
         self.graphql_client = GitHubGraphQLClient(github_token)
         
@@ -98,7 +101,7 @@ class OrganizationEnrichmentEngine:
             "end_time": None
         }
         
-        logger.info(f"🚀 OrganizationEnrichmentEngine v1.0 inicializado (batch_size={batch_size})")
+        logger.info(f"🚀 OrganizationEnrichmentEngine v1.0 inicializado (batch_size={batch_size}, sleep_time={sleep_time}s)")
     
     def enrich_all_organizations(
         self, 
@@ -172,7 +175,7 @@ class OrganizationEnrichmentEngine:
                 self._enrich_single_organization(org)
                 
                 # Sleep para evitar rate limits
-                time.sleep(0.5)
+                time.sleep(self.sleep_time)
             
             logger.info(f"✅ Lote {batch_num}/{total_batches} completado")
         
@@ -219,11 +222,21 @@ class OrganizationEnrichmentEngine:
                 top_contributors = self._find_top_quantum_contributors(quantum_repos_data["repo_ids"])
                 updates["top_quantum_contributors"] = top_contributors
                 updates["quantum_contributors_count"] = len(top_contributors)
+                
+                # Stack tecnológico (top lenguajes)
+                top_languages = self._calculate_top_languages(quantum_repos_data["repo_ids"])
+                updates["top_languages"] = top_languages
+                
+                # Prestigio acumulado (suma de estrellas)
+                total_stars = self._calculate_total_stars(quantum_repos_data["repo_ids"])
+                updates["total_stars"] = total_stars
             else:
                 updates["quantum_repositories"] = []
                 updates["quantum_repositories_count"] = 0
                 updates["top_quantum_contributors"] = []
                 updates["quantum_contributors_count"] = 0
+                updates["top_languages"] = []
+                updates["total_stars"] = 0
             
             # ==================== CALCULAR QUANTUM FOCUS SCORE ====================
             quantum_score = self._calculate_quantum_focus_score(
@@ -259,14 +272,23 @@ class OrganizationEnrichmentEngine:
             logger.info(f"✅ Organización {login} enriquecida correctamente")
             logger.info(f"   📊 Repos quantum: {updates['quantum_repositories_count']}/{updates['total_repositories_count']}")
             logger.info(f"   🎯 Quantum score: {updates.get('quantum_focus_score', 0):.2f}%")
+            logger.info(f"   ⭐ Total estrellas: {updates.get('total_stars', 0)}")
+            
+            # Mostrar top lenguajes
+            if updates.get('top_languages'):
+                top_3_langs = updates['top_languages'][:3]
+                langs_str = ", ".join([f"{lang['name']} ({lang['percentage']:.1f}%)" for lang in top_3_langs])
+                logger.info(f"   💻 Top lenguajes: {langs_str}")
             
             # Mostrar info de relevancia
             if org.get("is_relevant"):
-                discovered_repos = org.get("discovered_from_repo_names", [])
+                discovered_repos = org.get("discovered_from_repos", [])
                 if discovered_repos:
-                    logger.info(f"   ✅ Relevante - Descubierta desde: {', '.join(discovered_repos[:3])}")
-                    if len(discovered_repos) > 3:
-                        logger.info(f"      ... y {len(discovered_repos) - 3} repos más")
+                    repo_names = [repo.get("name", "") for repo in discovered_repos if isinstance(repo, dict)]
+                    if repo_names:
+                        logger.info(f"   ✅ Relevante - Descubierta desde: {', '.join(repo_names[:3])}")
+                        if len(repo_names) > 3:
+                            logger.info(f"      ... y {len(repo_names) - 3} repos más")
             else:
                 logger.info(f"   ⚠️  No relevante - Sin repos quantum ingestados")
             
@@ -336,7 +358,7 @@ class OrganizationEnrichmentEngine:
             logger.error(f"❌ Error buscando repos quantum de {org_login}: {e}")
             return None
     
-    def _find_top_quantum_contributors(self, repo_ids: List[str], limit: int = 10) -> List[str]:
+    def _find_top_quantum_contributors(self, repo_ids: List[str], limit: int = 10) -> List[Dict[str, str]]:
         """
         Encuentra los top contributors a repos quantum de la organización.
         
@@ -345,7 +367,7 @@ class OrganizationEnrichmentEngine:
             limit: Número máximo de contributors
             
         Returns:
-            Lista de IDs de usuarios (top contributors)
+            Lista de diccionarios con {id, login} de los top contributors
         """
         try:
             # Agregación para contar contribuciones por usuario
@@ -362,6 +384,7 @@ class OrganizationEnrichmentEngine:
                 # Agrupar por usuario y sumar contribuciones
                 {"$group": {
                     "_id": "$id",
+                    "login": {"$first": "$login"},
                     "total_contributions": {"$sum": "$extracted_from.contributions"}
                 }},
                 
@@ -374,11 +397,121 @@ class OrganizationEnrichmentEngine:
             
             results = list(self.users_repository.collection.aggregate(pipeline))
             
-            return [result["_id"] for result in results if result.get("_id")]
+            # Retornar lista con {id, login}
+            contributors = []
+            for result in results:
+                user_id = result.get("_id")
+                user_login = result.get("login")
+                if user_id and user_login:
+                    contributors.append({
+                        "id": user_id,
+                        "login": user_login
+                    })
+            
+            return contributors
             
         except Exception as e:
             logger.error(f"❌ Error buscando top contributors: {e}")
             return []
+    
+    def _calculate_top_languages(self, repo_ids: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Calcula el stack tecnológico (top lenguajes) de los repos quantum.
+        
+        Args:
+            repo_ids: Lista de IDs de repositorios quantum
+            limit: Número máximo de lenguajes a retornar
+            
+        Returns:
+            Lista de diccionarios con {name, percentage, repo_count}
+        """
+        try:
+            from collections import Counter
+            
+            if not repo_ids:
+                return []
+            
+            # Buscar repos en la BD por sus IDs
+            repos = list(self.repos_repository.collection.find(
+                {"id": {"$in": repo_ids}},
+                {"primary_language": 1, "_id": 0}
+            ))
+            
+            if not repos:
+                return []
+            
+            # Contar lenguajes y repos que los usan
+            language_counter = Counter()
+            repos_per_language = {}
+            
+            for repo in repos:
+                primary_language = repo.get("primary_language", {})
+                
+                # Verificar que sea un dict y tenga el campo name
+                if isinstance(primary_language, dict):
+                    lang_name = primary_language.get("name")
+                elif isinstance(primary_language, str):
+                    lang_name = primary_language
+                else:
+                    continue
+                
+                if lang_name:
+                    language_counter[lang_name] += 1
+                    repos_per_language[lang_name] = repos_per_language.get(lang_name, 0) + 1
+            
+            if not language_counter:
+                return []
+            
+            # Calcular porcentajes
+            total_repos = len(repos)
+            top_languages = []
+            
+            for lang_name, count in language_counter.most_common(limit):
+                percentage = (count / total_repos) * 100
+                top_languages.append({
+                    "name": lang_name,
+                    "percentage": round(percentage, 2),
+                    "repo_count": count
+                })
+            
+            return top_languages
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculando top languages: {e}")
+            return []
+    
+    def _calculate_total_stars(self, repo_ids: List[str]) -> int:
+        """
+        Calcula el prestigio acumulado (suma de estrellas) de los repos quantum.
+        
+        Args:
+            repo_ids: Lista de IDs de repositorios quantum
+            
+        Returns:
+            Suma total de estrellas
+        """
+        try:
+            if not repo_ids:
+                return 0
+            
+            # Buscar repos en la BD por sus IDs
+            repos = list(self.repos_repository.collection.find(
+                {"id": {"$in": repo_ids}},
+                {"stargazer_count": 1, "_id": 0}
+            ))
+            
+            total = 0
+            
+            for repo in repos:
+                stars = repo.get("stargazer_count", 0)
+                if isinstance(stars, int) and stars > 0:
+                    total += stars
+            
+            return total
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculando total stars: {e}")
+            return 0
     
     def _calculate_quantum_focus_score(
         self,

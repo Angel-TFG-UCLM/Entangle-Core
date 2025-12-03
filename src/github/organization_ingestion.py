@@ -288,26 +288,29 @@ class OrganizationIngestionEngine:
             
             is_relevant = len(org_repos) > 0
             
-            # Extraer IDs y nombres
-            repo_ids = [repo.get("id") for repo in org_repos if repo.get("id")]
-            repo_names = [
-                f"{repo.get('owner', {}).get('login', '')}/{repo.get('name', '')}"
-                for repo in org_repos
-                if repo.get("name")
-            ]
+            # Crear lista unificada con ID y nombre
+            discovered_repos = []
+            for repo in org_repos:
+                repo_id = repo.get("id")
+                repo_name = repo.get("name")
+                owner_login = repo.get("owner", {}).get("login", "")
+                
+                if repo_id and repo_name:
+                    discovered_repos.append({
+                        "id": repo_id,
+                        "name": f"{owner_login}/{repo_name}" if owner_login else repo_name
+                    })
             
             return {
                 "is_relevant": is_relevant,
-                "discovered_from_repos": repo_ids,
-                "discovered_from_repo_names": repo_names
+                "discovered_from_repos": discovered_repos
             }
             
         except Exception as e:
             logger.error(f"   ❌ Error calculando relevancia de {org_login}: {e}")
             return {
                 "is_relevant": False,
-                "discovered_from_repos": [],
-                "discovered_from_repo_names": []
+                "discovered_from_repos": []
             }
     
     def _fetch_organization_basic(self, login: str) -> Optional[Dict[str, Any]]:

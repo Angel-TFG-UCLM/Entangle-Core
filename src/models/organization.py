@@ -55,14 +55,9 @@ class Organization(BaseModel):
         description="True si tenemos repositorios quantum ingestados de esta organización"
     )
     
-    discovered_from_repos: List[str] = Field(
+    discovered_from_repos: List[Dict[str, str]] = Field(
         default_factory=list,
-        description="IDs de repositorios quantum de nuestra BD que pertenecen a esta org"
-    )
-    
-    discovered_from_repo_names: List[str] = Field(
-        default_factory=list,
-        description="Nombres legibles de los repos (owner/name) para debugging"
+        description="Repositorios quantum de nuestra BD que pertenecen a esta org [{id, name}]"
     )
     
     # ==================== MÉTRICAS BÁSICAS (Ingesta) ====================
@@ -123,9 +118,20 @@ class Organization(BaseModel):
         description="IDs de repositorios quantum de la organización"
     )
     
-    top_quantum_contributors: List[str] = Field(
+    top_quantum_contributors: List[Dict[str, str]] = Field(
         default_factory=list,
-        description="IDs de los top 10 contribuidores a repos quantum"
+        description="Top 10 contribuidores a repos quantum [{id, login}]"
+    )
+    
+    # ==================== ANÁLISIS TECNOLÓGICO Y PRESTIGIO ====================
+    top_languages: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Top lenguajes de programación usados en repos quantum [{name, percentage, repo_count}]"
+    )
+    
+    total_stars: Optional[int] = Field(
+        None,
+        description="Suma total de estrellas de todos los repositorios quantum de la organización"
     )
     
     # ==================== STATUS DE ENRIQUECIMIENTO ====================
@@ -135,7 +141,7 @@ class Organization(BaseModel):
         populate_by_name = True
         extra = "ignore"  # Ignora campos desconocidos de la API
     
-    @validator('quantum_repositories', 'top_quantum_contributors', 'discovered_from_repos', 'discovered_from_repo_names', pre=True)
+    @validator('quantum_repositories', 'top_quantum_contributors', 'discovered_from_repos', 'top_languages', pre=True)
     def convert_none_to_empty_list(cls, v):
         """Convierte None a lista vacía automáticamente."""
         return v if v is not None else []

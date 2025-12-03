@@ -82,7 +82,8 @@ def main():
             organizations_repository=orgs_repo,
             repositories_repository=repos_repo,
             users_repository=users_repo,
-            batch_size=batch_size
+            batch_size=batch_size,
+            sleep_time=0.5
         )
         
         # Ejecutar enriquecimiento
