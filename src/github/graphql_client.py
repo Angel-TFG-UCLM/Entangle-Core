@@ -76,8 +76,68 @@ class GitHubGraphQLClient:
                 
                 # Verificar si hay errores en la respuesta
                 if "errors" in data:
-                    logger.error(f"Errores en la respuesta de GraphQL: {data['errors']}")
-                    raise Exception(f"GraphQL errors: {data['errors']}")
+                    errors = data['errors']
+                    
+                    # Detectar específicamente errores de RATE_LIMIT
+                    is_rate_limit_error = False
+                    for error in errors:
+                        if error.get('type') == 'RATE_LIMIT' or 'rate limit' in str(error).lower():
+                            is_rate_limit_error = True
+                            logger.warning(f"⚠️ Rate limit de GitHub alcanzado: {error.get('message')}")
+                            
+                            # Obtener información del rate limit usando REST API (no GraphQL)
+                            try:
+                                rate_info = self._get_rate_limit_rest()
+                                graphql_rate = rate_info.get('resources', {}).get('graphql', {})
+                                
+                                reset_timestamp = graphql_rate.get('reset', 0)
+                                remaining = graphql_rate.get('remaining', 0)
+                                limit = graphql_rate.get('limit', 5000)
+                                
+                                logger.info(f"📊 Rate limit GraphQL: {remaining}/{limit} requests restantes")
+                                
+                                if reset_timestamp > 0:
+                                    # Calcular tiempo de espera exacto
+                                    reset_time = datetime.fromtimestamp(reset_timestamp)
+                                    now = datetime.now()
+                                    wait_seconds = max(0, (reset_time - now).total_seconds()) + 5  # +5s margen
+                                    
+                                    reset_str = reset_time.strftime('%Y-%m-%d %H:%M:%S')
+                                    logger.info(f"🕐 Rate limit se reseteará el: {reset_str}")
+                                    logger.info(f"⏳ Esperando {wait_seconds:.0f} segundos ({wait_seconds/60:.1f} minutos)...")
+                                    
+                                    # Esperar con progreso cada minuto
+                                    remaining_wait = wait_seconds
+                                    while remaining_wait > 0:
+                                        sleep_chunk = min(60, remaining_wait)
+                                        time.sleep(sleep_chunk)
+                                        remaining_wait -= sleep_chunk
+                                        if remaining_wait > 60:
+                                            logger.info(f"⏳ Quedan {remaining_wait:.0f}s ({remaining_wait/60:.1f} min)...")
+                                    
+                                    logger.info("✅ Rate limit reseteado. Reintentando query...")
+                                    # Salir del for de errores para reintentar
+                                    break
+                                else:
+                                    # Espera por defecto si no hay timestamp
+                                    logger.warning("⚠️ No se pudo obtener tiempo de reset. Esperando 1 hora...")
+                                    time.sleep(3600)
+                                    break
+                                    
+                            except Exception as rate_err:
+                                logger.error(f"❌ Error obteniendo rate limit REST: {rate_err}")
+                                # Espera por defecto
+                                logger.info("⏳ Esperando 1 hora por defecto...")
+                                time.sleep(3600)
+                                break
+                    
+                    # Si detectamos rate limit, continuar al siguiente intento
+                    if is_rate_limit_error and attempt < max_retries - 1:
+                        continue
+                    
+                    # Si no es rate limit o se agotaron reintentos, lanzar error
+                    logger.error(f"Errores en la respuesta de GraphQL: {errors}")
+                    raise Exception(f"GraphQL errors: {errors}")
                 
                 logger.debug("Query ejecutada exitosamente")
                 return data
@@ -191,6 +251,39 @@ class GitHubGraphQLClient:
                     logger.warning(f"Esperando {wait_seconds:.0f} segundos hasta el reset del rate limit...")
                     time.sleep(wait_seconds)
                     logger.info("Rate limit reseteado. Continuando...")
+    
+    def _get_rate_limit_rest(self) -> Dict[str, Any]:
+        """
+        Obtiene información del rate limit usando REST API en lugar de GraphQL.
+        
+        Esto evita el bucle recursivo cuando GraphQL está en rate limit.
+        Endpoint: https://api.github.com/rate_limit
+        
+        Returns:
+            Dict con información completa del rate limit:
+            {
+                "resources": {
+                    "core": {"limit": 5000, "remaining": 4999, "reset": 1234567890},
+                    "search": {"limit": 30, "remaining": 30, "reset": 1234567890},
+                    "graphql": {"limit": 5000, "remaining": 0, "reset": 1234567890}
+                }
+            }
+        """
+        rest_url = "https://api.github.com/rate_limit"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        try:
+            response = requests.get(rest_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            logger.debug(f"Rate limit REST obtenido: {data.get('resources', {}).get('graphql', {})}")
+            return data
+        except Exception as e:
+            logger.error(f"Error obteniendo rate limit REST: {e}")
+            raise
     
     def _build_search_query(self, config_criteria, use_simple_query: bool = False) -> str:
         """

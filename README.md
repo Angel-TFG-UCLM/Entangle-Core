@@ -122,6 +122,40 @@ python scripts/run_ingestion_segmented.py
 
 ---
 
+## 🌐 API REST
+
+El proyecto incluye una API REST completa con endpoints para todas las operaciones de ingesta y enriquecimiento.
+
+### 📡 Endpoints Principales
+
+- **Ingesta**:
+  - `POST /api/v1/ingestion/repositories` - Ingerir repositorios
+  - `POST /api/v1/ingestion/users` - Ingerir usuarios
+- **Enriquecimiento**:
+  - `POST /api/v1/enrichment/repositories` - Enriquecer repositorios
+  - `POST /api/v1/enrichment/users` - Enriquecer usuarios
+- **Consulta**:
+  - `GET /api/v1/ingestion/status/{task_id}` - Estado de tarea
+  - `GET /api/v1/tasks` - Listar todas las tareas
+
+### 📚 Documentación API
+
+- **Documentación completa**: [`docs/API_ENDPOINTS.md`](docs/API_ENDPOINTS.md)
+- **Swagger UI**: `http://localhost:8000/docs` (cuando la API está ejecutándose)
+- **Script de ejemplo**: [`scripts/api_client_example.py`](scripts/api_client_example.py)
+
+### 🚀 Iniciar API Localmente
+
+```powershell
+# Instalar dependencias
+pip install -r requirements.txt
+
+# Iniciar servidor
+python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+---
+
 ## 🚀 Despliegue en Azure
 
 Este proyecto está **100% preparado** para desplegarse en **Azure Container Apps** usando infraestructura como código (Bicep).
@@ -134,6 +168,8 @@ Este proyecto está **100% preparado** para desplegarse en **Azure Container App
 | [`QUICKSTART.md`](QUICKSTART.md) | Despliegue rápido paso a paso | 5 min |
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Guía completa con todas las opciones | - |
 | [`AZURE_SETUP_SUMMARY.md`](AZURE_SETUP_SUMMARY.md) | Resumen de archivos y configuración | - |
+| [`docs/API_ENDPOINTS.md`](docs/API_ENDPOINTS.md) | Documentación de API REST | - |
+| [`docs/AZURE_COSMOS_DB_OPTIMIZATIONS.md`](docs/AZURE_COSMOS_DB_OPTIMIZATIONS.md) | Optimizaciones para Cosmos DB Free Tier | - |
 
 ### ⚡ Despliegue Rápido
 

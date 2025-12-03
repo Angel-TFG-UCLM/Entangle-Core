@@ -451,8 +451,12 @@ class IngestionEngine:
                 )
                 
             except Exception as e:
-                logger.error(f"❌ Error en lote {batch_num}: {e}")
-                # Intentar insertar uno por uno en caso de error
+                logger.warning(f"⚠️  Error en lote {batch_num}: {e}. Reintentando uno por uno...")
+                # Intentar insertar uno por uno en caso de error (resiliencia)
+                # Esto permite que el proceso continúe incluso si hay problemas con algunos documentos
+                successful_in_batch = 0
+                failed_in_batch = 0
+                
                 for repo in batch:
                     try:
                         upsert_result = self.repo_db.upsert_one(
@@ -462,10 +466,17 @@ class IngestionEngine:
                         )
                         if upsert_result["operation"] == "insert":
                             total_inserted += 1
+                            successful_in_batch += 1
                         else:
                             total_updated += 1
+                            successful_in_batch += 1
                     except Exception as e2:
-                        logger.error(f"❌ Error insertando {repo.full_name if hasattr(repo, 'full_name') else repo.id}: {e2}")
+                        failed_in_batch += 1
+                        logger.warning(f"⚠️  No se pudo persistir {repo.full_name if hasattr(repo, 'full_name') else repo.id}: {e2}")
+                        # NO lanzar excepción - continuar con el siguiente
+                        continue
+                
+                logger.info(f"  ℹ️  Recuperación del lote {batch_num}: {successful_in_batch} exitosos, {failed_in_batch} fallidos")
         
         self.stats["repositories_inserted"] = total_inserted
         self.stats["repositories_updated"] = total_updated
