@@ -229,18 +229,20 @@ class UserEnrichmentEngine:
             logger.info("📌 Modo force_reenrich: procesando todos los usuarios")
         else:
             # Re-enriquecer si:
-            # 1. No tiene enrichment_status
-            # 2. No está completo (is_complete = false)
-            # 3. Más de 7 días desde la última actualización
+            # 1. No tiene enrichment_status (nunca enriquecido)
+            # 2. No tiene enriched_at (nunca enriquecido)
+            # 3. No está completo (is_complete = false)
+            # 4. Más de 7 días desde la última actualización
             seven_days_ago = datetime.now() - timedelta(days=7)
             query = {
                 "$or": [
                     {"enrichment_status": {"$exists": False}},
+                    {"enriched_at": {"$exists": False}},
                     {"enrichment_status.is_complete": False},
-                    {"enrichment_status.last_enriched": {"$lt": seven_days_ago}}
+                    {"enriched_at": {"$lt": seven_days_ago}}
                 ]
             }
-            logger.info("📌 Modo incremental: solo usuarios sin enriquecer, incompletos o desactualizados")
+            logger.info("📌 Modo incremental: usuarios sin enriquecer, incompletos o desactualizados (>7 días)")
         
         # Obtener usuarios
         users_cursor = self.users_repository.collection.find(query)
