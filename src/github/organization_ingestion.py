@@ -5,6 +5,7 @@ Estrategia Bottom-Up: descubre organizaciones desde usuarios existentes.
 import time
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime
+from pymongo.errors import OperationFailure
 
 from .graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
@@ -87,6 +88,52 @@ class OrganizationIngestionEngine:
         
         logger.info(f"🚀 OrganizationIngestionEngine v1.0 inicializado (batch_size={batch_size})")
     
+    def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
+        """
+        Ejecuta una operación con retry automático cuando Cosmos DB retorna 429.
+        
+        Args:
+            operation: Función a ejecutar
+            max_retries: Número máximo de reintentos (default 5)
+            
+        Returns:
+            Resultado de la operación o None si falla
+        """
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except OperationFailure as e:
+                if e.code == 16500:  # Cosmos DB throttling
+                    # Parsear RetryAfterMs del mensaje de error
+                    error_msg = str(e)
+                    retry_after_ms = 1000  # default fallback
+                    
+                    if 'RetryAfterMs=' in error_msg:
+                        start = error_msg.index('RetryAfterMs=') + len('RetryAfterMs=')
+                        end = error_msg.index(',', start)
+                        retry_after_ms = int(error_msg[start:end])
+                    
+                    retry_after_s = retry_after_ms / 1000.0
+                    
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"⚠️  Cosmos DB 429: esperando {retry_after_s:.2f}s "
+                            f"(intento {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(retry_after_s)
+                    else:
+                        logger.error(
+                            f"❌ Max reintentos alcanzado tras {max_retries} intentos"
+                        )
+                        return None  # Degradación graciosa
+                else:
+                    raise  # Otro tipo de OperationFailure
+            except Exception as e:
+                logger.error(f"❌ Error inesperado: {e}")
+                return None
+        
+        return None
+    
     def run(self, force_update: bool = False) -> Dict[str, Any]:
         """
         Ejecuta el proceso completo de ingesta de organizaciones.
@@ -153,7 +200,17 @@ class OrganizationIngestionEngine:
                 {"$sort": {"member_count": -1}}
             ]
             
-            results = list(self.users_repository.collection.aggregate(pipeline))
+            # Ejecutar con retry automático para Cosmos DB throttling
+            results = self._retry_on_cosmos_throttle(
+                lambda: list(self.users_repository.collection.aggregate(pipeline))
+            )
+            
+            # Sleep después de lectura
+            time.sleep(0.2)
+            
+            if results is None:
+                logger.error("❌ No se pudo descubrir organizaciones tras reintentos")
+                return set()
             
             logger.info(f"✅ Encontradas {len(results)} organizaciones únicas")
             
@@ -212,8 +269,13 @@ class OrganizationIngestionEngine:
         try:
             logger.debug(f"\n🏢 Procesando organización: {login}")
             
-            # Verificar si ya existe
-            existing = self.organizations_repository.collection.find_one({"login": login})
+            # Verificar si ya existe con retry automático
+            existing = self._retry_on_cosmos_throttle(
+                lambda: self.organizations_repository.collection.find_one({"login": login})
+            )
+            
+            # Sleep después de lectura
+            time.sleep(0.2)
             
             if existing and not force_update:
                 logger.debug(f"   ⏭️  Organización {login} ya existe (saltando)")
@@ -244,20 +306,71 @@ class OrganizationIngestionEngine:
             else:
                 logger.debug(f"   ⚠️  Organización {login} NO es relevante (sin repos quantum ingestados)")
             
-            # Guardar en BD
+            # Guardar en BD con retry para Cosmos DB throttling
             if existing:
-                # Actualizar
-                self.organizations_repository.collection.update_one(
-                    {"login": login},
-                    {"$set": org_dict}
-                )
-                logger.debug(f"   ↻ Organización {login} actualizada")
-                self.stats["total_updated"] += 1
+                # ✅ Preservar campos enriquecidos durante actualización
+                enriched_fields = [
+                    "quantum_focus_score",
+                    "quantum_repositories_count",
+                    "quantum_contributors_count",
+                    "total_stars",
+                    "top_languages",
+                    "top_quantum_contributors",
+                    "quantum_repositories",
+                    "is_quantum_focused",
+                    "enriched_at",
+                    "enrichment_status"
+                ]
+                
+                # Separar campos a actualizar vs preservar
+                fields_to_update = {}
+                
+                for key, value in org_dict.items():
+                    if key in enriched_fields:
+                        # Solo actualizar si el campo existente es null/vacío
+                        existing_value = existing.get(key)
+                        if existing_value is None or existing_value == [] or existing_value == {}:
+                            fields_to_update[key] = value
+                        # else: preservar valor existente (no incluir en update)
+                    else:
+                        # Campos básicos siempre se actualizan
+                        fields_to_update[key] = value
+                
+                # Actualizar con retry automático
+                if fields_to_update:
+                    result = self._retry_on_cosmos_throttle(
+                        lambda: self.organizations_repository.collection.update_one(
+                            {"login": login},
+                            {"$set": fields_to_update}
+                        )
+                    )
+                    
+                    if result is not None:
+                        logger.debug(f"   ↻ Organización {login} actualizada (preservando enriquecimiento)")
+                        self.stats["total_updated"] += 1
+                    else:
+                        logger.warning(f"   ⚠️  Organización {login} falló tras reintentos")
+                        self.stats["total_errors"] += 1
+                        return False
+                else:
+                    logger.debug(f"   ⏭️  Organización {login} sin cambios")
+                    self.stats["total_skipped"] += 1
             else:
-                # Insertar
-                self.organizations_repository.collection.insert_one(org_dict)
-                logger.debug(f"   ✨ Organización {login} insertada")
-                self.stats["total_inserted"] += 1
+                # Insertar nueva organización con retry automático
+                result = self._retry_on_cosmos_throttle(
+                    lambda: self.organizations_repository.collection.insert_one(org_dict)
+                )
+                
+                if result is not None:
+                    logger.debug(f"   ✨ Organización {login} insertada")
+                    self.stats["total_inserted"] += 1
+                else:
+                    logger.warning(f"   ⚠️  Organización {login} falló tras reintentos")
+                    self.stats["total_errors"] += 1
+                    return False
+            
+            # Sleep adicional para Cosmos DB (después de escritura)
+            time.sleep(0.3)
             
             self.stats["total_processed"] += 1
             return True
@@ -282,9 +395,22 @@ class OrganizationIngestionEngine:
             # Si está en la colección repositories, ya es quantum-related (pasó filtros)
             repos_collection = self.users_repository.collection.database["repositories"]
             
-            org_repos = list(repos_collection.find({
-                "owner.login": org_login
-            }))
+            # Buscar con retry automático para Cosmos DB throttling
+            org_repos = self._retry_on_cosmos_throttle(
+                lambda: list(repos_collection.find({
+                    "owner.login": org_login
+                }))
+            )
+            
+            # Sleep después de lectura
+            time.sleep(0.2)
+            
+            if org_repos is None:
+                logger.warning(f"   ⚠️  No se pudo leer repos de {org_login} tras reintentos")
+                return {
+                    "is_relevant": False,
+                    "discovered_from_repos": []
+                }
             
             is_relevant = len(org_repos) > 0
             
@@ -357,12 +483,18 @@ class OrganizationIngestionEngine:
             duration = self.stats["end_time"] - self.stats["start_time"]
             self.stats["duration_seconds"] = duration.total_seconds()
         
-        # Calcular organizaciones relevantes vs no relevantes
+        # Calcular organizaciones relevantes vs no relevantes con retry
         try:
-            total_relevant = self.organizations_repository.collection.count_documents({"is_relevant": True})
-            total_non_relevant = self.organizations_repository.collection.count_documents({"is_relevant": False})
-            self.stats["total_relevant"] = total_relevant
-            self.stats["total_non_relevant"] = total_non_relevant
+            total_relevant = self._retry_on_cosmos_throttle(
+                lambda: self.organizations_repository.collection.count_documents({"is_relevant": True})
+            )
+            total_non_relevant = self._retry_on_cosmos_throttle(
+                lambda: self.organizations_repository.collection.count_documents({"is_relevant": False})
+            )
+            
+            if total_relevant is not None and total_non_relevant is not None:
+                self.stats["total_relevant"] = total_relevant
+                self.stats["total_non_relevant"] = total_non_relevant
         except Exception as e:
             logger.error(f"Error calculando stats de relevancia: {e}")
         
