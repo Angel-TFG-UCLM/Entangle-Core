@@ -21,14 +21,8 @@ from .repository import (
     DependencyGraphManifest
 )
 
-# Organization models
-from .organization import (
-    Organization,
-    OrganizationRepository,
-    Member,
-    Team,
-    SponsorListing
-)
+# Organization models v1.0 - INGESTA BÁSICA
+from .organization import Organization
 
 # User models v3.0 - LIMPIO (solo clases que existen)
 from .user import (
@@ -62,12 +56,8 @@ __all__ = [
     "Vulnerability",
     "DependencyGraphManifest",
     
-    # Organization
+    # Organization v1.0
     "Organization",
-    "OrganizationRepository",
-    "Member",
-    "Team",
-    "SponsorListing",
     
     # User v3.0
     "User",
