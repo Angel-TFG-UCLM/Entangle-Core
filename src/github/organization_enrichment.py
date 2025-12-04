@@ -12,6 +12,7 @@ ESTRATEGIA:
 import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
+from pymongo.errors import OperationFailure
 
 from .graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
@@ -102,6 +103,53 @@ class OrganizationEnrichmentEngine:
         }
         
         logger.info(f"🚀 OrganizationEnrichmentEngine v1.0 inicializado (batch_size={batch_size}, sleep_time={sleep_time}s)")
+    
+    def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
+        """
+        Ejecuta una operación con retry automático cuando Cosmos DB retorna 429.
+        
+        Args:
+            operation: Función a ejecutar
+            max_retries: Número máximo de reintentos (default 5)
+            
+        Returns:
+            Resultado de la operación o None si falla
+        """
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except OperationFailure as e:
+                if e.code == 16500:  # RequestRateTooLarge
+                    # Extraer RetryAfterMs del mensaje de error
+                    error_msg = str(e)
+                    retry_after_ms = 1000  # Default 1s
+                    
+                    # Parsear RetryAfterMs del mensaje
+                    if 'RetryAfterMs=' in error_msg:
+                        try:
+                            start = error_msg.index('RetryAfterMs=') + len('RetryAfterMs=')
+                            end = error_msg.index(',', start) if ',' in error_msg[start:] else error_msg.index(' ', start)
+                            retry_after_ms = int(error_msg[start:end])
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    retry_after_s = retry_after_ms / 1000.0
+                    
+                    if attempt < max_retries - 1:
+                        logger.warning(f"⚠️  Cosmos DB 429: esperando {retry_after_s:.2f}s antes de reintentar (intento {attempt + 1}/{max_retries})")
+                        time.sleep(retry_after_s)
+                    else:
+                        logger.error(f"❌ Cosmos DB 429: máximo de reintentos ({max_retries}) alcanzado")
+                        # No lanzar excepción, retornar None para continuar
+                        return None
+                else:
+                    raise
+            except Exception as e:
+                # Para otros errores, retornar None y continuar
+                logger.error(f"❌ Error en operación: {e}")
+                return None
+        
+        return None
     
     def enrich_all_organizations(
         self, 
@@ -263,10 +311,15 @@ class OrganizationEnrichmentEngine:
             }
             
             # ==================== GUARDAR EN BD ====================
-            self.orgs_repository.collection.update_one(
-                {"_id": org.get("_id")},
-                {"$set": updates}
+            self._retry_on_cosmos_throttle(
+                lambda: self.orgs_repository.collection.update_one(
+                    {"_id": org.get("_id")},
+                    {"$set": updates}
+                )
             )
+            
+            # Sleep para Cosmos DB después de write (RU/s limit)
+            time.sleep(0.3)
             
             self.stats["total_enriched"] += 1
             logger.info(f"✅ Organización {login} enriquecida correctamente")
@@ -338,13 +391,17 @@ class OrganizationEnrichmentEngine:
             Dict con repo_ids y metadata o None
         """
         try:
-            # Buscar repos de la org en nuestra BD
-            # Si está en repositories, ya es quantum-related (pasó filtros)
-            quantum_repos = list(self.repos_repository.collection.find({
-                "owner.login": org_login
-            }))
+            # Buscar repos de la org en nuestra BD con retry automático
+            quantum_repos = self._retry_on_cosmos_throttle(
+                lambda: list(self.repos_repository.collection.find({
+                    "owner.login": org_login
+                }))
+            )
             
-            if not quantum_repos:
+            # Sleep para Cosmos DB (RU/s limit)
+            time.sleep(0.2)
+            
+            if quantum_repos is None or not quantum_repos:
                 return None
             
             repo_ids = [repo.get("id") for repo in quantum_repos if repo.get("id")]
@@ -395,7 +452,15 @@ class OrganizationEnrichmentEngine:
                 {"$limit": limit}
             ]
             
-            results = list(self.users_repository.collection.aggregate(pipeline))
+            results = self._retry_on_cosmos_throttle(
+                lambda: list(self.users_repository.collection.aggregate(pipeline))
+            )
+            
+            # Sleep para Cosmos DB (RU/s limit)
+            time.sleep(0.2)
+            
+            if results is None:
+                return []
             
             # Retornar lista con {id, login}
             contributors = []
@@ -431,13 +496,18 @@ class OrganizationEnrichmentEngine:
             if not repo_ids:
                 return []
             
-            # Buscar repos en la BD por sus IDs
-            repos = list(self.repos_repository.collection.find(
-                {"id": {"$in": repo_ids}},
-                {"primary_language": 1, "_id": 0}
-            ))
+            # Buscar repos en la BD por sus IDs con retry automático
+            repos = self._retry_on_cosmos_throttle(
+                lambda: list(self.repos_repository.collection.find(
+                    {"id": {"$in": repo_ids}},
+                    {"primary_language": 1, "_id": 0}
+                ))
+            )
             
-            if not repos:
+            # Sleep para Cosmos DB (RU/s limit)
+            time.sleep(0.2)
+            
+            if repos is None or not repos:
                 return []
             
             # Contar lenguajes y repos que los usan
@@ -494,11 +564,19 @@ class OrganizationEnrichmentEngine:
             if not repo_ids:
                 return 0
             
-            # Buscar repos en la BD por sus IDs
-            repos = list(self.repos_repository.collection.find(
-                {"id": {"$in": repo_ids}},
-                {"stargazer_count": 1, "_id": 0}
-            ))
+            # Buscar repos en la BD por sus IDs con retry automático
+            repos = self._retry_on_cosmos_throttle(
+                lambda: list(self.repos_repository.collection.find(
+                    {"id": {"$in": repo_ids}},
+                    {"stargazer_count": 1, "_id": 0}
+                ))
+            )
+            
+            # Sleep para Cosmos DB (RU/s limit)
+            time.sleep(0.2)
+            
+            if repos is None:
+                return 0
             
             total = 0
             
