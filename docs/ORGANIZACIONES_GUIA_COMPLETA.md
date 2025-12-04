@@ -938,6 +938,156 @@ discovered_from_repos: [
 
 ---
 
+### **Problema 6: Cosmos DB Rate Limit Errors (429 TooManyRequests)**
+
+**Síntoma:**
+```
+pymongo.errors.OperationFailure: Command find failed: 
+Request rate is large. ActivityId: xxx, Error: 16500, 
+RetryAfterMs: 660, Details: Response status code does not 
+indicate success: TooManyRequests (429)
+```
+
+**Causa:** Azure Cosmos DB Free Tier tiene límite de 400 RU/s (Request Units por segundo)
+
+**Solución Implementada:**
+
+#### **1. Sistema de Reintentos con Backoff Exponencial**
+
+```python
+def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
+    """
+    Reintenta operaciones de MongoDB con manejo de throttling de Cosmos DB.
+    
+    Características:
+    - Detecta error 16500 (Cosmos DB throttling)
+    - Extrae RetryAfterMs del mensaje de error
+    - Espera el tiempo indicado por Cosmos DB
+    - Máximo 5 reintentos
+    - Degradación graciosa (retorna None si falla)
+    """
+    for attempt in range(max_retries):
+        try:
+            return operation()
+        except OperationFailure as e:
+            if e.code == 16500:  # Cosmos DB throttling
+                # Parsear RetryAfterMs del mensaje de error
+                error_msg = str(e)
+                retry_after_ms = 1000  # default fallback
+                
+                if 'RetryAfterMs=' in error_msg:
+                    start = error_msg.index('RetryAfterMs=') + len('RetryAfterMs=')
+                    end = error_msg.index(',', start)
+                    retry_after_ms = int(error_msg[start:end])
+                
+                retry_after_s = retry_after_ms / 1000.0
+                
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"⚠️  Cosmos DB 429: esperando {retry_after_s:.2f}s "
+                        f"(intento {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(retry_after_s)
+                else:
+                    logger.error(
+                        f"❌ Max reintentos alcanzado tras {max_retries} intentos"
+                    )
+                    return None  # Degradación graciosa
+            else:
+                raise  # Otro tipo de OperationFailure
+        except Exception as e:
+            logger.error(f"❌ Error inesperado: {e}")
+            return None
+    
+    return None
+```
+
+#### **2. Wrapping de Operaciones MongoDB**
+
+```python
+# Todas las operaciones usan retry automático:
+
+# Lectura de repos
+quantum_repos = self._retry_on_cosmos_throttle(
+    lambda: list(self.repos_repository.collection.find({
+        "owner.login": org_login
+    }))
+)
+
+# Validación de None (degradación graciosa)
+if quantum_repos is None or not quantum_repos:
+    return None
+
+# Sleep adicional para reducir presión sobre RU/s
+time.sleep(0.2)  # Lecturas
+time.sleep(0.3)  # Escrituras
+```
+
+#### **3. Configuración de Sleeps Optimizada**
+
+```python
+# En OrganizationEnrichmentEngine.__init__:
+sleep_time: float = 1.0  # Entre organizaciones
+
+# En scripts/run_organization_enrichment.py:
+engine = OrganizationEnrichmentEngine(
+    batch_size=5,
+    sleep_time=1.0  # Aumentado de 0.5s a 1.0s
+)
+```
+
+#### **4. Manejo de Resultados None**
+
+```python
+# _find_quantum_repositories
+if quantum_repos is None or not quantum_repos:
+    return None
+
+# _find_top_quantum_contributors
+if results is None:
+    return []
+
+# _calculate_top_languages
+if repos is None or not repos:
+    return []
+
+# _calculate_total_stars
+if repos is None:
+    return 0
+```
+
+**Resultados Esperados:**
+```
+✅ Tiempos de espera variables basados en RetryAfterMs de Cosmos DB
+   ⚠️  Cosmos DB 429: esperando 0.66s (intento 1/5)
+   ⚠️  Cosmos DB 429: esperando 1.85s (intento 2/5)
+   ⚠️  Cosmos DB 429: esperando 3.14s (intento 3/5)
+
+✅ Sistema continúa procesando tras fallos individuales
+✅ Organizaciones exitosas se enrichecen correctamente
+✅ Métricas parciales (si algunas queries fallan)
+```
+
+**Recomendaciones Adicionales:**
+
+1. **Reducir batch_size** si persisten errores:
+   ```python
+   batch_size = 3  # Reducir de 5 a 3
+   ```
+
+2. **Aumentar sleep_time** entre orgs:
+   ```python
+   sleep_time = 2.0  # Aumentar de 1.0s a 2.0s
+   ```
+
+3. **Considerar Azure Cosmos DB Tier superior** si el volumen crece:
+   - Free Tier: 400 RU/s
+   - Standard: 1000+ RU/s configurable
+
+4. **Implementar caching** para reducir queries repetitivas
+
+---
+
 ## 📚 Referencias
 
 ### **Archivos Principales:**
