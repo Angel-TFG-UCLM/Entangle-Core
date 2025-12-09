@@ -11,7 +11,7 @@ Este script prueba el flujo completo:
 import sys
 sys.path.insert(0, '.')
 
-from src.github.ingestion import IngestionEngine, run_ingestion
+from src.github.repositories_ingestion import IngestionEngine, run_ingestion
 from src.core import logger, db
 from src.core.mongo_repository import MongoRepository
 
@@ -34,9 +34,7 @@ def test_integration_simple():
         # Ejecutar ingesta con límite pequeño para testing
         print("\n🚀 Ejecutando ingesta de prueba (máx 5 repositorios)...")
         report = engine.run(
-            max_results=5,
-            save_to_json=True,
-            output_file="tests/test_ingestion_results.json"
+            max_results=5
         )
         
         # Verificar resultados
@@ -95,7 +93,7 @@ def test_integration_with_validation():
         engine = IngestionEngine(batch_size=5)
         
         # Ejecutar ingesta
-        report = engine.run(max_results=3, save_to_json=False)
+        report = engine.run(max_results=3)
         
         # Verificar que se reportan errores de validación (si los hay)
         if report["summary"]["validation_errors"] > 0:
@@ -124,14 +122,14 @@ def test_incremental_mode():
         # Primera ingesta (completa)
         print("1️⃣  Primera ingesta (completa)...")
         engine1 = IngestionEngine(incremental=False, batch_size=5)
-        report1 = engine1.run(max_results=3, save_to_json=False)
+        report1 = engine1.run(max_results=3)
         inserted_first = report1["summary"]["repositories_inserted"]
         print(f"  ✓ Repositorios insertados: {inserted_first}")
         
         # Segunda ingesta (incremental - debería actualizar)
         print("\n2️⃣  Segunda ingesta (incremental)...")
         engine2 = IngestionEngine(incremental=True, batch_size=5)
-        report2 = engine2.run(max_results=3, save_to_json=False)
+        report2 = engine2.run(max_results=3)
         updated_second = report2["summary"]["repositories_updated"]
         print(f"  ✓ Repositorios actualizados: {updated_second}")
         
@@ -159,7 +157,7 @@ def test_bulk_operations():
         # Ingesta con batch pequeño
         print("📦 Ingesta con batch_size=3...")
         engine = IngestionEngine(batch_size=3)
-        report = engine.run(max_results=10, save_to_json=False)
+        report = engine.run(max_results=10)
         
         print(f"✅ Procesados en batches:")
         print(f"  • Total persistido: {report['summary']['repositories_inserted'] + report['summary']['repositories_updated']}")
@@ -172,32 +170,34 @@ def test_bulk_operations():
         return False
 
 
-def test_relations_creation():
-    """Test de creación de relaciones."""
-    print("\n" + "="*80)
-    print("  🧪 TEST: Creación de Relaciones")
-    print("="*80 + "\n")
-    
-    try:
-        # Ingesta que crea relaciones
-        engine = IngestionEngine()
-        report = engine.run(max_results=3, save_to_json=False)
-        
-        print(f"🔗 Relaciones creadas: {report['summary']['relations_created']}")
-        
-        # Verificar en MongoDB
-        relation_db = MongoRepository("relations")
-        count = relation_db.count_documents({})
-        print(f"💾 Total de relaciones en MongoDB: {count}")
-        
-        # Mostrar algunas relaciones
-        sample = relation_db.find({}, limit=3)
-        print("\n📋 Muestra de relaciones:")
-        for rel in sample:
-            print(f"  • {rel.get('source_login')} → {rel.get('target_name')} ({rel.get('relation_type')})")
-        
-        print("\n✅ Test de relaciones completado")
-        return True
+# DESHABILITADO: Test preservado para futura implementación de análisis de grafos
+# Para reactivar: descomentar este test y la llamada en main()
+# def test_relations_creation():
+#     """Test de creación de relaciones."""
+#     print("\n" + "="*80)
+#     print("  🧪 TEST: Creación de Relaciones")
+#     print("="*80 + "\n")
+#     
+#     try:
+#         # Ingesta que crea relaciones
+#         engine = IngestionEngine()
+#         report = engine.run(max_results=3, save_to_json=False)
+#         
+#         print(f"🔗 Relaciones creadas: {report['summary']['relations_created']}")
+#         
+#         # Verificar en MongoDB
+#         relation_db = MongoRepository("relations")
+#         count = relation_db.count_documents({})
+#         print(f"💾 Total de relaciones en MongoDB: {count}")
+#         
+#         # Mostrar algunas relaciones
+#         sample = relation_db.find({}, limit=3)
+#         print("\n📋 Muestra de relaciones:")
+#         for rel in sample:
+#             print(f"  • {rel.get('source_login')} → {rel.get('target_name')} ({rel.get('relation_type')})")
+#         
+#         print("\n✅ Test de relaciones completado")
+#         return True
         
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -238,7 +238,7 @@ def main():
         "Test de validación": test_integration_with_validation(),
         "Test modo incremental": test_incremental_mode(),
         "Test operaciones bulk": test_bulk_operations(),
-        "Test creación de relaciones": test_relations_creation()
+        # "Test creación de relaciones": test_relations_creation()  # DESHABILITADO: Para futura implementación de análisis de grafos
     }
     
     # Resumen

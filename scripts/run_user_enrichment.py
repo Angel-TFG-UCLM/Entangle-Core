@@ -30,7 +30,7 @@ def main():
     """Ejecuta el enriquecimiento de usuarios v2.0."""
     
     logger.info("=" * 80)
-    logger.info("🚀 INICIANDO ENRIQUECIMIENTO DE USUARIOS v2.0")
+    logger.info("INICIANDO ENRIQUECIMIENTO DE USUARIOS v2.0")
     logger.info("=" * 80)
     
     # Cargar variables de entorno
@@ -40,11 +40,11 @@ def main():
     github_token = os.getenv("GITHUB_TOKEN")
     
     if not github_token:
-        logger.error("❌ GITHUB_TOKEN no configurado en .env")
+        logger.error("GITHUB_TOKEN no configurado en .env")
         return 1
     
     # Obtener parámetros
-    logger.info("\n📋 Configuración v2.0:")
+    logger.info("\nConfiguración v2.0:")
     logger.info("  • Motor: Super-query GraphQL (1 query por usuario)")
     logger.info("  • Campos a enriquecer:")
     logger.info("    - Repositorios destacados (pinned)")
@@ -78,12 +78,12 @@ def main():
     
     try:
         # Conectar a MongoDB
-        logger.info("\n🔗 Conectando a MongoDB...")
+        logger.info("\nConectando a MongoDB...")
         users_repo = MongoRepository("users")
         repos_repo = MongoRepository("repositories")
         
         # Inicializar motor
-        logger.info("🔧 Inicializando UserEnrichmentEngine v2.0...")
+        logger.info("Inicializando UserEnrichmentEngine v2.0...")
         engine = UserEnrichmentEngine(
             github_token=github_token,
             users_repository=users_repo,
@@ -92,7 +92,7 @@ def main():
         )
         
         # Ejecutar enriquecimiento
-        logger.info("\n🔄 Ejecutando enriquecimiento de usuarios...")
+        logger.info("\nEjecutando enriquecimiento de usuarios...")
         stats = engine.enrich_all_users(
             max_users=max_users,
             force_reenrich=force_reenrich
@@ -109,12 +109,12 @@ def main():
         
         if 'duration_seconds' in stats:
             duration = stats['duration_seconds']
-            logger.info(f"\n⏱️  Duración: {duration:.2f}s ({duration/60:.1f} minutos)")
+            logger.info(f"\n⏱Duración: {duration:.2f}s ({duration/60:.1f} minutos)")
         
         return 0
         
     except KeyboardInterrupt:
-        logger.warning("\n⚠️  Operación interrumpida por el usuario")
+        logger.warning("\nOperación interrumpida por el usuario")
         return 1
     except Exception as e:
         logger.error(f"\n❌ Error durante el enriquecimiento: {e}", exc_info=True)

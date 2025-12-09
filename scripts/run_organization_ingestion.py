@@ -23,7 +23,7 @@ def main():
     """Ejecuta la ingesta de organizaciones."""
     
     logger.info("=" * 80)
-    logger.info("🏢 INICIANDO INGESTA DE ORGANIZACIONES")
+    logger.info("INICIANDO INGESTA DE ORGANIZACIONES")
     logger.info("=" * 80)
     
     # Cargar variables de entorno
@@ -35,7 +35,7 @@ def main():
         return 1
     
     # Confirmar con usuario
-    logger.info("\n📋 Configuración:")
+    logger.info("\nConfiguración:")
     logger.info("  • Estrategia: Bottom-Up (desde usuarios)")
     logger.info("  • Fuente: Campo 'organizations' de usuarios")
     logger.info("  • Deduplicación: por login de organización")
@@ -49,12 +49,12 @@ def main():
     
     try:
         # Crear repositorios
-        logger.info("\n🔧 Inicializando repositorios...")
+        logger.info("\nInicializando repositorios...")
         users_repo = MongoRepository("users")
         orgs_repo = MongoRepository("organizations", unique_fields=["id"])
         
         # Crear motor de ingesta
-        logger.info("🔧 Creando motor de ingesta...")
+        logger.info("Creando motor de ingesta...")
         engine = OrganizationIngestionEngine(
             github_token=github_token,
             users_repository=users_repo,
@@ -63,7 +63,7 @@ def main():
         )
         
         # Ejecutar ingesta
-        logger.info("\n🔄 Ejecutando ingesta de organizaciones...")
+        logger.info("\nEjecutando ingesta de organizaciones...")
         stats = engine.run(force_update=False)
         
         # Mostrar estadísticas finales
@@ -81,7 +81,7 @@ def main():
             logger.warning(f"\n⚠️  Errores: {stats['total_errors']}")
         
         duration = stats.get('duration_seconds', 0)
-        logger.info(f"\n⏱️  Duración: {duration:.2f}s ({duration/60:.1f} minutos)")
+        logger.info(f"\nDuración: {duration:.2f}s ({duration/60:.1f} minutos)")
         
         return 0
         

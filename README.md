@@ -58,7 +58,7 @@ Sistema completo de ingesta de repositorios de software cuántico desde GitHub c
   - Control automático de rate limit
   - Paginación automática
   
-- ✅ **Motor de ingesta** ([`src/github/ingestion.py`](src/github/ingestion.py))
+- ✅ **Motor de ingesta** ([`src/github/repositories_ingestion.py`](src/github/repositories_ingestion.py))
   - Orquestación completa del flujo: búsqueda → filtrado → almacenamiento
   - Sistema de **9 filtros avanzados** integrado
   - Almacenamiento dual: MongoDB + JSON
@@ -115,7 +115,7 @@ Sistema completo de ingesta de repositorios de software cuántico desde GitHub c
 
 **Uso**:
 ```bash
-python scripts/run_ingestion_segmented.py
+python scripts/run_repositories_ingestion.py
 ```
 
 **Documentación completa**: Ver [`docs/SEGMENTACION_DINAMICA.md`](docs/SEGMENTACION_DINAMICA.md)

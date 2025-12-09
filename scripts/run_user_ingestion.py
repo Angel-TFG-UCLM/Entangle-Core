@@ -20,7 +20,7 @@ def main():
     """Ejecuta la ingesta de usuarios."""
     
     logger.info("=" * 80)
-    logger.info("🚀 INICIANDO INGESTA DE USUARIOS")
+    logger.info("INICIANDO INGESTA DE USUARIOS")
     logger.info("=" * 80)
     
     # Cargar variables de entorno
@@ -32,7 +32,7 @@ def main():
         return
     
     # Confirmar con usuario
-    logger.info("\n📋 Configuración:")
+    logger.info("\nConfiguración:")
     logger.info("  • Fuentes: colaboradores, contributors, watchers, stargazers")
     logger.info("  • Deduplicación: por ID de usuario")
     logger.info("  • Almacenamiento: MongoDB (colección 'users')")
@@ -51,14 +51,14 @@ def main():
         logger.info("\n" + "=" * 80)
         logger.info("✅ INGESTA DE USUARIOS COMPLETADA")
         logger.info("=" * 80)
-        logger.info(f"\n📊 Estadísticas:")
+        logger.info(f"\nEstadísticas:")
         logger.info(f"  • Repositorios procesados: {stats.get('repos_processed', 0)}")
         logger.info(f"  • Usuarios encontrados: {stats.get('users_found', 0)}")
         logger.info(f"  • Usuarios únicos: {stats.get('unique_users', 0)}")
         logger.info(f"  • Usuarios nuevos insertados: {stats.get('users_inserted', 0)}")
         logger.info(f"  • Usuarios ya existentes: {stats.get('users_existing', 0)}")
         
-        logger.info(f"\n📈 Fuentes:")
+        logger.info(f"\nFuentes:")
         sources = stats.get('sources', {})
         logger.info(f"  • Colaboradores: {sources.get('collaborators', 0)}")
         logger.info(f"  • Contributors: {sources.get('contributors', 0)}")
@@ -69,7 +69,7 @@ def main():
             logger.warning(f"\n⚠️  Errores: {stats['errors']}")
         
         duration = stats.get('duration_seconds', 0)
-        logger.info(f"\n⏱️  Duración: {duration:.2f}s ({duration/60:.1f} minutos)")
+        logger.info(f"\nDuración: {duration:.2f}s ({duration/60:.1f} minutos)")
         
     except KeyboardInterrupt:
         logger.warning("\n⚠️  Operación interrumpida por el usuario")

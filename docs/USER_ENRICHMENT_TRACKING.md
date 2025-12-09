@@ -144,7 +144,7 @@ python scripts/check_enrichment_status.py
 
 ## 📊 Comparación con Repositorios
 
-La implementación es **idéntica** a la de repositorios (`src/github/enrichment.py`):
+La implementación es **idéntica** a la de repositorios (`src/github/repositories_enrichment.py`):
 
 | Característica | Repositorios | Usuarios |
 |---------------|--------------|----------|

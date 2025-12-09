@@ -16,7 +16,7 @@ sys.path.insert(0, '.')
 
 from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime, timezone
-from src.github.ingestion import IngestionEngine
+from src.github.repositories_ingestion import IngestionEngine
 from src.core import db
 from src.core.mongo_repository import MongoRepository
 from src.models import Repository, Organization, User
@@ -275,59 +275,61 @@ def test_incremental_mode():
         return False
 
 
-def test_relations_creation():
-    """Test de creación de relaciones."""
-    print("\n" + "="*80)
-    print("  🧪 TEST 4: Creación de Relaciones")
-    print("="*80 + "\n")
-    
-    try:
-        # Limpiar colecciones
-        repo_db = MongoRepository("repositories")
-        relation_db = MongoRepository("relations")
-        repo_db.delete_many({})
-        relation_db.delete_many({})
-        print("🧹 Colecciones limpiadas")
-        
-        # Mock client
-        mock_client = Mock()
-        mock_response = get_mock_graphql_response(3)
-        mock_client.search_repositories_all_pages.return_value = mock_response
-        
-        # Crear engine
-        engine = IngestionEngine(client=mock_client, batch_size=5)
-        
-        # Validar y persistir
-        repos_raw = [edge["node"] for edge in mock_response["search"]["edges"]]
-        validated, _ = engine._validate_repositories(repos_raw)
-        engine._persist_repositories(validated)
-        
-        print(f"📦 {len(validated)} repositorios persistidos")
-        
-        # Crear relaciones
-        engine._create_relations(validated)
-        
-        # Verificar
-        relations_count = relation_db.count_documents({})
-        print(f"✅ Relaciones creadas: {relations_count}")
-        print(f"✅ Stats: {engine.stats['relations_created']}")
-        
-        assert relations_count == 3, f"Esperaba 3 relaciones, obtuvo {relations_count}"
-        assert engine.stats["relations_created"] == 3, f"Stats incorrectos"
-        
-        # Verificar una relación
-        sample_relation = relation_db.find_one({})
-        assert sample_relation is not None, "No se encontró ninguna relación"
-        print(f"\n📋 Sample de relación:")
-        print(f"  • Source: {sample_relation.get('source_login')}")
-        print(f"  • Target: {sample_relation.get('target_name')}")
-        print(f"  • Type: {sample_relation.get('relation_type')}")
-        
-        print("\n✅ TEST 4 PASADO")
-        return True
-        
-    except Exception as e:
-        print(f"\n❌ TEST 4 FALLÓ: {e}")
+# DESHABILITADO: Test preservado para futura implementación de análisis de grafos
+# Para reactivar: descomentar este test y la llamada en main()
+# def test_relations_creation():
+#     """Test de creación de relaciones."""
+#     print("\n" + "="*80)
+#     print("  🧪 TEST 4: Creación de Relaciones")
+#     print("="*80 + "\n")
+#     
+#     try:
+#         # Limpiar colecciones
+#         repo_db = MongoRepository("repositories")
+#         relation_db = MongoRepository("relations")
+#         repo_db.delete_many({})
+#         relation_db.delete_many({})
+#         print("🧹 Colecciones limpiadas")
+#         
+#         # Mock client
+#         mock_client = Mock()
+#         mock_response = get_mock_graphql_response(3)
+#         mock_client.search_repositories_all_pages.return_value = mock_response
+#         
+#         # Crear engine
+#         engine = IngestionEngine(client=mock_client, batch_size=5)
+#         
+#         # Validar y persistir
+#         repos_raw = [edge["node"] for edge in mock_response["search"]["edges"]]
+#         validated, _ = engine._validate_repositories(repos_raw)
+#         engine._persist_repositories(validated)
+#         
+#         print(f"📦 {len(validated)} repositorios persistidos")
+#         
+#         # Crear relaciones
+#         engine._create_relations(validated)
+#         
+#         # Verificar
+#         relations_count = relation_db.count_documents({})
+#         print(f"✅ Relaciones creadas: {relations_count}")
+#         print(f"✅ Stats: {engine.stats['relations_created']}")
+#         
+#         assert relations_count == 3, f"Esperaba 3 relaciones, obtuvo {relations_count}"
+#         assert engine.stats["relations_created"] == 3, f"Stats incorrectos"
+#         
+#         # Verificar una relación
+#         sample_relation = relation_db.find_one({})
+#         assert sample_relation is not None, "No se encontró ninguna relación"
+#         print(f"\n📋 Sample de relación:")
+#         print(f"  • Source: {sample_relation.get('source_login')}")
+#         print(f"  • Target: {sample_relation.get('target_name')}")
+#         print(f"  • Type: {sample_relation.get('relation_type')}")
+#         
+#         print("\n✅ TEST 4 PASADO")
+#         return True
+#         
+#     except Exception as e:
+#         print(f"\n❌ TEST 4 FALLÓ: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -412,14 +414,14 @@ def test_full_integration_flow():
         
         # Ejecutar flujo completo
         print("🚀 Ejecutando flujo completo...")
-        report = engine.run(max_results=5, save_to_json=False)
+        report = engine.run(max_results=5)
         
         # Verificar reporte
         print(f"\n📊 REPORTE:")
         print(f"  • Total encontrado: {report['summary']['total_found']}")
         print(f"  • Validados: {report['summary']['validation_success']}")
         print(f"  • Insertados: {report['summary']['repositories_inserted']}")
-        print(f"  • Relaciones: {report['summary']['relations_created']}")
+        # print(f"  • Relaciones: {report['summary']['relations_created']}")  # DESHABILITADO: Para futura implementación de análisis de grafos
         
         # Assertions
         assert report['summary']['total_found'] == 5
@@ -469,7 +471,7 @@ def main():
         "Validación (Raw → Pydantic)": test_validation_phase(),
         "Persistencia (Bulk Operations)": test_persistence_phase(),
         "Modo Incremental": test_incremental_mode(),
-        "Creación de Relaciones": test_relations_creation(),
+        # "Creación de Relaciones": test_relations_creation(),  # DESHABILITADO: Para futura implementación de análisis de grafos
         "Manejo de Errores": test_validation_errors(),
         "Flujo Completo": test_full_integration_flow()
     }

@@ -86,7 +86,7 @@ class OrganizationIngestionEngine:
             "end_time": None
         }
         
-        logger.info(f"🚀 OrganizationIngestionEngine v1.0 inicializado (batch_size={batch_size})")
+        logger.info(f"OrganizationIngestionEngine v1.0 inicializado (batch_size={batch_size})")
     
     def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
         """
@@ -145,7 +145,7 @@ class OrganizationIngestionEngine:
             Estadísticas del proceso
         """
         logger.info("=" * 80)
-        logger.info("🏢 INICIANDO INGESTA DE ORGANIZACIONES v1.0")
+        logger.info("INICIANDO INGESTA DE ORGANIZACIONES v1.0")
         logger.info("=" * 80)
         
         self.stats["start_time"] = datetime.now()
@@ -172,7 +172,7 @@ class OrganizationIngestionEngine:
         Returns:
             Set de logins únicos de organizaciones
         """
-        logger.info("\n🔍 Descubriendo organizaciones desde usuarios...")
+        logger.info("\nDescubriendo organizaciones desde usuarios...")
         
         try:
             # Agregación para obtener todos los logins únicos de organizaciones
@@ -267,7 +267,7 @@ class OrganizationIngestionEngine:
             True si se procesó correctamente, False si hubo error
         """
         try:
-            logger.debug(f"\n🏢 Procesando organización: {login}")
+            logger.debug(f"\nProcesando organización: {login}")
             
             # Verificar si ya existe con retry automático
             existing = self._retry_on_cosmos_throttle(

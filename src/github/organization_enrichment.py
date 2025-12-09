@@ -102,7 +102,7 @@ class OrganizationEnrichmentEngine:
             "end_time": None
         }
         
-        logger.info(f"🚀 OrganizationEnrichmentEngine v1.0 inicializado (batch_size={batch_size}, sleep_time={sleep_time}s)")
+        logger.info(f"OrganizationEnrichmentEngine v1.0 inicializado (batch_size={batch_size}, sleep_time={sleep_time}s)")
     
     def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
         """
@@ -167,7 +167,7 @@ class OrganizationEnrichmentEngine:
             Estadísticas del proceso
         """
         logger.info("=" * 80)
-        logger.info("🏢 INICIANDO ENRIQUECIMIENTO DE ORGANIZACIONES v1.0")
+        logger.info("INICIANDO ENRIQUECIMIENTO DE ORGANIZACIONES v1.0")
         logger.info("=" * 80)
         
         self.stats["start_time"] = datetime.now()
@@ -242,7 +242,7 @@ class OrganizationEnrichmentEngine:
         login = org.get("login")
         
         try:
-            logger.info(f"\n🏢 Enriqueciendo organización: {login}")
+            logger.info(f"\nEnriqueciendo organización: {login}")
             
             # ==================== SUPER-QUERY: UNA SOLA LLAMADA ====================
             graphql_data = self._fetch_organization_data(login)

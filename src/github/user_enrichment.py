@@ -291,7 +291,7 @@ class UserEnrichmentEngine:
         login = user.get("login")
         
         try:
-            logger.info(f"\n👤 Enriqueciendo usuario: {login}")
+            logger.info(f"\nEnriqueciendo usuario: {login}")
             
             # Limpiar arrays vacíos del usuario (legacy)
             self._clean_empty_arrays(user)
@@ -376,7 +376,7 @@ class UserEnrichmentEngine:
             )
             
             self.stats["total_enriched"] += 1
-            logger.info(f"✅ Usuario {login} enriquecido correctamente (v3.0)")
+            logger.info(f"✅ Usuario {login} enriquecido correctamente")
             
             return True
             
@@ -721,6 +721,6 @@ class UserEnrichmentEngine:
         logger.info(f"❌ Total errores: {self.stats['total_errors']}")
         
         if "duration_seconds" in self.stats:
-            logger.info(f"⏱️  Duración: {self.stats['duration_seconds']:.2f} segundos")
+            logger.info(f"Duración: {self.stats['duration_seconds']:.2f} segundos")
         
         return self.stats

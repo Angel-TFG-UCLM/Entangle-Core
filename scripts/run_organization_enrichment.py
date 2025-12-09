@@ -26,7 +26,7 @@ def main():
     """Ejecuta el enriquecimiento de organizaciones."""
     
     logger.info("=" * 80)
-    logger.info("🏢 INICIANDO ENRIQUECIMIENTO DE ORGANIZACIONES")
+    logger.info("INICIANDO ENRIQUECIMIENTO DE ORGANIZACIONES")
     logger.info("=" * 80)
     
     # Cargar variables de entorno
@@ -38,7 +38,7 @@ def main():
         return 1
     
     # Obtener parámetros
-    logger.info("\n📋 Configuración:")
+    logger.info("\nConfiguración:")
     logger.info("  • Motor: Super-query GraphQL (1 query por organización)")
     logger.info("  • Campos a enriquecer:")
     logger.info("    - quantum_focus_score (0-100)")
@@ -70,13 +70,13 @@ def main():
     
     try:
         # Crear repositorios
-        logger.info("\n🔧 Inicializando repositorios...")
+        logger.info("\nInicializando repositorios...")
         orgs_repo = MongoRepository("organizations")
         repos_repo = MongoRepository("repositories")
         users_repo = MongoRepository("users")
         
         # Crear motor de enriquecimiento
-        logger.info("🔧 Creando motor de enriquecimiento...")
+        logger.info("Creando motor de enriquecimiento...")
         engine = OrganizationEnrichmentEngine(
             github_token=github_token,
             organizations_repository=orgs_repo,
@@ -87,7 +87,7 @@ def main():
         )
         
         # Ejecutar enriquecimiento
-        logger.info("\n🔄 Ejecutando enriquecimiento de organizaciones...")
+        logger.info("\nEjecutando enriquecimiento de organizaciones...")
         stats = engine.enrich_all_organizations(
             max_orgs=max_orgs,
             force_reenrich=force_reenrich
@@ -106,7 +106,7 @@ def main():
             logger.warning(f"\n⚠️  Errores: {stats['total_errors']}")
         
         duration = stats.get('duration_seconds', 0)
-        logger.info(f"\n⏱️  Duración: {duration:.2f}s ({duration/60:.1f} minutos)")
+        logger.info(f"\nDuración: {duration:.2f}s ({duration/60:.1f} minutos)")
         
         return 0
         

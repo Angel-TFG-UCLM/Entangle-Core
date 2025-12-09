@@ -68,7 +68,7 @@ fetch('/api/v1/ingestion/repositories', { method: 'POST' })
 
 ---
 
-### 3. **Resiliencia en Persistencia** (`src/github/ingestion.py`)
+### 3. **Resiliencia en Persistencia** (`src/github/repositories_ingestion.py`)
 
 **Problema**: Si un lote completo de documentos falla al escribirse en Cosmos DB (por throttling, errores de red, o documentos malformados), todo el proceso se detenía.
 

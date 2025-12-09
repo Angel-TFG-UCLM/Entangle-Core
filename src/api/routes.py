@@ -12,10 +12,10 @@ from ..github.extract import (
     search_repositories
 )
 from ..github.rate_limit import get_rate_limit_info
-from ..github.ingestion import IngestionEngine
+from ..github.repositories_ingestion import IngestionEngine
 from ..github.user_ingestion import UserIngestionEngine
 from ..github.organization_ingestion import OrganizationIngestionEngine
-from ..github.enrichment import EnrichmentEngine
+from ..github.repositories_enrichment import EnrichmentEngine
 from ..github.user_enrichment import UserEnrichmentEngine
 from ..github.organization_enrichment import OrganizationEnrichmentEngine
 from ..github.graphql_client import GitHubGraphQLClient

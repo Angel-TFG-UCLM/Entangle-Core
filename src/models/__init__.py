@@ -31,13 +31,13 @@ from .user import (
     UserOrganization
 )
 
-# Relation models
-from .relation import (
-    Relation,
-    RelationType,
-    ContributionMetrics,
-    TimeSeriesData
-)
+# Relation models - DESHABILITADO: Para futura implementación de análisis de grafos
+# from .relation import (
+#     Relation,
+#     RelationType,
+#     ContributionMetrics,
+#     TimeSeriesData
+# )
 
 __all__ = [
     # Repository

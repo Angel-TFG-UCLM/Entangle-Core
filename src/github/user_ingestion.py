@@ -72,7 +72,7 @@ class UserIngestionEngine:
             "duration_seconds": 0
         }
         
-        logger.info(f"🚀 UserIngestionEngine inicializado (batch_size={batch_size})")
+        logger.info(f"UserIngestionEngine inicializado (batch_size={batch_size})")
     
     def run(self, max_repos: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -118,11 +118,11 @@ class UserIngestionEngine:
         logger.info(f"  • Usuarios únicos encontrados: {self.stats['unique_users']}")
         logger.info(f"  • Usuarios nuevos insertados: {self.stats['users_inserted']}")
         logger.info(f"  • Usuarios ya existentes: {self.stats['users_existing']}")
-        logger.info(f"\n🤖 Clasificación:")
+        logger.info(f"\nClasificación:")
         logger.info(f"  • Usuarios reales: {self.stats['real_users']} ({self.stats['real_users']/self.stats['unique_users']*100:.1f}%)")
         logger.info(f"  • Bots detectados: {self.stats['bots_detected']} ({self.stats['bots_detected']/self.stats['unique_users']*100:.1f}%)")
         logger.info(f"\n⚠️  Errores: {self.stats['total_errors']}")
-        logger.info(f"⏱️  Duración: {self.stats['duration_seconds']:.2f}s ({self.stats['duration_seconds']/60:.1f} minutos)")
+        logger.info(f"Duración: {self.stats['duration_seconds']:.2f}s ({self.stats['duration_seconds']/60:.1f} minutos)")
         
         return self.stats
     

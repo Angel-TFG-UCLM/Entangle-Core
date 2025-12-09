@@ -9,7 +9,7 @@ def test_imports():
     print("\n✓ Testing imports...")
     
     try:
-        from src.github.ingestion import IngestionEngine
+        from src.github.repositories_ingestion import IngestionEngine
         print("  ✓ IngestionEngine importado")
         
         from src.core.mongo_repository import MongoRepository
@@ -36,7 +36,7 @@ def test_engine_initialization():
     print("\n✓ Testing IngestionEngine initialization...")
     
     try:
-        from src.github.ingestion import IngestionEngine
+        from src.github.repositories_ingestion import IngestionEngine
         
         engine = IngestionEngine(incremental=False, batch_size=10)
         print("  ✓ Motor de ingesta creado")

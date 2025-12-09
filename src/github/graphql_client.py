@@ -94,7 +94,7 @@ class GitHubGraphQLClient:
                                 remaining = graphql_rate.get('remaining', 0)
                                 limit = graphql_rate.get('limit', 5000)
                                 
-                                logger.info(f"📊 Rate limit GraphQL: {remaining}/{limit} requests restantes")
+                                logger.info(f"Rate limit GraphQL: {remaining}/{limit} requests restantes")
                                 
                                 if reset_timestamp > 0:
                                     # Calcular tiempo de espera exacto
@@ -103,8 +103,8 @@ class GitHubGraphQLClient:
                                     wait_seconds = max(0, (reset_time - now).total_seconds()) + 5  # +5s margen
                                     
                                     reset_str = reset_time.strftime('%Y-%m-%d %H:%M:%S')
-                                    logger.info(f"🕐 Rate limit se reseteará el: {reset_str}")
-                                    logger.info(f"⏳ Esperando {wait_seconds:.0f} segundos ({wait_seconds/60:.1f} minutos)...")
+                                    logger.info(f"Rate limit se reseteará el: {reset_str}")
+                                    logger.info(f"Esperando {wait_seconds:.0f} segundos ({wait_seconds/60:.1f} minutos)...")
                                     
                                     # Esperar con progreso cada minuto
                                     remaining_wait = wait_seconds
@@ -113,7 +113,7 @@ class GitHubGraphQLClient:
                                         time.sleep(sleep_chunk)
                                         remaining_wait -= sleep_chunk
                                         if remaining_wait > 60:
-                                            logger.info(f"⏳ Quedan {remaining_wait:.0f}s ({remaining_wait/60:.1f} min)...")
+                                            logger.info(f"Quedan {remaining_wait:.0f}s ({remaining_wait/60:.1f} min)...")
                                     
                                     logger.info("✅ Rate limit reseteado. Reintentando query...")
                                     # Salir del for de errores para reintentar
@@ -127,7 +127,7 @@ class GitHubGraphQLClient:
                             except Exception as rate_err:
                                 logger.error(f"❌ Error obteniendo rate limit REST: {rate_err}")
                                 # Espera por defecto
-                                logger.info("⏳ Esperando 1 hora por defecto...")
+                                logger.info("Esperando 1 hora por defecto...")
                                 time.sleep(3600)
                                 break
                     
