@@ -1,75 +1,43 @@
-name: Deploy to Azure Container Apps
+name: CI/CD Manual TFG
 
 on:
+  # 1. Se activa automático al hacer push en main O develop
   push:
-    branches: [ main, Ingesta_MongoDB ]
-  pull_request:
-    branches: [ main ]
+    branches: [ "main", "develop" ]
+  
+  # 2. ¡Esto es lo que buscas! Te permite darle a un botón "Play" manual
   workflow_dispatch:
 
 env:
-  AZURE_CONTAINER_REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
-  CONTAINER_APP_NAME: tfg-backend-api
-  RESOURCE_GROUP: rg-tfg-backend
+  IMAGE_NAME: tfg-backend
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Run tests
-      run: |
-        pip install pytest pytest-cov
-        pytest tests/ -v --cov=src --cov-report=xml || true
-    
-    - name: Log in to Azure
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
-    
-    - name: Build and push Docker image
-      if: github.event_name == 'push'
-      run: |
-        az acr build \
-          --registry ${{ secrets.AZURE_CONTAINER_REGISTRY_NAME }} \
-          --image tfg-backend:${{ github.sha }} \
-          --image tfg-backend:latest \
-          --file Dockerfile \
-          .
-    
-    - name: Deploy to Azure Container Apps
-      if: github.event_name == 'push'
-      run: |
-        az containerapp update \
-          --name ${{ env.CONTAINER_APP_NAME }} \
-          --resource-group ${{ env.RESOURCE_GROUP }} \
-          --image ${{ env.AZURE_CONTAINER_REGISTRY }}/tfg-backend:${{ github.sha }}
-    
-    - name: Verify deployment
-      if: github.event_name == 'push'
-      run: |
-        APP_URL=$(az containerapp show \
-          --name ${{ env.CONTAINER_APP_NAME }} \
-          --resource-group ${{ env.RESOURCE_GROUP }} \
-          --query properties.configuration.ingress.fqdn -o tsv)
-        
-        echo "Application deployed to: https://$APP_URL"
-        
-        # Wait for app to be ready
-        sleep 30
-        
-        # Health check
-        curl -f https://$APP_URL/api/v1/health || exit 1
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Login en tu registro privado de Azure (sin pedir permiso a la uni)
+      - name: Log in to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.AZURE_CONTAINER_REGISTRY_NAME }}.azurecr.io
+          username: ${{ secrets.AZURE_REGISTRY_USERNAME }}
+          password: ${{ secrets.AZURE_REGISTRY_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Construye y sube
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # Aquí está el truco: usamos github.ref_name para que la etiqueta
+          # sea el nombre de la rama (ej: tfg-backend:develop)
+          tags: |
+            ${{ secrets.AZURE_CONTAINER_REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ secrets.AZURE_CONTAINER_REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.AZURE_CONTAINER_REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
