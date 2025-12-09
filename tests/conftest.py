@@ -10,7 +10,7 @@ def pytest_configure(config):
     """Configuración inicial de pytest."""
     # Agregar marcadores personalizados
     config.addinivalue_line(
-        "markers", "integration: Tests de integración que requieren servicios externos (MongoDB, GitHub API)"
+        "markers", "integration: Tests de integración que requieren servicios externos. (MongoDB, GitHub API)"
     )
     config.addinivalue_line(
         "markers", "slow: Tests lentos que tardan más de 5 segundos"
