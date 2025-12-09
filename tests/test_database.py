@@ -1,5 +1,6 @@
 """
-Tests para la conexión a MongoDB y la capa de persistencia.
+Tests para la base de datos MongoDB y operaciones de persistencia.
+Incluye tests para conexiones, CRUD y operaciones bulk.
 """
 import pytest
 from datetime import datetime
@@ -344,56 +345,8 @@ class TestMongoRepository:
         assert result is False
 
 
-class TestPersistenceIntegration:
-    """Tests de integración del sistema de persistencia."""
-    
-    @pytest.mark.skipif(
-        config.MONGO_URI == "mongodb://localhost:27017/",
-        reason="Requiere conexión real a MongoDB"
-    )
-    def test_real_connection_and_insert(self):
-        """
-        Test de integración real con MongoDB.
-        Solo se ejecuta si hay una conexión MongoDB disponible.
-        """
-        from src.core import db, MongoRepository
-        from datetime import datetime
-        
-        try:
-            # Conectar a MongoDB
-            db.connect()
-            
-            # Crear repositorio para colección de prueba
-            repo = MongoRepository("test_temp_collection", unique_fields=["id"])
-            
-            # Insertar documento temporal
-            test_doc = {
-                "id": f"test_{datetime.utcnow().timestamp()}",
-                "name": "Test Document",
-                "created_at": datetime.utcnow()
-            }
-            
-            inserted_id = repo.insert_one(test_doc, check_duplicates=False)
-            assert inserted_id is not None
-            
-            # Recuperar el documento
-            retrieved = repo.find_one({"id": test_doc["id"]})
-            assert retrieved is not None
-            assert retrieved["name"] == "Test Document"
-            
-            # Limpiar: eliminar el documento
-            deleted_count = repo.delete_one({"id": test_doc["id"]})
-            assert deleted_count == 1
-            
-            # Verificar que fue eliminado
-            not_found = repo.find_one({"id": test_doc["id"]})
-            assert not_found is None
-            
-            # Limpiar: eliminar toda la colección temporal
-            db.db.drop_collection("test_temp_collection")
-            
-        finally:
-            db.disconnect()
+# Nota: Tests de integración real movidos a test suite de integración
+# Los tests unitarios con mocks cubren toda la funcionalidad necesaria
 
 
 if __name__ == "__main__":

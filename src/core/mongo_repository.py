@@ -3,7 +3,7 @@ Capa de persistencia genérica para MongoDB.
 Proporciona operaciones CRUD reutilizables para todas las colecciones.
 """
 from typing import Dict, List, Optional, Any, Type, Union
-from datetime import datetime
+from datetime import datetime, UTC
 from pymongo.collection import Collection
 from pymongo.results import InsertOneResult, InsertManyResult, UpdateResult, DeleteResult
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -352,7 +352,7 @@ class MongoRepository:
             
             # Agregar timestamp de actualización
             if update_timestamp:
-                doc_dict["updated_at"] = datetime.utcnow()
+                doc_dict["updated_at"] = datetime.now(UTC)
             
             # Usar $set para actualizar todo el documento
             update = {"$set": doc_dict}
@@ -462,7 +462,7 @@ class MongoRepository:
                     logger.warning(f"⚠️ Documento sin campo '{unique_field}', se omite del bulk_upsert")
                     continue
                 
-                doc_dict["updated_at"] = datetime.utcnow()
+                doc_dict["updated_at"] = datetime.now(UTC)
                 
                 # Crear operación de upsert con el campo único correcto
                 query = {unique_field: unique_value}

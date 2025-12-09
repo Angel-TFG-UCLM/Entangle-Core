@@ -59,7 +59,7 @@ async def rate_limit():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/organizations/{org_login}")
+@router.get("/organizations/github/{org_login}")
 async def get_organization(
     org_login: str,
     save_to_db: bool = Query(default=True, description="Guardar en base de datos")
@@ -81,7 +81,7 @@ async def get_organization(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/repositories/{owner}/{name}")
+@router.get("/repositories/github/{owner}/{name}")
 async def get_repository(
     owner: str,
     name: str,
@@ -105,7 +105,7 @@ async def get_repository(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/users/{user_login}")
+@router.get("/users/github/{user_login}")
 async def get_user(
     user_login: str,
     save_to_db: bool = Query(default=True, description="Guardar en base de datos")
@@ -150,6 +150,158 @@ async def search_repos(
         }
     except Exception as e:
         logger.error(f"Error al buscar repositorios: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ENDPOINTS DE LISTADO (desde base de datos)
+# ============================================================================
+
+@router.get("/repositories")
+async def list_repositories(
+    skip: int = Query(default=0, ge=0, description="Número de documentos a saltar"),
+    limit: int = Query(default=50, ge=1, le=1000, description="Límite de resultados"),
+    language: Optional[str] = Query(None, description="Filtrar por lenguaje"),
+    min_stars: Optional[int] = Query(None, ge=0, description="Estrellas mínimas")
+):
+    """
+    Lista repositorios desde la base de datos con paginación y filtros.
+    """
+    try:
+        from ..core.db import db
+        
+        # Construir filtro
+        filter_query = {}
+        if language:
+            filter_query["primary_language.name"] = language
+        if min_stars is not None:
+            filter_query["stargazer_count"] = {"$gte": min_stars}
+        
+        # Obtener repositorios
+        repo_collection = db.get_collection("repositories")
+        repositories = list(repo_collection.find(filter_query).skip(skip).limit(limit))
+        
+        # Convertir ObjectId a string
+        for repo in repositories:
+            repo["_id"] = str(repo["_id"])
+        
+        return repositories
+    except Exception as e:
+        logger.error(f"Error al listar repositorios: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/repositories/db/{repo_id}")
+async def get_repository_by_id(repo_id: str):
+    """
+    Obtiene un repositorio por su ID de MongoDB.
+    """
+    try:
+        from ..core.db import db
+        from bson import ObjectId
+        
+        repo_collection = db.get_collection("repositories")
+        repo = repo_collection.find_one({"_id": ObjectId(repo_id)})
+        
+        if not repo:
+            raise HTTPException(status_code=404, detail="Repositorio no encontrado")
+        
+        repo["_id"] = str(repo["_id"])
+        return repo
+    except Exception as e:
+        logger.error(f"Error al obtener repositorio: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/users")
+async def list_users(
+    skip: int = Query(default=0, ge=0, description="Número de documentos a saltar"),
+    limit: int = Query(default=50, ge=1, le=1000, description="Límite de resultados")
+):
+    """
+    Lista usuarios desde la base de datos con paginación.
+    """
+    try:
+        from ..core.db import db
+        
+        user_collection = db.get_collection("users")
+        users = list(user_collection.find({}).skip(skip).limit(limit))
+        
+        # Convertir ObjectId a string
+        for user in users:
+            user["_id"] = str(user["_id"])
+        
+        return users
+    except Exception as e:
+        logger.error(f"Error al listar usuarios: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/users/db/{user_id}")
+async def get_user_by_id(user_id: str):
+    """
+    Obtiene un usuario por su ID de MongoDB.
+    """
+    try:
+        from ..core.db import db
+        from bson import ObjectId
+        
+        user_collection = db.get_collection("users")
+        user = user_collection.find_one({"_id": ObjectId(user_id)})
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        
+        user["_id"] = str(user["_id"])
+        return user
+    except Exception as e:
+        logger.error(f"Error al obtener usuario: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/organizations")
+async def list_organizations(
+    skip: int = Query(default=0, ge=0, description="Número de documentos a saltar"),
+    limit: int = Query(default=50, ge=1, le=1000, description="Límite de resultados")
+):
+    """
+    Lista organizaciones desde la base de datos con paginación.
+    """
+    try:
+        from ..core.db import db
+        
+        org_collection = db.get_collection("organizations")
+        organizations = list(org_collection.find({}).skip(skip).limit(limit))
+        
+        # Convertir ObjectId a string
+        for org in organizations:
+            org["_id"] = str(org["_id"])
+        
+        return organizations
+    except Exception as e:
+        logger.error(f"Error al listar organizaciones: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/organizations/db/{org_id}")
+async def get_organization_by_id(org_id: str):
+    """
+    Obtiene una organización por su ID de MongoDB.
+    """
+    try:
+        from ..core.db import db
+        from bson import ObjectId
+        
+        org_collection = db.get_collection("organizations")
+        org = org_collection.find_one({"_id": ObjectId(org_id)})
+        
+        if not org:
+            raise HTTPException(status_code=404, detail="Organización no encontrada")
+        
+        org["_id"] = str(org["_id"])
+        return org
+    except Exception as e:
+        logger.error(f"Error al obtener organización: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
