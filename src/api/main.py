@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TFG Backend API",
     description="API para extraer y analizar datos de GitHub",
-    version="2.0.0",
+    version="1.0.0",
     debug=config.DEBUG,
     lifespan=lifespan
 )
