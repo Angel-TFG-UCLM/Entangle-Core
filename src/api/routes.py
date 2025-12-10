@@ -46,6 +46,36 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@router.get("/stats")
+async def get_stats():
+    """
+    Obtiene estadísticas generales del sistema.
+    Retorna el conteo total de repositorios, usuarios y organizaciones.
+    """
+    try:
+        from ..core.db import db
+        
+        # Obtener colecciones
+        repos_collection = db.get_collection("repositories")
+        users_collection = db.get_collection("users")
+        orgs_collection = db.get_collection("organizations")
+        
+        # Contar documentos
+        repos_count = repos_collection.count_documents({})
+        users_count = users_collection.count_documents({})
+        orgs_count = orgs_collection.count_documents({})
+        
+        return {
+            "repositories": repos_count,
+            "users": users_count,
+            "organizations": orgs_count,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error al obtener estadísticas: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/rate-limit")
 async def rate_limit():
     """
