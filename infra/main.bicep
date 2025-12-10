@@ -73,8 +73,8 @@ module api './core/host/container-app.bicep' = {
     containerRegistryName: containerRegistry.outputs.name
     containerCpuCoreCount: '1.0'
     containerMemory: '2.0Gi'
-    containerMaxReplicas: 10
-    containerMinReplicas: 1
+    containerMaxReplicas: 1
+    containerMinReplicas: 0
     env: [
       {
         name: 'ENVIRONMENT'

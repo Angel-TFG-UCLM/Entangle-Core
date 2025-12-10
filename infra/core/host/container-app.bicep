@@ -5,8 +5,8 @@ param containerAppsEnvironmentName string
 param containerRegistryName string
 param containerCpuCoreCount string = '0.5'
 param containerMemory string = '1.0Gi'
-param containerMaxReplicas int = 10
-param containerMinReplicas int = 1
+param containerMaxReplicas int = 1
+param containerMinReplicas int = 0
 param targetPort int = 8000
 param env array = []
 param secrets array = []
