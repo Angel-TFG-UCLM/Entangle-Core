@@ -2,7 +2,7 @@ name: CI/CD Manual TFG
 
 on:
   push:
-    branches: [ "main", "develop, Desarrollo-Frontend" ]
+    branches: [ "main", "develop", "Desarrollo-Frontend" ]
   
   workflow_dispatch:
 
