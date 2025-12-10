@@ -55,15 +55,18 @@ async def get_stats():
     try:
         from ..core.db import db
         
+        # Asegurar conexión activa (reconecta automáticamente si está caída)
+        db.ensure_connection()
+        
         # Obtener colecciones
         repos_collection = db.get_collection("repositories")
         users_collection = db.get_collection("users")
         orgs_collection = db.get_collection("organizations")
         
-        # Contar documentos
-        repos_count = repos_collection.count_documents({})
-        users_count = users_collection.count_documents({})
-        orgs_count = orgs_collection.count_documents({})
+        # Contar documentos con timeout de 5 segundos
+        repos_count = repos_collection.count_documents({}, maxTimeMS=5000)
+        users_count = users_collection.count_documents({}, maxTimeMS=5000)
+        orgs_count = orgs_collection.count_documents({}, maxTimeMS=5000)
         
         return {
             "repositories": repos_count,
@@ -72,8 +75,9 @@ async def get_stats():
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
-        logger.error(f"Error al obtener estadísticas: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Error al obtener estadísticas: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @router.get("/rate-limit")
