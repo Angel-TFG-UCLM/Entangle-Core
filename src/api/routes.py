@@ -1062,7 +1062,6 @@ def _run_full_pipeline_direct(task_id: str):
         
         # Obtener dependencias comunes
         import os
-        db = get_database()
         github_token = os.getenv("GITHUB_TOKEN")
         
         if not github_token:
@@ -1072,13 +1071,13 @@ def _run_full_pipeline_direct(task_id: str):
         background_tasks_status[task_id]["progress"] = "1/6 - Ingesta de Repositorios"
         result = run_operation(
             "1. Ingesta de Repositorios",
-            lambda: IngestionEngine(incremental=False).run(max_results=None)
+            lambda: IngestionEngine(incremental=False).run(max_results=None, save_to_json=False)
         )
         results.append(result)
         
         # 2. Enriquecimiento de Repositorios  
         background_tasks_status[task_id]["progress"] = "2/6 - Enriquecimiento de Repositorios"
-        repo_repo = MongoRepository(db, "repositories")
+        repo_repo = MongoRepository("repositories")
         
         result = run_operation(
             "2. Enriquecimiento de Repositorios",
@@ -1100,7 +1099,7 @@ def _run_full_pipeline_direct(task_id: str):
         
         # 4. Enriquecimiento de Usuarios
         background_tasks_status[task_id]["progress"] = "4/6 - Enriquecimiento de Usuarios"
-        users_repo = MongoRepository(db, "users")
+        users_repo = MongoRepository("users")
         client = GitHubGraphQLClient(github_token)
         
         result = run_operation(
@@ -1114,7 +1113,7 @@ def _run_full_pipeline_direct(task_id: str):
         
         # 5. Ingesta de Organizaciones
         background_tasks_status[task_id]["progress"] = "5/6 - Ingesta de Organizaciones"
-        orgs_repo = MongoRepository(db, "organizations")
+        orgs_repo = MongoRepository("organizations")
         
         result = run_operation(
             "5. Ingesta de Organizaciones",

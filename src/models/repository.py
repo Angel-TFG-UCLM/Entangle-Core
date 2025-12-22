@@ -207,7 +207,8 @@ class Repository(BaseModel):
     parent_name_with_owner: Optional[str] = Field(None, alias="parentNameWithOwner")
     
     # ==================== README (OPCIONAL/DIFERIDO) ====================
-    readme_text: Optional[str] = Field(None, alias="readmeText")  # Puede ser pesado
+    readme_text: Optional[str] = Field(None, alias="readmeText", exclude=True)  # NO se guarda en BD (muy pesado)
+    readme_length: int = Field(0, alias="readmeLength")  # Solo guardamos la longitud
     has_readme: bool = Field(False, alias="hasReadme")
     
     # ==================== SEGURIDAD (SOLO CONTADOR) ====================
@@ -414,12 +415,14 @@ class Repository(BaseModel):
             )
         
         # ==================== README ====================
-        readme_text = None
+        readme_text = None  # Se usa para filtrado pero NO se guarda
+        readme_length = 0
         has_readme = False
         readme_object = data.get("object")
         if readme_object and isinstance(readme_object, dict):
             readme_text = readme_object.get("text")
             has_readme = bool(readme_text)
+            readme_length = len(readme_text) if readme_text else 0
         
         # ==================== SEGURIDAD (SOLO CONTADOR) ====================
         vulnerability_alerts_data = data.get("vulnerabilityAlerts", {})
@@ -500,7 +503,8 @@ class Repository(BaseModel):
             defaultBranchRefName=default_branch_name,
             parentId=parent_id,
             parentNameWithOwner=parent_name_with_owner,
-            readmeText=readme_text,
+            readmeText=readme_text,  # Solo para filtrado, no se persiste (exclude=True)
+            readmeLength=readme_length,
             hasReadme=has_readme,
             vulnerabilityAlertsCount=vulnerability_alerts_count,
             dependencyGraphManifests=dependency_graph_manifests,
