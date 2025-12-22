@@ -950,7 +950,7 @@ def _run_organization_enrichment(
 @router.post("/pipeline/run-all")
 async def run_full_pipeline(background_tasks: BackgroundTasks):
     """
-    Ejecuta el pipeline completo de ingesta y enriquecimiento.
+    Ejecuta el pipeline completo de ingesta y enriquecimiento. Este es el que debes ejecutar si quieres una ingesta completa desde 0
     
     Ejecuta directamente todas las operaciones en orden (con logs visibles en Azure):
     1. Ingesta de Repositorios
@@ -1061,8 +1061,12 @@ def _run_full_pipeline_direct(task_id: str):
         logger.info("=" * 80)
         
         # Obtener dependencias comunes
+        import os
         db = get_database()
-        github_token = config.github_token
+        github_token = os.getenv("GITHUB_TOKEN")
+        
+        if not github_token:
+            raise ValueError("GITHUB_TOKEN no configurado en variables de entorno")
         
         # 1. Ingesta de Repositorios
         background_tasks_status[task_id]["progress"] = "1/6 - Ingesta de Repositorios"
