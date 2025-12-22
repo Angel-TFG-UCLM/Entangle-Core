@@ -952,7 +952,7 @@ async def run_full_pipeline(background_tasks: BackgroundTasks):
     """
     Ejecuta el pipeline completo de ingesta y enriquecimiento.
     
-    Ejecuta el script run_full_pipeline.py que corre todas las operaciones en orden:
+    Ejecuta directamente todas las operaciones en orden (con logs visibles en Azure):
     1. Ingesta de Repositorios
     2. Enriquecimiento de Repositorios
     3. Ingesta de Usuarios
@@ -974,17 +974,222 @@ async def run_full_pipeline(background_tasks: BackgroundTasks):
         "started_at": datetime.now().isoformat()
     }
     
-    background_tasks.add_task(_run_full_pipeline_script, task_id)
+    background_tasks.add_task(_run_full_pipeline_direct, task_id)
     
     return {
         "task_id": task_id,
         "status": "started",
-        "message": "Pipeline completo iniciado. Usa GET /tasks para ver el estado."
+        "message": "Pipeline completo iniciado. Usa GET /pipeline/status/{task_id} para ver el estado."
     }
 
 
+def _run_full_pipeline_direct(task_id: str):
+    """Ejecuta el pipeline completo llamando directamente a las funciones (logs visibles en Azure)."""
+    from dataclasses import dataclass
+    from typing import List
+    import traceback
+    from ..core.db import get_database
+    from ..github.user_ingestion import run_user_ingestion
+    
+    @dataclass
+    class OperationResult:
+        """Resultado de una operación del pipeline."""
+        name: str
+        success: bool
+        duration: float
+        records_processed: int = 0
+        error_message: str = ""
+    
+    def run_operation(name: str, func, *args, **kwargs) -> OperationResult:
+        """Ejecuta una operación y registra su resultado."""
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info(f"EJECUTANDO: {name}")
+        logger.info("=" * 80)
+        
+        start_time = datetime.now()
+        success = False
+        records_processed = 0
+        error_message = ""
+        
+        try:
+            result = func(*args, **kwargs)
+            success = True
+            
+            # Extraer el número de registros procesados según el tipo de resultado
+            if isinstance(result, dict):
+                records_processed = (
+                    result.get('total', 0) or 
+                    result.get('total_processed', 0) or
+                    result.get('stats', {}).get('total_found', 0) or
+                    result.get('total_organizations', 0) or
+                    result.get('total_users', 0) or
+                    result.get('enriched', 0) or
+                    result.get('new_organizations', 0) or
+                    result.get('new_users', 0) or
+                    0
+                )
+            elif isinstance(result, int):
+                records_processed = result
+                
+            logger.info(f"✅ {name} completado exitosamente")
+            if records_processed > 0:
+                logger.info(f"   Registros procesados: {records_processed:,}")
+            
+        except Exception as e:
+            success = False
+            error_message = str(e)
+            logger.error(f"❌ Error en {name}: {error_message}")
+            logger.error(traceback.format_exc())
+        
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        return OperationResult(
+            name=name,
+            success=success,
+            duration=duration,
+            records_processed=records_processed,
+            error_message=error_message
+        )
+    
+    try:
+        total_start = datetime.now()
+        results: List[OperationResult] = []
+        
+        logger.info("🚀 INICIANDO PIPELINE COMPLETO DE INGESTA Y ENRIQUECIMIENTO")
+        logger.info("=" * 80)
+        
+        # Obtener dependencias comunes
+        db = get_database()
+        github_token = config.github_token
+        
+        # 1. Ingesta de Repositorios
+        background_tasks_status[task_id]["progress"] = "1/6 - Ingesta de Repositorios"
+        result = run_operation(
+            "1. Ingesta de Repositorios",
+            lambda: IngestionEngine(incremental=False).run(max_results=None)
+        )
+        results.append(result)
+        
+        # 2. Enriquecimiento de Repositorios  
+        background_tasks_status[task_id]["progress"] = "2/6 - Enriquecimiento de Repositorios"
+        repo_repo = MongoRepository(db, "repositories")
+        
+        result = run_operation(
+            "2. Enriquecimiento de Repositorios",
+            lambda: EnrichmentEngine(
+                github_token=github_token,
+                repos_repository=repo_repo,
+                batch_size=10
+            ).enrich_all_repositories(max_repos=None, force_reenrich=False)
+        )
+        results.append(result)
+        
+        # 3. Ingesta de Usuarios
+        background_tasks_status[task_id]["progress"] = "3/6 - Ingesta de Usuarios"
+        result = run_operation(
+            "3. Ingesta de Usuarios",
+            run_user_ingestion
+        )
+        results.append(result)
+        
+        # 4. Enriquecimiento de Usuarios
+        background_tasks_status[task_id]["progress"] = "4/6 - Enriquecimiento de Usuarios"
+        users_repo = MongoRepository(db, "users")
+        client = GitHubGraphQLClient(github_token)
+        
+        result = run_operation(
+            "4. Enriquecimiento de Usuarios",
+            lambda: UserEnrichmentEngine(users_repo, repo_repo, client).enrich_all_users(
+                max_users=None, 
+                force_reenrich=False
+            )
+        )
+        results.append(result)
+        
+        # 5. Ingesta de Organizaciones
+        background_tasks_status[task_id]["progress"] = "5/6 - Ingesta de Organizaciones"
+        orgs_repo = MongoRepository(db, "organizations")
+        
+        result = run_operation(
+            "5. Ingesta de Organizaciones",
+            lambda: OrganizationIngestionEngine(
+                github_token=github_token,
+                users_repository=users_repo,
+                organizations_repository=orgs_repo,
+                batch_size=5
+            ).run(force_update=False)
+        )
+        results.append(result)
+        
+        # 6. Enriquecimiento de Organizaciones
+        background_tasks_status[task_id]["progress"] = "6/6 - Enriquecimiento de Organizaciones"
+        result = run_operation(
+            "6. Enriquecimiento de Organizaciones",
+            lambda: OrganizationEnrichmentEngine(
+                github_token=github_token,
+                organizations_repository=orgs_repo,
+                repositories_repository=repo_repo,
+                batch_size=5
+            ).enrich_all_organizations(max_orgs=None, force_reenrich=False)
+        )
+        results.append(result)
+        
+        total_end = datetime.now()
+        total_duration = (total_end - total_start).total_seconds()
+        
+        # Resumen
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("📊 RESUMEN COMPLETO DE EJECUCIÓN")
+        logger.info("=" * 80)
+        
+        successful = sum(1 for r in results if r.success)
+        total_records = sum(r.records_processed for r in results if r.success)
+        
+        for result in results:
+            status = "✅ ÉXITO" if result.success else "❌ ERROR"
+            logger.info(f"{result.name}: {status} ({result.records_processed:,} registros, {result.duration:.0f}s)")
+            if not result.success:
+                logger.error(f"   Error: {result.error_message}")
+        
+        logger.info("")
+        logger.info(f"Total: {successful}/{len(results)} operaciones exitosas")
+        logger.info(f"Registros procesados: {total_records:,}")
+        logger.info(f"Duración total: {total_duration:.0f}s ({total_duration/60:.1f}m)")
+        
+        # Actualizar estado final
+        if successful == len(results):
+            background_tasks_status[task_id]["status"] = "completed"
+            background_tasks_status[task_id]["progress"] = "Pipeline completado exitosamente"
+            logger.info("🎉 PIPELINE COMPLETADO EXITOSAMENTE 🎉")
+        else:
+            background_tasks_status[task_id]["status"] = "completed_with_errors"
+            background_tasks_status[task_id]["progress"] = f"Completado con {len(results) - successful} errores"
+            logger.warning("⚠️  PIPELINE COMPLETADO CON ERRORES ⚠️")
+        
+        background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
+        background_tasks_status[task_id]["total_operations"] = len(results)
+        background_tasks_status[task_id]["successful_operations"] = successful
+        background_tasks_status[task_id]["total_records"] = total_records
+        background_tasks_status[task_id]["duration_seconds"] = total_duration
+        
+    except Exception as e:
+        logger.error(f"❌ Error crítico en pipeline {task_id}: {e}")
+        logger.error(traceback.format_exc())
+        background_tasks_status[task_id]["status"] = "failed"
+        background_tasks_status[task_id]["progress"] = f"Error crítico: {str(e)}"
+        background_tasks_status[task_id]["error"] = str(e)
+        background_tasks_status[task_id]["failed_at"] = datetime.now().isoformat()
+
+
 def _run_full_pipeline_script(task_id: str):
-    """Ejecuta el script run_full_pipeline.py en background."""
+    """
+    DEPRECADO: Ejecuta el script run_full_pipeline.py usando subprocess.
+    No se usa porque capture_output=True oculta los logs en Azure.
+    Mantenido solo por compatibilidad legacy.
+    """
     import subprocess
     import sys
     import os
