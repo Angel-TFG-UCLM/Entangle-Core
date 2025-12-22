@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from pydantic import ValidationError
+from pymongo.errors import OperationFailure
 
 from .graphql_client import GitHubGraphQLClient
 from .filters import RepositoryFilters
@@ -109,6 +110,52 @@ class IngestionEngine:
         }
         
         logger.info(f"Motor de ingesta inicializado (incremental={'SÍ' if incremental else 'NO'}, batch_size={batch_size})")
+    
+    def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
+        """
+        Ejecuta una operación con retry automático cuando Cosmos DB retorna 429.
+        
+        Args:
+            operation: Función a ejecutar
+            max_retries: Número máximo de reintentos (default 5)
+            
+        Returns:
+            Resultado de la operación o None si falla
+        """
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except OperationFailure as e:
+                if e.code == 16500:  # Cosmos DB throttling
+                    # Parsear RetryAfterMs del mensaje de error
+                    error_msg = str(e)
+                    retry_after_ms = 1000  # default fallback
+                    
+                    if 'RetryAfterMs=' in error_msg:
+                        start = error_msg.index('RetryAfterMs=') + len('RetryAfterMs=')
+                        end = error_msg.index(',', start)
+                        retry_after_ms = int(error_msg[start:end])
+                    
+                    retry_after_s = retry_after_ms / 1000.0
+                    
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"⚠️  Cosmos DB 429: esperando {retry_after_s:.2f}s "
+                            f"(intento {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(retry_after_s)
+                    else:
+                        logger.error(
+                            f"❌ Max reintentos alcanzado tras {max_retries} intentos"
+                        )
+                        return None  # Degradación graciosa
+                else:
+                    raise  # Otro tipo de OperationFailure
+            except Exception as e:
+                logger.error(f"❌ Error inesperado: {e}")
+                return None
+        
+        return None
     
     def run(
         self,
@@ -436,20 +483,30 @@ class IngestionEngine:
             logger.debug(f"  Procesando lote {batch_num}/{total_batches} ({len(batch)} repos)...")
             
             try:
-                # Bulk upsert
-                result = self.repo_db.bulk_upsert(
-                    documents=batch,
-                    unique_field="id"
+                # Bulk upsert con retry automático para throttling de Cosmos DB
+                result = self._retry_on_cosmos_throttle(
+                    lambda: self.repo_db.bulk_upsert(
+                        documents=batch,
+                        unique_field="id"
+                    )
                 )
                 
-                total_inserted += result["upserted_count"]
-                total_updated += result["modified_count"]
-                
-                logger.debug(
-                    f"    ✓ Lote {batch_num}: "
-                    f"{result['upserted_count']} nuevos, "
-                    f"{result['modified_count']} actualizados"
-                )
+                if result:
+                    total_inserted += result["upserted_count"]
+                    total_updated += result["modified_count"]
+                    
+                    logger.debug(
+                        f"    ✓ Lote {batch_num}: "
+                        f"{result['upserted_count']} nuevos, "
+                        f"{result['modified_count']} actualizados"
+                    )
+                    
+                    # Sleep para evitar sobrecarga en Cosmos DB
+                    time.sleep(0.5)
+                else:
+                    logger.warning(f"⚠️  Lote {batch_num} falló tras reintentos. Intentando uno por uno...")
+                    # Fallback a inserción individual
+                    raise Exception("Bulk upsert failed after retries")
                 
             except Exception as e:
                 logger.warning(f"⚠️  Error en lote {batch_num}: {e}. Reintentando uno por uno...")
@@ -460,17 +517,27 @@ class IngestionEngine:
                 
                 for repo in batch:
                     try:
-                        upsert_result = self.repo_db.upsert_one(
-                            query={"id": repo.id},
-                            document=repo.dict(),
-                            update_timestamp=True
+                        upsert_result = self._retry_on_cosmos_throttle(
+                            lambda: self.repo_db.upsert_one(
+                                query={"id": repo.id},
+                                document=repo.dict(),
+                                update_timestamp=True
+                            )
                         )
-                        if upsert_result["operation"] == "insert":
-                            total_inserted += 1
-                            successful_in_batch += 1
+                        
+                        if upsert_result:
+                            if upsert_result["operation"] == "insert":
+                                total_inserted += 1
+                                successful_in_batch += 1
+                            else:
+                                total_updated += 1
+                                successful_in_batch += 1
+                            
+                            # Sleep entre repos individuales
+                            time.sleep(0.2)
                         else:
-                            total_updated += 1
-                            successful_in_batch += 1
+                            failed_in_batch += 1
+                            logger.warning(f"⚠️  No se pudo persistir {repo.full_name if hasattr(repo, 'full_name') else repo.id}: falló tras reintentos")
                     except Exception as e2:
                         failed_in_batch += 1
                         logger.warning(f"⚠️  No se pudo persistir {repo.full_name if hasattr(repo, 'full_name') else repo.id}: {e2}")

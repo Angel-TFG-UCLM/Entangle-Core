@@ -1,9 +1,9 @@
 """
-Motor de Ingesta de Organizaciones de GitHub - v1.0
-Estrategia Bottom-Up: descubre organizaciones desde usuarios existentes.
+Motor de Ingesta de Organizaciones de GitHub - v2.0
+Estrategia Repository-First: descubre organizaciones desde repositorios quantum.
 """
 import time
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pymongo.errors import OperationFailure
 
@@ -15,8 +15,9 @@ from ..models.organization import Organization
 
 class OrganizationIngestionEngine:
     """
-    Motor para ingerir organizaciones de GitHub usando estrategia Bottom-Up.
-    Descubre organizaciones desde los usuarios ya ingestados.
+    Motor para ingerir organizaciones de GitHub usando estrategia Repository-First.
+    Descubre organizaciones desde los repositorios quantum ya ingestados.
+    Garantiza que solo se ingestán organizaciones con repos quantum confirmados.
     """
     
     # Query GraphQL ligera para datos básicos de organización
@@ -86,7 +87,7 @@ class OrganizationIngestionEngine:
             "end_time": None
         }
         
-        logger.info(f"OrganizationIngestionEngine v1.0 inicializado (batch_size={batch_size})")
+        logger.info(f"OrganizationIngestionEngine v2.0 inicializado (batch_size={batch_size})")
     
     def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
         """
@@ -145,64 +146,72 @@ class OrganizationIngestionEngine:
             Estadísticas del proceso
         """
         logger.info("=" * 80)
-        logger.info("INICIANDO INGESTA DE ORGANIZACIONES v1.0")
+        logger.info("INICIANDO INGESTA DE ORGANIZACIONES v2.0 (Repository-First)")
         logger.info("=" * 80)
         
         self.stats["start_time"] = datetime.now()
         
-        # Paso 1: Descubrir organizaciones desde usuarios
-        org_logins = self._discover_organizations()
+        # Paso 1: Descubrir organizaciones desde repositorios quantum
+        orgs_data = self._discover_organizations()
         
-        if not org_logins:
+        if not orgs_data:
             logger.warning("⚠️  No se encontraron organizaciones para procesar")
             return self._finalize_stats()
         
-        self.stats["total_discovered"] = len(org_logins)
-        logger.info(f"📊 Total organizaciones descubiertas: {len(org_logins)}")
+        self.stats["total_discovered"] = len(orgs_data)
+        logger.info(f"📊 Total organizaciones descubiertas: {len(orgs_data)}")
         
         # Paso 2: Procesar en lotes
-        self._process_batch(org_logins, force_update)
+        self._process_batch(orgs_data, force_update)
         
         return self._finalize_stats()
     
-    def _discover_organizations(self) -> Set[str]:
+    def _discover_organizations(self) -> Dict[str, Dict[str, Any]]:
         """
-        Descubre organizaciones únicas desde los usuarios en MongoDB.
+        Descubre organizaciones únicas desde los repositorios quantum en MongoDB.
+        Solo incluye organizaciones (owner.type == 'Organization').
         
         Returns:
-            Set de logins únicos de organizaciones
+            Dict con {org_login: {'repos': [{id, name}], 'repo_count': int}}
         """
-        logger.info("\nDescubriendo organizaciones desde usuarios...")
+        logger.info("\nDescubriendo organizaciones desde repositorios quantum...")
         
         try:
-            # Agregación para obtener todos los logins únicos de organizaciones
+            # Obtener repositorios collection
+            repos_collection = self.users_repository.collection.database["repositories"]
+            
+            # Agregación para obtener organizaciones únicas con sus repos
             pipeline = [
-                # Filtrar usuarios que tienen organizaciones
-                {"$match": {"organizations": {"$exists": True, "$ne": []}}},
+                # Filtrar solo repos de organizaciones (no usuarios individuales)
+                {"$match": {"owner.type": "Organization"}},
                 
-                # Desenrollar el array de organizaciones
-                {"$unwind": "$organizations"},
-                
-                # Agrupar por login para obtener valores únicos
+                # Agrupar por login de la organización
                 {"$group": {
-                    "_id": "$organizations.login",
-                    "count": {"$sum": 1}  # Cuenta cuántos usuarios pertenecen a esta org
+                    "_id": "$owner.login",
+                    "repos": {
+                        "$push": {
+                            "id": "$id",
+                            "name": {"$concat": ["$owner.login", "/", "$name"]}
+                        }
+                    },
+                    "repo_count": {"$sum": 1}
                 }},
                 
-                # Proyectar solo el login
+                # Proyectar campos
                 {"$project": {
                     "login": "$_id",
-                    "member_count": "$count",
+                    "repos": 1,
+                    "repo_count": 1,
                     "_id": 0
                 }},
                 
-                # Ordenar por número de miembros (descendente)
-                {"$sort": {"member_count": -1}}
+                # Ordenar por número de repos (descendente)
+                {"$sort": {"repo_count": -1}}
             ]
             
             # Ejecutar con retry automático para Cosmos DB throttling
             results = self._retry_on_cosmos_throttle(
-                lambda: list(self.users_repository.collection.aggregate(pipeline))
+                lambda: list(repos_collection.aggregate(pipeline))
             )
             
             # Sleep después de lectura
@@ -210,32 +219,41 @@ class OrganizationIngestionEngine:
             
             if results is None:
                 logger.error("❌ No se pudo descubrir organizaciones tras reintentos")
-                return set()
+                return {}
             
-            logger.info(f"✅ Encontradas {len(results)} organizaciones únicas")
+            logger.info(f"✅ Encontradas {len(results)} organizaciones con repos quantum")
             
             # Mostrar top 10
             if results:
-                logger.info("\n📊 Top 10 organizaciones por número de miembros:")
+                logger.info("\n📊 Top 10 organizaciones por número de repos quantum:")
                 for i, org in enumerate(results[:10], 1):
-                    logger.info(f"   {i}. {org['login']} ({org['member_count']} miembros)")
+                    logger.info(f"   {i}. {org['login']} ({org['repo_count']} repos quantum)")
             
-            # Retornar solo los logins
-            return {org["login"] for org in results if org.get("login")}
+            # Convertir a dict para acceso rápido
+            orgs_dict = {}
+            for org in results:
+                login = org.get("login")
+                if login:
+                    orgs_dict[login] = {
+                        "repos": org.get("repos", []),
+                        "repo_count": org.get("repo_count", 0)
+                    }
+            
+            return orgs_dict
             
         except Exception as e:
             logger.error(f"❌ Error descubriendo organizaciones: {e}")
-            return set()
+            return {}
     
-    def _process_batch(self, org_logins: Set[str], force_update: bool) -> None:
+    def _process_batch(self, orgs_data: Dict[str, Dict[str, Any]], force_update: bool) -> None:
         """
         Procesa las organizaciones en lotes.
         
         Args:
-            org_logins: Set de logins de organizaciones
+            orgs_data: Dict con {login: {'repos': [...], 'repo_count': int}}
             force_update: Si True, actualiza organizaciones existentes
         """
-        org_list = list(org_logins)
+        org_list = list(orgs_data.items())
         total_orgs = len(org_list)
         
         logger.info(f"\n📦 Procesando {total_orgs} organizaciones en lotes de {self.batch_size}...")
@@ -247,21 +265,23 @@ class OrganizationIngestionEngine:
             
             logger.info(f"\n📦 Lote {batch_num}/{total_batches} ({len(batch)} organizaciones)")
             
-            for login in batch:
-                self._fetch_and_save_organization(login, force_update)
+            for login, data in batch:
+                # Pasar repos directamente (ya los tenemos)
+                self._fetch_and_save_organization(login, force_update, data['repos'])
                 
                 # Sleep para respetar Rate Limit
                 time.sleep(0.5)
             
             logger.info(f"✅ Lote {batch_num}/{total_batches} completado")
     
-    def _fetch_and_save_organization(self, login: str, force_update: bool = False) -> bool:
+    def _fetch_and_save_organization(self, login: str, force_update: bool = False, discovered_repos: List[Dict[str, str]] = None) -> bool:
         """
         Obtiene y guarda una organización individual.
         
         Args:
             login: Login de la organización
             force_update: Si True, actualiza si ya existe
+            discovered_repos: Lista de repos ya descubiertos [{id, name}]
             
         Returns:
             True si se procesó correctamente, False si hubo error
@@ -293,18 +313,14 @@ class OrganizationIngestionEngine:
             # Crear modelo
             organization = Organization.from_graphql_response(org_data)
             
-            # Calcular relevancia basándose en repos existentes
-            relevance_data = self._calculate_organization_relevance(login)
-            
-            # Actualizar campos de relevancia
+            # Usar repos descubiertos (ya los tenemos, no necesitamos calcularlos)
+            # TODAS las organizaciones encontradas son relevantes por definición
             org_dict = organization.model_dump(by_alias=False, exclude_none=False)
-            org_dict.update(relevance_data)
+            org_dict["is_relevant"] = True
+            org_dict["discovered_from_repos"] = discovered_repos or []
             
             # Log de relevancia
-            if relevance_data["is_relevant"]:
-                logger.debug(f"   ✅ Organización {login} ES RELEVANTE ({len(relevance_data['discovered_from_repos'])} repos quantum)")
-            else:
-                logger.debug(f"   ⚠️  Organización {login} NO es relevante (sin repos quantum ingestados)")
+            logger.debug(f"   ✅ Organización {login} - {len(discovered_repos or [])} repos quantum")
             
             # Guardar en BD con retry para Cosmos DB throttling
             if existing:
@@ -379,65 +395,6 @@ class OrganizationIngestionEngine:
             logger.error(f"   ❌ Error procesando {login}: {e}")
             self.stats["total_errors"] += 1
             return False
-    
-    def _calculate_organization_relevance(self, org_login: str) -> Dict[str, Any]:
-        """
-        Calcula la relevancia de una organización basándose en repos quantum ingestados.
-        
-        Args:
-            org_login: Login de la organización
-            
-        Returns:
-            Dict con is_relevant, discovered_from_repos, discovered_from_repo_names
-        """
-        try:
-            # Buscar repos de esta organización en nuestra BD
-            # Si está en la colección repositories, ya es quantum-related (pasó filtros)
-            repos_collection = self.users_repository.collection.database["repositories"]
-            
-            # Buscar con retry automático para Cosmos DB throttling
-            org_repos = self._retry_on_cosmos_throttle(
-                lambda: list(repos_collection.find({
-                    "owner.login": org_login
-                }))
-            )
-            
-            # Sleep después de lectura
-            time.sleep(0.2)
-            
-            if org_repos is None:
-                logger.warning(f"   ⚠️  No se pudo leer repos de {org_login} tras reintentos")
-                return {
-                    "is_relevant": False,
-                    "discovered_from_repos": []
-                }
-            
-            is_relevant = len(org_repos) > 0
-            
-            # Crear lista unificada con ID y nombre
-            discovered_repos = []
-            for repo in org_repos:
-                repo_id = repo.get("id")
-                repo_name = repo.get("name")
-                owner_login = repo.get("owner", {}).get("login", "")
-                
-                if repo_id and repo_name:
-                    discovered_repos.append({
-                        "id": repo_id,
-                        "name": f"{owner_login}/{repo_name}" if owner_login else repo_name
-                    })
-            
-            return {
-                "is_relevant": is_relevant,
-                "discovered_from_repos": discovered_repos
-            }
-            
-        except Exception as e:
-            logger.error(f"   ❌ Error calculando relevancia de {org_login}: {e}")
-            return {
-                "is_relevant": False,
-                "discovered_from_repos": []
-            }
     
     def _fetch_organization_basic(self, login: str) -> Optional[Dict[str, Any]]:
         """

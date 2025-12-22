@@ -943,3 +943,89 @@ def _run_organization_enrichment(
         background_tasks_status[task_id]["progress"] = f"Error: {str(e)}"
         background_tasks_status[task_id]["error"] = str(e)
         background_tasks_status[task_id]["failed_at"] = datetime.now().isoformat()
+
+
+
+
+@router.post("/pipeline/run-all")
+async def run_full_pipeline(background_tasks: BackgroundTasks):
+    """
+    Ejecuta el pipeline completo de ingesta y enriquecimiento.
+    
+    Ejecuta el script run_full_pipeline.py que corre todas las operaciones en orden:
+    1. Ingesta de Repositorios
+    2. Enriquecimiento de Repositorios
+    3. Ingesta de Usuarios
+    4. Enriquecimiento de Usuarios
+    5. Ingesta de Organizaciones
+    6. Enriquecimiento de Organizaciones
+    
+    Retorna un task_id para consultar el progreso.
+    """
+    import uuid
+    
+    task_id = f"full-pipeline-{uuid.uuid4()}"
+    
+    background_tasks_status[task_id] = {
+        "task_id": task_id,
+        "task_type": "full_pipeline",
+        "status": "running",
+        "progress": "Iniciando pipeline completo...",
+        "started_at": datetime.now().isoformat()
+    }
+    
+    background_tasks.add_task(_run_full_pipeline_script, task_id)
+    
+    return {
+        "task_id": task_id,
+        "status": "started",
+        "message": "Pipeline completo iniciado. Usa GET /tasks para ver el estado."
+    }
+
+
+def _run_full_pipeline_script(task_id: str):
+    """Ejecuta el script run_full_pipeline.py en background."""
+    import subprocess
+    import sys
+    import os
+    
+    try:
+        script_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "scripts",
+            "run_full_pipeline.py"
+        )
+        
+        background_tasks_status[task_id]["progress"] = "Ejecutando pipeline completo..."
+        
+        logger.info(f"Ejecutando script: {script_path}")
+        
+        # Ejecutar el script
+        result = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        )
+        
+        if result.returncode == 0:
+            background_tasks_status[task_id]["status"] = "completed"
+            background_tasks_status[task_id]["progress"] = "Pipeline completado exitosamente"
+            background_tasks_status[task_id]["output"] = result.stdout
+        else:
+            background_tasks_status[task_id]["status"] = "failed"
+            background_tasks_status[task_id]["progress"] = f"Pipeline fallo con codigo {result.returncode}"
+            background_tasks_status[task_id]["error"] = result.stderr
+            background_tasks_status[task_id]["output"] = result.stdout
+        
+        background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
+        background_tasks_status[task_id]["exit_code"] = result.returncode
+        
+        logger.info(f"Pipeline completado - Task ID: {task_id}, Exit Code: {result.returncode}")
+        
+    except Exception as e:
+        logger.error(f"Error ejecutando pipeline {task_id}: {e}")
+        background_tasks_status[task_id]["status"] = "failed"
+        background_tasks_status[task_id]["progress"] = f"Error: {str(e)}"
+        background_tasks_status[task_id]["error"] = str(e)
+        background_tasks_status[task_id]["failed_at"] = datetime.now().isoformat()
