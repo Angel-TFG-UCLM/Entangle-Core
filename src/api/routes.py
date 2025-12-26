@@ -1085,7 +1085,7 @@ def _run_full_pipeline_direct(task_id: str):
                 github_token=github_token,
                 repos_repository=repo_repo,
                 batch_size=10
-            ).enrich_all_repositories(max_repos=None, force_reenrich=False)
+            ).enrich_all_repositories(max_repos=None)
         )
         results.append(result)
         
