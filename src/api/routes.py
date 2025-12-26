@@ -802,8 +802,7 @@ def _run_repository_enrichment(
         background_tasks_status[task_id]["progress"] = "Ejecutando enriquecimiento de repositorios..."
         
         stats = engine.enrich_all_repositories(
-            max_repos=max_repos,
-            force_reenrich=force_reenrich
+            max_repos=max_repos
         )
         
         background_tasks_status[task_id]["status"] = "completed"
