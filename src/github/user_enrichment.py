@@ -290,6 +290,11 @@ class UserEnrichmentEngine:
         """
         login = user.get("login")
         
+        if not login:
+            logger.warning(f"⚠️  Usuario sin campo 'login' encontrado (ID: {user.get('_id')}). Saltando...")
+            self.stats["total_errors"] += 1
+            return False
+        
         try:
             logger.info(f"\nEnriqueciendo usuario: {login}")
             

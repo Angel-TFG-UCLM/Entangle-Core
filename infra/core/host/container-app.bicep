@@ -66,7 +66,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
                 path: '/api/v1/health'
                 port: targetPort
               }
-              initialDelaySeconds: 15
+              initialDelaySeconds: 30
               periodSeconds: 30
             }
           ]

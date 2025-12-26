@@ -8,6 +8,10 @@ from pymongo import MongoClient
 from pymongo.database import Database as PyMongoDatabase
 from pymongo.collection import Collection
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+import warnings
+
+# Suppress pymongo warning about CosmosDB cluster
+warnings.filterwarnings("ignore", message="You appear to be connected to a CosmosDB cluster")
 
 from .config import config
 from .logger import logger

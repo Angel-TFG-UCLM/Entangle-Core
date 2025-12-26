@@ -419,6 +419,8 @@ class Repository(BaseModel):
         readme_object = data.get("object")
         if readme_object and isinstance(readme_object, dict):
             readme_text = readme_object.get("text")
+            if readme_text and len(readme_text) > 2000:
+                 readme_text = readme_text[:2000] + "... [TRUNCATED]"
             has_readme = bool(readme_text)
         
         # ==================== SEGURIDAD (SOLO CONTADOR) ====================

@@ -111,6 +111,29 @@ class IngestionEngine:
         
         logger.info(f"Motor de ingesta inicializado (incremental={'SÍ' if incremental else 'NO'}, batch_size={batch_size})")
     
+    def _sanitize_repo_data(self, repo_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Crea una copia saneada del repositorio para logs/errores.
+        Trunca campos largos como el README para evitar logs excesivos.
+        """
+        try:
+            # Hacer una copia superficial es suficiente para el nivel superior
+            # pero necesitamos profundizar para 'object.text'
+            sanitized = repo_data.copy()
+            
+            # Truncar README si existe
+            if "object" in sanitized and isinstance(sanitized["object"], dict):
+                obj = sanitized["object"].copy()
+                if "text" in obj and isinstance(obj["text"], str):
+                    text = obj["text"]
+                    if len(text) > 500:
+                        obj["text"] = text[:500] + "... [TRUNCATED FOR LOGS]"
+                sanitized["object"] = obj
+            
+            return sanitized
+        except Exception:
+            return {"error": "Could not sanitize data"}
+    
     def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
         """
         Ejecuta una operación con retry automático cuando Cosmos DB retorna 429.
@@ -433,19 +456,22 @@ class IngestionEngine:
                     logger.debug(f"  Validados: {i}/{len(repositories_raw)}")
                     
             except ValidationError as e:
+                sanitized_data = self._sanitize_repo_data(repo_raw)
                 error_info = {
                     "repository": repo_raw.get("nameWithOwner", "unknown"),
                     "errors": e.errors(),
-                    "raw_data": repo_raw
+                    "raw_data": sanitized_data
                 }
                 errors.append(error_info)
-                logger.warning(f"⚠️  Error validando {repo_raw.get('nameWithOwner')}: {e}")
+                # No loguear la excepción completa si puede contener datos masivos
+                logger.warning(f"⚠️  Error validando {repo_raw.get('nameWithOwner')}: {str(e)[:500]}...")
                 
             except Exception as e:
+                sanitized_data = self._sanitize_repo_data(repo_raw)
                 error_info = {
                     "repository": repo_raw.get("nameWithOwner", "unknown"),
                     "error": str(e),
-                    "raw_data": repo_raw
+                    "raw_data": sanitized_data
                 }
                 errors.append(error_info)
                 logger.error(f"❌ Error inesperado validando {repo_raw.get('nameWithOwner')}: {e}")
