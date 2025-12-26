@@ -244,12 +244,13 @@ class EnrichmentEngine:
         
         return None
     
-    def enrich_all_repositories(self, max_repos: Optional[int] = None) -> Dict[str, Any]:
+    def enrich_all_repositories(self, max_repos: Optional[int] = None, force_reenrich: bool = False) -> Dict[str, Any]:
         """
         Enriquece todos los repositorios en MongoDB.
         
         Args:
             max_repos: Límite opcional de repositorios a procesar
+            force_reenrich: Si True, re-enriquece incluso repositorios ya enriquecidos
             
         Returns:
             Diccionario con estadísticas del proceso
@@ -266,7 +267,21 @@ class EnrichmentEngine:
         
         # Obtener repositorios de MongoDB
         logger.info("\n📂 Consultando repositorios en MongoDB...")
-        query = {}
+        
+        # Si force_reenrich, procesar todos; si no, solo los no enriquecidos o incompletos
+        if force_reenrich:
+            query = {}
+            logger.info("📌 Modo force_reenrich: procesando todos los repositorios")
+        else:
+            # Solo repositorios que no estén completamente enriquecidos
+            query = {
+                "$or": [
+                    {"enrichment_status": {"$exists": False}},
+                    {"enrichment_status.is_complete": False},
+                    {"enrichment_status.is_complete": {"$exists": False}}
+                ]
+            }
+        
         repos = list(self.repos_repository.collection.find(query).limit(max_repos or 0))
         total_repos = len(repos)
         
