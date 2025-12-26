@@ -67,6 +67,13 @@ def main():
         else:
             print("✅ Enriqueciendo todos los repositorios\n")
         
+        # Leer force_reenrich desde variable de entorno
+        force_reenrich_env = os.getenv('FORCE_REENRICHMENT', 'false').lower()
+        force_reenrich = force_reenrich_env == 'true'
+        
+        if force_reenrich:
+            logger.info("📌 Modo force_reenrich: procesando todos los repositorios")
+        
         print("=" * 80)
         print("  🔄 PROCESANDO...")
         print("=" * 80 + "\n")
@@ -81,7 +88,10 @@ def main():
         )
         
         # Ejecutar enriquecimiento
-        stats = engine.enrich_all_repositories(max_repos=max_repos)
+        stats = engine.enrich_all_repositories(
+            max_repos=max_repos,
+            force_reenrich=force_reenrich
+        )
         
         # Mostrar resumen final
         print("\n" + "=" * 80)
