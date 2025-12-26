@@ -37,7 +37,7 @@ def main():
         logger.error("❌ GITHUB_TOKEN no configurado en .env")
         return 1
     
-    # Obtener parámetros
+    # Obtener parámetros desde variables de entorno o usar defaults
     logger.info("\nConfiguración:")
     logger.info("  • Motor: Super-query GraphQL (1 query por organización)")
     logger.info("  • Campos a enriquecer:")
@@ -50,23 +50,31 @@ def main():
     logger.info("    - Try-except por organización (continúa en fallos)")
     logger.info("    - Batch size optimizado para Azure Free Tier")
     
-    # Límite de organizaciones (opcional)
-    max_orgs_input = input("\n¿Límite de organizaciones? (Enter para todas): ").strip()
-    max_orgs = int(max_orgs_input) if max_orgs_input else None
+    # Leer parámetros desde variables de entorno
+    max_orgs_env = os.getenv('ENRICHMENT_LIMIT')
+    max_orgs = int(max_orgs_env) if max_orgs_env else None
     
-    # Tamaño de lote
-    batch_size_input = input("Tamaño de lote (default=5 para Azure): ").strip()
-    batch_size = int(batch_size_input) if batch_size_input else 5
+    batch_size_env = os.getenv('BATCH_SIZE')
+    batch_size = int(batch_size_env) if batch_size_env else 5
     
-    # Modo force_reenrich
-    force_input = input("¿Forzar re-enriquecimiento? (s/n, default=n): ").strip().lower()
-    force_reenrich = force_input in ['s', 'si', 'sí', 'y', 'yes']
+    force_reenrich_env = os.getenv('FORCE_REENRICHMENT', 'false').lower()
+    force_reenrich = force_reenrich_env == 'true'
+    
+    auto_confirm = os.getenv('AUTO_CONFIRM', 'false').lower() == 'true'
+    
+    logger.info(f"\nParámetros:")
+    logger.info(f"  • Límite: {max_orgs or 'Todas'}")
+    logger.info(f"  • Batch size: {batch_size}")
+    logger.info(f"  • Force reenrich: {force_reenrich}")
     
     # Confirmar
-    response = input("\n¿Desea continuar? (s/n): ")
-    if response.lower() not in ['s', 'si', 'sí', 'y', 'yes']:
-        logger.info("❌ Operación cancelada por el usuario")
-        return 0
+    if auto_confirm:
+        logger.info("\n✓ Auto-confirmación activada, continuando...")
+    else:
+        response = input("\n¿Desea continuar? (s/n): ")
+        if response.lower() not in ['s', 'si', 'sí', 'y', 'yes']:
+            logger.info("❌ Operación cancelada por el usuario")
+            return 0
     
     try:
         # Crear repositorios

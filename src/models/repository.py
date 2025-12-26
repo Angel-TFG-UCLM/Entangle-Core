@@ -16,9 +16,35 @@ Elimina:
   ❌ Flags booleanos irrelevantes (is_template, has_projects, has_wiki, has_pages, is_disabled)
   ❌ Bloques de seguridad detallados (vulnerabilities, security_policy)
   ⚠️ Aplanar languages a estructura simple
+Modelo optimizado de datos para Repository (Repositorio de GitHub).
+Pydantic v2 - Limpio, estructurado y eficiente.
+
+Conserva:
+  ✅ Métricas numéricas (stars, forks, watchers, etc.)
+  ✅ Métricas de actividad (commits, issues, PRs, releases)
+  ✅ Fechas clave (created, updated, pushed, last_commit)
+  ✅ Datos cualitativos (topics, license, description, primary_language)
+  ✅ Colaboradores (modelo simplificado)
+  ✅ README (opcional/diferido)
+
+Elimina:
+  ❌ URLs redundantes (solo html_url)
+  ❌ IDs internos sin valor (node_id, organization_id fuera de owner)
+  ❌ Flags booleanos irrelevantes (is_template, has_projects, has_wiki, has_pages, is_disabled)
+  ❌ Bloques de seguridad detallados (vulnerabilities, security_policy)
+  ⚠️ Aplanar languages a estructura simple
 """
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+
+
+# ==================== SUB-MODELOS SIMPLIFICADOS ====================
+
+class LanguageInfo(BaseModel):
+    """Lenguaje de programación - Modelo aplanado."""
+    model_config = ConfigDict(populate_by_name=True)
+    
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 
@@ -36,10 +62,16 @@ class LicenseInfo(BaseModel):
     """Información de licencia de software."""
     model_config = ConfigDict(populate_by_name=True)
     
-    key: str  # e.g., "apache-2.0"
-    name: str  # e.g., "Apache License 2.0"
+    key: Optional[str] = None  # e.g., "apache-2.0" (puede ser None)
+    name: Optional[str] = None  # e.g., "Apache License 2.0" (puede ser None)
     spdx_id: Optional[str] = Field(None, alias="spdxId")
     url: Optional[str] = None
+
+
+class OwnerInfo(BaseModel):
+    """Propietario del repositorio (User u Organization)."""
+    model_config = ConfigDict(populate_by_name=True)
+    
 
 
 class OwnerInfo(BaseModel):
@@ -49,15 +81,25 @@ class OwnerInfo(BaseModel):
     id: str
     login: str
     url: str  # Solo URL principal de GitHub
+    url: str  # Solo URL principal de GitHub
     avatar_url: Optional[str] = Field(None, alias="avatarUrl")
     type: Optional[str] = Field(None, alias="__typename")  # "User" o "Organization"
+
 
 
 class CollaboratorInfo(BaseModel):
     """Colaborador del repositorio - Modelo simplificado."""
     model_config = ConfigDict(populate_by_name=True)
     
+class CollaboratorInfo(BaseModel):
+    """Colaborador del repositorio - Modelo simplificado."""
+    model_config = ConfigDict(populate_by_name=True)
+    
     login: str
+    id: str
+    contributions: int = 0
+    has_commits: bool = False
+    is_mentionable: bool = True
     id: str
     contributions: int = 0
     has_commits: bool = False
@@ -68,12 +110,21 @@ class CommitInfo(BaseModel):
     """Commit reciente - Información mínima."""
     model_config = ConfigDict(populate_by_name=True)
     
+class CommitInfo(BaseModel):
+    """Commit reciente - Información mínima."""
+    model_config = ConfigDict(populate_by_name=True)
+    
     oid: str  # SHA del commit
     message: str
     committed_date: Optional[datetime] = Field(None, alias="committedDate")
     author_login: Optional[str] = Field(None, alias="authorLogin")
+    author_login: Optional[str] = Field(None, alias="authorLogin")
 
 
+class IssueInfo(BaseModel):
+    """Issue - Información esencial."""
+    model_config = ConfigDict(populate_by_name=True)
+    
 class IssueInfo(BaseModel):
     """Issue - Información esencial."""
     model_config = ConfigDict(populate_by_name=True)
@@ -86,6 +137,11 @@ class IssueInfo(BaseModel):
     closed_at: Optional[datetime] = Field(None, alias="closedAt")
 
 
+
+class PullRequestInfo(BaseModel):
+    """Pull Request - Información esencial."""
+    model_config = ConfigDict(populate_by_name=True)
+    
 class PullRequestInfo(BaseModel):
     """Pull Request - Información esencial."""
     model_config = ConfigDict(populate_by_name=True)
@@ -96,9 +152,15 @@ class PullRequestInfo(BaseModel):
     state: str  # OPEN, CLOSED, MERGED
     created_at: Optional[datetime] = Field(None, alias="createdAt")
     closed_at: Optional[datetime] = Field(None, alias="closedAt")
+    closed_at: Optional[datetime] = Field(None, alias="closedAt")
     merged_at: Optional[datetime] = Field(None, alias="mergedAt")
 
 
+
+class ReleaseInfo(BaseModel):
+    """Release - Información clave."""
+    model_config = ConfigDict(populate_by_name=True)
+    
 class ReleaseInfo(BaseModel):
     """Release - Información clave."""
     model_config = ConfigDict(populate_by_name=True)
@@ -112,6 +174,10 @@ class ReleaseInfo(BaseModel):
 
 
 # ==================== MODELO PRINCIPAL ====================
+    is_draft: bool = Field(False, alias="isDraft")
+
+
+# ==================== MODELO PRINCIPAL ====================
 
 class Repository(BaseModel):
     """
@@ -119,27 +185,41 @@ class Repository(BaseModel):
     
     Estructura limpia y eficiente para análisis estadístico.
     Elimina redundancias y conserva datos esenciales.
+    Modelo optimizado de repositorio de GitHub.
+    
+    Estructura limpia y eficiente para análisis estadístico.
+    Elimina redundancias y conserva datos esenciales.
     """
+    model_config = ConfigDict(populate_by_name=True)
+    
     model_config = ConfigDict(populate_by_name=True)
     
     # ==================== IDENTIFICACIÓN ====================
     id: str  # ID único de GitHub (GraphQL)
+    id: str  # ID único de GitHub (GraphQL)
     name: str
     name_with_owner: str = Field(alias="nameWithOwner")
     full_name: Optional[str] = Field(None, alias="fullName")  # Compatibilidad REST API
+    full_name: Optional[str] = Field(None, alias="fullName")  # Compatibilidad REST API
     
     # ==================== DESCRIPCIÓN ====================
+    # ==================== DESCRIPCIÓN ====================
     description: Optional[str] = None
+    url: str  # ✅ SOLO html_url (GitHub web)
     url: str  # ✅ SOLO html_url (GitHub web)
     homepage_url: Optional[str] = Field(None, alias="homepageUrl")
     
     # ==================== PROPIETARIO ====================
     owner: Optional[OwnerInfo] = None
+    owner: Optional[OwnerInfo] = None
     
+    # ==================== FECHAS CLAVE ====================
     # ==================== FECHAS CLAVE ====================
     created_at: Optional[datetime] = Field(None, alias="createdAt")
     updated_at: Optional[datetime] = Field(None, alias="updatedAt")
     pushed_at: Optional[datetime] = Field(None, alias="pushedAt")
+    last_commit_date: Optional[datetime] = Field(None, alias="lastCommitDate")
+    ingested_at: datetime = Field(default_factory=datetime.utcnow)
     last_commit_date: Optional[datetime] = Field(None, alias="lastCommitDate")
     ingested_at: datetime = Field(default_factory=datetime.utcnow)
     
@@ -148,8 +228,15 @@ class Repository(BaseModel):
     
     # ==================== LENGUAJES (APLANADO) ====================
     languages: List[LanguageInfo] = Field(default_factory=list)
+    # ==================== LENGUAJE PRINCIPAL ====================
+    primary_language: Optional[str] = Field(None, alias="primaryLanguage")  # Solo nombre
+    
+    # ==================== LENGUAJES (APLANADO) ====================
+    languages: List[LanguageInfo] = Field(default_factory=list)
     languages_count: int = Field(0, alias="languagesCount")
     
+    # ==================== TOPICS ====================
+    repository_topics: List[str] = Field(default_factory=list, alias="repositoryTopics")  # Solo nombres
     # ==================== TOPICS ====================
     repository_topics: List[str] = Field(default_factory=list, alias="repositoryTopics")  # Solo nombres
     topics_count: int = Field(0, alias="topicsCount")
@@ -160,8 +247,12 @@ class Repository(BaseModel):
     watchers_count: int = Field(0, alias="watchersCount")
     subscribers_count: int = Field(0, alias="subscribersCount")
     network_count: int = Field(0, alias="networkCount")  # Total de forks en red
+    network_count: int = Field(0, alias="networkCount")  # Total de forks en red
     
     # ==================== MÉTRICAS DE CONTENIDO ====================
+    disk_usage: int = Field(0, alias="diskUsage")  # KB
+    
+    # ==================== COMMITS ====================
     disk_usage: int = Field(0, alias="diskUsage")  # KB
     
     # ==================== COMMITS ====================
@@ -169,11 +260,13 @@ class Repository(BaseModel):
     branches_count: int = Field(0, alias="branchesCount")
     tags_count: int = Field(0, alias="tagsCount")
     recent_commits: List[CommitInfo] = Field(default_factory=list, alias="recentCommits")
+    recent_commits: List[CommitInfo] = Field(default_factory=list, alias="recentCommits")
     
     # ==================== ISSUES ====================
     issues_count: int = Field(0, alias="issuesCount")
     open_issues_count: int = Field(0, alias="openIssuesCount")
     closed_issues_count: int = Field(0, alias="closedIssuesCount")
+    recent_issues: List[IssueInfo] = Field(default_factory=list, alias="recentIssues")
     recent_issues: List[IssueInfo] = Field(default_factory=list, alias="recentIssues")
     
     # ==================== PULL REQUESTS ====================
@@ -182,7 +275,12 @@ class Repository(BaseModel):
     closed_pull_requests_count: int = Field(0, alias="closedPullRequestsCount")
     merged_pull_requests_count: int = Field(0, alias="mergedPullRequestsCount")
     recent_pull_requests: List[PullRequestInfo] = Field(default_factory=list, alias="recentPullRequests")
+    recent_pull_requests: List[PullRequestInfo] = Field(default_factory=list, alias="recentPullRequests")
     
+    # ==================== RELEASES ====================
+    releases_count: int = Field(0, alias="releasesCount")
+    latest_release: Optional[ReleaseInfo] = Field(None, alias="latestRelease")
+    releases: List[ReleaseInfo] = Field(default_factory=list)
     # ==================== RELEASES ====================
     releases_count: int = Field(0, alias="releasesCount")
     latest_release: Optional[ReleaseInfo] = Field(None, alias="latestRelease")
@@ -193,10 +291,16 @@ class Repository(BaseModel):
     collaborators_count: int = Field(0, alias="collaboratorsCount")
     
     # ==================== ESTADOS RELEVANTES ====================
+    # ==================== COLABORADORES (SIMPLIFICADO) ====================
+    collaborators: List[CollaboratorInfo] = Field(default_factory=list)
+    collaborators_count: int = Field(0, alias="collaboratorsCount")
+    
+    # ==================== ESTADOS RELEVANTES ====================
     is_fork: bool = Field(False, alias="isFork")
     is_archived: bool = Field(False, alias="isArchived")
     
     # ==================== LICENCIA ====================
+    license_info: Optional[LicenseInfo] = Field(None, alias="licenseInfo")
     license_info: Optional[LicenseInfo] = Field(None, alias="licenseInfo")
     
     # ==================== BRANCH PRINCIPAL ====================
@@ -205,15 +309,20 @@ class Repository(BaseModel):
     # ==================== PARENT (si es fork) ====================
     parent_id: Optional[str] = Field(None, alias="parentId")
     parent_name_with_owner: Optional[str] = Field(None, alias="parentNameWithOwner")
+    # ==================== PARENT (si es fork) ====================
+    parent_id: Optional[str] = Field(None, alias="parentId")
+    parent_name_with_owner: Optional[str] = Field(None, alias="parentNameWithOwner")
     
     # ==================== README (OPCIONAL/DIFERIDO) ====================
-    readme_text: Optional[str] = Field(None, alias="readmeText", exclude=True)  # NO se guarda en BD (muy pesado)
-    readme_length: int = Field(0, alias="readmeLength")  # Solo guardamos la longitud
+    readme_text: Optional[str] = Field(None, alias="readmeText")  # Puede ser pesado
     has_readme: bool = Field(False, alias="hasReadme")
     
     # ==================== SEGURIDAD (SOLO CONTADOR) ====================
+    # ==================== SEGURIDAD (SOLO CONTADOR) ====================
     vulnerability_alerts_count: int = Field(0, alias="vulnerabilityAlertsCount")
     
+    # ==================== DEPENDENCIAS (SOLO MANIFIESTOS) ====================
+    dependency_graph_manifests: List[Dict[str, Any]] = Field(default_factory=list, alias="dependencyGraphManifests")
     # ==================== DEPENDENCIAS (SOLO MANIFIESTOS) ====================
     dependency_graph_manifests: List[Dict[str, Any]] = Field(default_factory=list, alias="dependencyGraphManifests")
     
@@ -221,10 +330,17 @@ class Repository(BaseModel):
     code_of_conduct: Optional[Dict[str, str]] = Field(None, alias="codeOfConduct")  # Simplificado
     funding_links: List[Dict[str, str]] = Field(default_factory=list, alias="fundingLinks")
     custom_properties: Dict[str, Any] = Field(default_factory=dict, alias="customProperties")
+    code_of_conduct: Optional[Dict[str, str]] = Field(None, alias="codeOfConduct")  # Simplificado
+    funding_links: List[Dict[str, str]] = Field(default_factory=list, alias="fundingLinks")
+    custom_properties: Dict[str, Any] = Field(default_factory=dict, alias="customProperties")
     
     # ==================== ENRIQUECIMIENTO ====================
     enrichment_status: Dict[str, Any] = Field(default_factory=dict, alias="enrichmentStatus")
+    # ==================== ENRIQUECIMIENTO ====================
+    enrichment_status: Dict[str, Any] = Field(default_factory=dict, alias="enrichmentStatus")
     
+    @field_validator('ingested_at', mode='before')
+    @classmethod
     @field_validator('ingested_at', mode='before')
     @classmethod
     def set_ingested_at(cls, v):
@@ -238,12 +354,22 @@ class Repository(BaseModel):
         if isinstance(v, dict):
             return v.get('name')
         return v
+    @field_validator('primary_language', mode='before')
+    @classmethod
+    def extract_primary_language_name(cls, v):
+        """Extrae solo el nombre del lenguaje principal."""
+        if isinstance(v, dict):
+            return v.get('name')
+        return v
     
     def to_mongo_dict(self) -> dict:
         """
         Convierte a diccionario para MongoDB.
         Usa _id en lugar de id para el índice primario.
+        Convierte a diccionario para MongoDB.
+        Usa _id en lugar de id para el índice primario.
         """
+        data = self.model_dump(by_alias=True, exclude_none=True)
         data = self.model_dump(by_alias=True, exclude_none=True)
         if 'id' in data:
             data['_id'] = data.pop('id')
@@ -254,13 +380,18 @@ class Repository(BaseModel):
         """
         Crea instancia desde respuesta GraphQL optimizada.
         Aplana estructuras anidadas y elimina redundancias.
+        Crea instancia desde respuesta GraphQL optimizada.
+        Aplana estructuras anidadas y elimina redundancias.
         
         Args:
+            data: Respuesta GraphQL del repositorio
             data: Respuesta GraphQL del repositorio
             
         Returns:
             Repository: Instancia optimizada
+            Repository: Instancia optimizada
         """
+        # ==================== OWNER ====================
         # ==================== OWNER ====================
         owner_data = data.get("owner")
         owner = None
@@ -272,10 +403,27 @@ class Repository(BaseModel):
                 avatarUrl=owner_data.get("avatarUrl"),
                 **{"__typename": owner_data.get("__typename")}
             )
+        owner = None
+        if owner_data:
+            owner = OwnerInfo(
+                id=owner_data.get("id", ""),
+                login=owner_data.get("login", ""),
+                url=owner_data.get("url", ""),
+                avatarUrl=owner_data.get("avatarUrl"),
+                **{"__typename": owner_data.get("__typename")}
+            )
         
+        # ==================== LENGUAJES (APLANADO) ====================
         # ==================== LENGUAJES (APLANADO) ====================
         languages_data = data.get("languages", {})
         languages_edges = languages_data.get("edges", [])
+        languages = []
+        for edge in languages_edges:
+            node = edge.get("node", {})
+            languages.append(LanguageInfo(
+                name=node.get("name", ""),
+                size=edge.get("size", 0)
+            ))
         languages = []
         for edge in languages_edges:
             node = edge.get("node", {})
@@ -290,11 +438,18 @@ class Repository(BaseModel):
         primary_language = primary_language_data.get("name") if primary_language_data else None
         
         # ==================== TOPICS (SOLO NOMBRES) ====================
+        # Lenguaje principal (solo nombre)
+        primary_language_data = data.get("primaryLanguage")
+        primary_language = primary_language_data.get("name") if primary_language_data else None
+        
+        # ==================== TOPICS (SOLO NOMBRES) ====================
         topics_data = data.get("repositoryTopics", {})
         topics_nodes = topics_data.get("nodes", [])
         repository_topics = [node.get("topic", {}).get("name", "") for node in topics_nodes if node.get("topic")]
+        repository_topics = [node.get("topic", {}).get("name", "") for node in topics_nodes if node.get("topic")]
         topics_count = topics_data.get("totalCount", 0)
         
+        # ==================== COLABORADORES (SIMPLIFICADO) ====================
         # ==================== COLABORADORES (SIMPLIFICADO) ====================
         collaborators_data = data.get("collaborators", {})
         collaborators_nodes = collaborators_data.get("nodes", [])
@@ -307,13 +462,25 @@ class Repository(BaseModel):
                 has_commits=collab.get("hasCommits", False),
                 is_mentionable=collab.get("isMentionable", True)
             ))
+        collaborators = []
+        for collab in collaborators_nodes:
+            collaborators.append(CollaboratorInfo(
+                login=collab.get("login", ""),
+                id=collab.get("id", ""),
+                contributions=collab.get("contributions", 0),
+                has_commits=collab.get("hasCommits", False),
+                is_mentionable=collab.get("isMentionable", True)
+            ))
         collaborators_count = collaborators_data.get("totalCount", 0)
         
+        # ==================== CONTADORES DE MÉTRICAS ====================
         # ==================== CONTADORES DE MÉTRICAS ====================
         watchers_count = data.get("watchers", {}).get("totalCount", 0)
         subscribers_count = data.get("subscribers", {}).get("totalCount", 0)
         network_count = data.get("networkCount", data.get("forkCount", 0))
+        network_count = data.get("networkCount", data.get("forkCount", 0))
         
+        # ==================== ISSUES ====================
         # ==================== ISSUES ====================
         issues_data = data.get("issues", {})
         issues_count = issues_data.get("totalCount", 0)
@@ -330,7 +497,21 @@ class Repository(BaseModel):
                 createdAt=issue_node.get("createdAt"),
                 closedAt=issue_node.get("closedAt")
             ))
+        open_issues_count = data.get("openIssues", {}).get("totalCount", 0)
+        closed_issues_count = data.get("closedIssues", {}).get("totalCount", 0)
         
+        recent_issues = []
+        for issue_node in issues_data.get("nodes", [])[:5]:
+            recent_issues.append(IssueInfo(
+                id=issue_node.get("id", ""),
+                number=issue_node.get("number", 0),
+                title=issue_node.get("title", ""),
+                state=issue_node.get("state", ""),
+                createdAt=issue_node.get("createdAt"),
+                closedAt=issue_node.get("closedAt")
+            ))
+        
+        # ==================== PULL REQUESTS ====================
         # ==================== PULL REQUESTS ====================
         pull_requests_data = data.get("pullRequests", {})
         pull_requests_count = pull_requests_data.get("totalCount", 0)
@@ -349,7 +530,24 @@ class Repository(BaseModel):
                 closedAt=pr_node.get("closedAt"),
                 mergedAt=pr_node.get("mergedAt")
             ))
+        open_pull_requests_count = data.get("openPullRequests", {}).get("totalCount", 0)
+        closed_pull_requests_count = data.get("closedPullRequests", {}).get("totalCount", 0)
+        merged_pull_requests_count = data.get("mergedPullRequests", {}).get("totalCount", 0)
         
+        recent_pull_requests = []
+        for pr_node in pull_requests_data.get("nodes", [])[:5]:
+            recent_pull_requests.append(PullRequestInfo(
+                id=pr_node.get("id", ""),
+                number=pr_node.get("number", 0),
+                title=pr_node.get("title", ""),
+                state=pr_node.get("state", ""),
+                createdAt=pr_node.get("createdAt"),
+                closedAt=pr_node.get("closedAt"),
+                mergedAt=pr_node.get("mergedAt")
+            ))
+        
+        # ==================== COMMITS ====================
+        commits_count = 0
         # ==================== COMMITS ====================
         commits_count = 0
         branches_count = data.get("refs", {}).get("totalCount", 0)
@@ -367,7 +565,12 @@ class Repository(BaseModel):
             
             commits_edges = history.get("edges", [])
             for edge in commits_edges[:10]:
+            for edge in commits_edges[:10]:
                 commit_node = edge.get("node", {})
+                author_info = commit_node.get("author", {})
+                author_user = author_info.get("user", {})
+                
+                recent_commits.append(CommitInfo(
                 author_info = commit_node.get("author", {})
                 author_user = author_info.get("user", {})
                 
@@ -377,10 +580,13 @@ class Repository(BaseModel):
                     committedDate=commit_node.get("committedDate"),
                     authorLogin=author_user.get("login") if author_user else None
                 ))
+                    authorLogin=author_user.get("login") if author_user else None
+                ))
             
             if commits_edges:
                 last_commit_date = commits_edges[0].get("node", {}).get("committedDate")
         
+        # ==================== RELEASES ====================
         # ==================== RELEASES ====================
         releases_data = data.get("releases", {})
         releases_count = releases_data.get("totalCount", 0)
@@ -394,8 +600,19 @@ class Repository(BaseModel):
                 isPrerelease=release_node.get("isPrerelease", False),
                 isDraft=release_node.get("isDraft", False)
             ))
+        releases = []
+        for release_node in releases_data.get("nodes", []):
+            releases.append(ReleaseInfo(
+                id=release_node.get("id", ""),
+                tagName=release_node.get("tagName", ""),
+                name=release_node.get("name"),
+                publishedAt=release_node.get("publishedAt"),
+                isPrerelease=release_node.get("isPrerelease", False),
+                isDraft=release_node.get("isDraft", False)
+            ))
         latest_release = releases[0] if releases else None
         
+        # ==================== PARENT (si es fork) ====================
         # ==================== PARENT (si es fork) ====================
         parent_id = None
         parent_name_with_owner = None
@@ -415,8 +632,7 @@ class Repository(BaseModel):
             )
         
         # ==================== README ====================
-        readme_text = None  # Se usa para filtrado pero NO se guarda
-        readme_length = 0
+        readme_text = None
         has_readme = False
         readme_object = data.get("object")
         if readme_object and isinstance(readme_object, dict):
@@ -425,11 +641,36 @@ class Repository(BaseModel):
             readme_length = len(readme_text) if readme_text else 0
         
         # ==================== SEGURIDAD (SOLO CONTADOR) ====================
+        # ==================== SEGURIDAD (SOLO CONTADOR) ====================
         vulnerability_alerts_data = data.get("vulnerabilityAlerts", {})
         vulnerability_alerts_count = vulnerability_alerts_data.get("totalCount", 0)
         
         # ==================== DEPENDENCIAS (MANIFIESTOS) ====================
+        # ==================== DEPENDENCIAS (MANIFIESTOS) ====================
         dependency_graph_data = data.get("dependencyGraphManifests", {})
+        dependency_graph_manifests = []
+        for manifest_node in dependency_graph_data.get("nodes", []):
+            dependency_graph_manifests.append({
+                "filename": manifest_node.get("filename", ""),
+                "dependenciesCount": manifest_node.get("dependenciesCount", 0)
+            })
+        
+        # ==================== CODE OF CONDUCT Y FUNDING ====================
+        code_of_conduct_data = data.get("codeOfConduct")
+        code_of_conduct = None
+        if code_of_conduct_data:
+            code_of_conduct = {
+                "key": code_of_conduct_data.get("key", ""),
+                "name": code_of_conduct_data.get("name", ""),
+                "url": code_of_conduct_data.get("url", "")
+            }
+        
+        funding_links = []
+        for link in data.get("fundingLinks", []):
+            funding_links.append({
+                "platform": link.get("platform", ""),
+                "url": link.get("url", "")
+            })
         dependency_graph_manifests = []
         for manifest_node in dependency_graph_data.get("nodes", []):
             dependency_graph_manifests.append({
@@ -503,8 +744,7 @@ class Repository(BaseModel):
             defaultBranchRefName=default_branch_name,
             parentId=parent_id,
             parentNameWithOwner=parent_name_with_owner,
-            readmeText=readme_text,  # Solo para filtrado, no se persiste (exclude=True)
-            readmeLength=readme_length,
+            readmeText=readme_text,
             hasReadme=has_readme,
             vulnerabilityAlertsCount=vulnerability_alerts_count,
             dependencyGraphManifests=dependency_graph_manifests,

@@ -3,6 +3,7 @@ Sistema de logging del proyecto.
 """
 import logging
 import sys
+import io
 from pathlib import Path
 
 from .config import config
@@ -42,7 +43,15 @@ def setup_logger(name: str = "tfg-backend") -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S"
     )
     
-    # Handler para consola (solo INFO y superior en producción)
+    # Handler para consola con soporte UTF-8 para Windows
+    # Envolver stdout con UTF-8 encoding para soportar emojis en Windows
+    try:
+        # Intentar reconfigurar stdout para UTF-8
+        if sys.stdout.encoding != 'utf-8':
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    except:
+        pass  # Si falla, continuar con la configuración por defecto
+    
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
     console_handler.setFormatter(formatter)

@@ -56,13 +56,19 @@ def main():
         logger.info(f"\n  • Total de consultas estimadas: {total_queries}")
         logger.info(f"  • Repositorios estimados: {total_queries * 1000:,} (máximo teórico)")
         
-        # Preguntar confirmación
-        print("\n¿Deseas continuar con la ingesta segmentada? [s/N]: ", end="")
-        response = input().strip().lower()
+        # Verificar auto-confirmación desde variable de entorno
+        auto_confirm = os.getenv('AUTO_CONFIRM', 'false').lower() == 'true'
         
-        if response not in ['s', 'si', 'sí', 'y', 'yes']:
-            logger.info("Operación cancelada por el usuario")
-            return
+        if auto_confirm:
+            logger.info("\n✓ Auto-confirmación activada, continuando...")
+        else:
+            # Preguntar confirmación
+            print("\n¿Deseas continuar con la ingesta segmentada? [s/N]: ", end="")
+            response = input().strip().lower()
+            
+            if response not in ['s', 'si', 'sí', 'y', 'yes']:
+                logger.info("Operación cancelada por el usuario")
+                return
         
         # Crear motor de ingesta
         engine = IngestionEngine(
@@ -86,7 +92,7 @@ def main():
         logger.info(f"  • Repositorios válidos: {result['summary']['total_filtered']:,}")
         logger.info(f"  • Nuevos en DB: {result['summary']['repositories_inserted']:,}")
         logger.info(f"  • Actualizados en DB: {result['summary']['repositories_updated']:,}")
-        logger.info(f"  • Relaciones creadas: {result['summary']['relations_created']:,}")
+        # logger.info(f"  • Relaciones creadas: {result['summary']['relations_created']:,}")  # DESHABILITADO: Feature deprecada
         logger.info(f"  • Duración total: {result['timing']['total']}")
         
     except KeyboardInterrupt:

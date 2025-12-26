@@ -55,16 +55,15 @@ def main():
             unique_fields=["id"]
         )
         
-        # Preguntar cuántos repositorios enriquecer
-        user_input = input("\n¿Cuántos repositorios quieres enriquecer? [Enter = todos]: ").strip()
-        
+        # Leer parámetros desde variables de entorno o usar defaults
         max_repos = None
-        if user_input:
+        enrichment_limit = os.getenv('ENRICHMENT_LIMIT')
+        if enrichment_limit:
             try:
-                max_repos = int(user_input)
+                max_repos = int(enrichment_limit)
                 print(f"✅ Enriquecimiento limitado a {max_repos} repositorios\n")
             except ValueError:
-                print("⚠️  Entrada inválida, enriqueciendo todos los repositorios\n")
+                print("⚠️  Entrada inválida en ENRICHMENT_LIMIT, enriqueciendo todos los repositorios\n")
         else:
             print("✅ Enriqueciendo todos los repositorios\n")
         

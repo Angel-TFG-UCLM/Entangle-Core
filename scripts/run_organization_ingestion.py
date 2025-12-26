@@ -45,10 +45,16 @@ def main():
     logger.info("  • Rate Limit: batch_size=5, sleep=0.5s")
     logger.info("  • Garantía: TODAS las orgs tienen repos quantum")
     
-    response = input("\n¿Desea continuar? (s/n): ")
-    if response.lower() not in ['s', 'si', 'sí', 'y', 'yes']:
-        logger.info("❌ Operación cancelada por el usuario")
-        return 0
+    # Verificar auto-confirmación desde variable de entorno
+    auto_confirm = os.getenv('AUTO_CONFIRM', 'false').lower() == 'true'
+    
+    if auto_confirm:
+        logger.info("\n✓ Auto-confirmación activada, continuando...")
+    else:
+        response = input("\n¿Desea continuar? (s/n): ")
+        if response.lower() not in ['s', 'si', 'sí', 'y', 'yes']:
+            logger.info("❌ Operación cancelada por el usuario")
+            return 0
     
     try:
         # Crear repositorios
