@@ -209,3 +209,4 @@ backups/
 scripts/clean_duplicate_fields.py
 scripts/fix_db_schema.py
 scripts/recalculate_enrichment_status.py
+scripts/run_full_pipeline_test.py
