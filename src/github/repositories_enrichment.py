@@ -273,14 +273,22 @@ class EnrichmentEngine:
             query = {}
             logger.info("📌 Modo force_reenrich: procesando todos los repositorios")
         else:
-            # Solo repositorios que no estén completamente enriquecidos
+            # Solo repositorios que:
+            # 1. No tienen enrichment_status (nunca enriquecidos)
+            # 2. No están completos
+            # 3. Fueron enriquecidos hace más de 7 días
+            from datetime import timedelta
+            seven_days_ago = datetime.now() - timedelta(days=7)
+            
             query = {
                 "$or": [
                     {"enrichment_status": {"$exists": False}},
                     {"enrichment_status.is_complete": False},
-                    {"enrichment_status.is_complete": {"$exists": False}}
+                    {"enrichment_status.is_complete": {"$exists": False}},
+                    {"enrichment_status.last_enriched": {"$lt": seven_days_ago.isoformat()}}
                 ]
             }
+            logger.info("📌 Modo incremental: repos sin enriquecer, incompletos o desactualizados (>7 días)")
         
         repos = list(self.repos_repository.collection.find(query).limit(max_repos or 0))
         total_repos = len(repos)
@@ -309,13 +317,37 @@ class EnrichmentEngine:
                 repo_name = repo.get('name_with_owner', 'unknown')
                 logger.info(f"\n🔄 [{batch_num}.{idx}] Procesando: {repo_name}")
                 
-                try:
-                    self._enrich_repository(repo)
-                    self.stats["total_enriched"] += 1
-                    logger.info(f"✅ [{batch_num}.{idx}] Completado: {repo_name}")
-                except Exception as e:
-                    logger.error(f"❌ [{batch_num}.{idx}] Error en {repo_name}: {type(e).__name__}: {e}")
-                    self.stats["total_errors"] += 1
+                # Intentar con reintentos para errores de CosmosDB
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        self._enrich_repository(repo)
+                        self.stats["total_enriched"] += 1
+                        logger.info(f"✅ [{batch_num}.{idx}] Completado: {repo_name}")
+                        break  # Éxito, salir del loop de reintentos
+                    except Exception as e:
+                        error_str = str(e)
+                        
+                        # Manejar error 429 de CosmosDB (TooManyRequests)
+                        if "16500" in error_str or "429" in error_str or "TooManyRequests" in error_str:
+                            # Extraer RetryAfterMs si está disponible
+                            import re
+                            retry_match = re.search(r'RetryAfterMs[=:](\d+)', error_str)
+                            wait_ms = int(retry_match.group(1)) if retry_match else 2000
+                            wait_seconds = (wait_ms / 1000) + 0.5  # Añadir margen
+                            
+                            if attempt < max_retries - 1:
+                                logger.warning(f"⏳ [{batch_num}.{idx}] CosmosDB rate limit. Esperando {wait_seconds:.1f}s (intento {attempt + 1}/{max_retries})...")
+                                time.sleep(wait_seconds)
+                                continue  # Reintentar
+                            else:
+                                logger.error(f"❌ [{batch_num}.{idx}] Error en {repo_name} después de {max_retries} intentos: {type(e).__name__}")
+                                self.stats["total_errors"] += 1
+                        else:
+                            # Otros errores no se reintentan
+                            logger.error(f"❌ [{batch_num}.{idx}] Error en {repo_name}: {type(e).__name__}: {e}")
+                            self.stats["total_errors"] += 1
+                            break
                 
                 self.stats["total_processed"] += 1
             
