@@ -1134,6 +1134,7 @@ def _run_full_pipeline_direct(task_id: str):
                 github_token=github_token,
                 organizations_repository=orgs_repo,
                 repositories_repository=repo_repo,
+                users_repository=users_repo,
                 batch_size=5
             ).enrich_all_organizations(max_orgs=None, force_reenrich=False)
         )
