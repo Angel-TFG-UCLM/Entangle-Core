@@ -21,7 +21,25 @@ Elimina:
   ❌ Bloques de seguridad detallados (vulnerabilities, security_policy)
   ⚠️ Aplanar languages a estructura simple
 """
+# ==================== UTILIDADES ====================
 
+def _truncate_text(text: Optional[str], max_length: int = 500, suffix: str = "... [TRUNCATED]") -> Optional[str]:
+    """
+    Trunca un texto si excede la longitud máxima.
+    
+    Args:
+        text: Texto a truncar
+        max_length: Longitud máxima permitida
+        suffix: Sufijo a añadir cuando se trunca
+    
+    Returns:
+        Texto truncado o None si el texto es None
+    """
+    if not text:
+        return text
+    if len(text) > max_length:
+        return text[:max_length] + suffix
+    return text
 # ==================== SUB-MODELOS SIMPLIFICADOS ====================
 
 class LanguageInfo(BaseModel):
@@ -324,7 +342,7 @@ class Repository(BaseModel):
             recent_issues.append(IssueInfo(
                 id=issue_node.get("id", ""),
                 number=issue_node.get("number", 0),
-                title=issue_node.get("title", ""),
+                title=_truncate_text(issue_node.get("title", ""), max_length=200),
                 state=issue_node.get("state", ""),
                 createdAt=issue_node.get("createdAt"),
                 closedAt=issue_node.get("closedAt")
@@ -342,7 +360,7 @@ class Repository(BaseModel):
             recent_pull_requests.append(PullRequestInfo(
                 id=pr_node.get("id", ""),
                 number=pr_node.get("number", 0),
-                title=pr_node.get("title", ""),
+                title=_truncate_text(pr_node.get("title", ""), max_length=200),
                 state=pr_node.get("state", ""),
                 createdAt=pr_node.get("createdAt"),
                 closedAt=pr_node.get("closedAt"),
@@ -372,7 +390,7 @@ class Repository(BaseModel):
                 
                 recent_commits.append(CommitInfo(
                     oid=commit_node.get("oid", ""),
-                    message=commit_node.get("message", ""),
+                    message=_truncate_text(commit_node.get("message", ""), max_length=200),
                     committedDate=commit_node.get("committedDate"),
                     authorLogin=author_user.get("login") if author_user else None
                 ))
@@ -418,9 +436,7 @@ class Repository(BaseModel):
         has_readme = False
         readme_object = data.get("object")
         if readme_object and isinstance(readme_object, dict):
-            readme_text = readme_object.get("text")
-            if readme_text and len(readme_text) > 2000:
-                 readme_text = readme_text[:2000] + "... [TRUNCATED]"
+            readme_text = _truncate_text(readme_object.get("text"), max_length=1000)
             has_readme = bool(readme_text)
         
         # ==================== SEGURIDAD (SOLO CONTADOR) ====================
@@ -459,7 +475,7 @@ class Repository(BaseModel):
             name=data.get("name", ""),
             nameWithOwner=data.get("nameWithOwner", ""),
             fullName=data.get("fullName"),
-            description=data.get("description"),
+            description=_truncate_text(data.get("description"), max_length=500),
             url=data.get("url", ""),
             homepageUrl=data.get("homepageUrl"),
             owner=owner,

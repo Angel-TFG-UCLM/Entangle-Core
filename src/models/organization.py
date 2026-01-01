@@ -7,6 +7,25 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel, Field, validator
 
 
+def _truncate_text(text: Optional[str], max_length: int = 500, suffix: str = "... [TRUNCATED]") -> Optional[str]:
+    """
+    Trunca un texto si excede la longitud máxima.
+    
+    Args:
+        text: Texto a truncar
+        max_length: Longitud máxima permitida
+        suffix: Sufijo a añadir cuando se trunca
+    
+    Returns:
+        Texto truncado o None si el texto es None
+    """
+    if not text:
+        return text
+    if len(text) > max_length:
+        return text[:max_length] + suffix
+    return text
+
+
 class EnrichmentStatus(BaseModel):
     """Estado del enriquecimiento de la organización."""
     is_complete: bool = False
@@ -176,8 +195,8 @@ class Organization(BaseModel):
         return cls(
             id=data.get("id"),
             login=data.get("login"),
-            name=data.get("name"),
-            description=data.get("description"),
+            name=_truncate_text(data.get("name"), max_length=200),
+            description=_truncate_text(data.get("description"), max_length=500),
             email=data.get("email"),
             url=data.get("url"),
             avatarUrl=data.get("avatarUrl"),

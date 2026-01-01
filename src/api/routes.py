@@ -1100,11 +1100,15 @@ def _run_full_pipeline_direct(task_id: str):
         # 4. Enriquecimiento de Usuarios
         background_tasks_status[task_id]["progress"] = "4/6 - Enriquecimiento de Usuarios"
         users_repo = MongoRepository("users")
-        client = GitHubGraphQLClient(github_token)
         
         result = run_operation(
             "4. Enriquecimiento de Usuarios",
-            lambda: UserEnrichmentEngine(users_repo, repo_repo, client).enrich_all_users(
+            lambda: UserEnrichmentEngine(
+                github_token=github_token,
+                users_repository=users_repo,
+                repos_repository=repo_repo,
+                batch_size=5
+            ).enrich_all_users(
                 max_users=None, 
                 force_reenrich=False
             )
