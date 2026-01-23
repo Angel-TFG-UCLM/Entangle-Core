@@ -1,7 +1,8 @@
 """
-Script para ejecutar la ingesta de organizaciones desde usuarios.
+Script para ejecutar la ingesta de organizaciones desde repositorios quantum.
 
-Estrategia Bottom-Up: descubre organizaciones desde usuarios ya ingestados.
+Estrategia Repository-First v2.0: descubre organizaciones desde repos quantum ya ingestados.
+Garantiza que TODAS las organizaciones ingestadas tienen repos quantum confirmados.
 """
 
 import sys
@@ -36,16 +37,24 @@ def main():
     
     # Confirmar con usuario
     logger.info("\nConfiguración:")
-    logger.info("  • Estrategia: Bottom-Up (desde usuarios)")
-    logger.info("  • Fuente: Campo 'organizations' de usuarios")
+    logger.info("  • Estrategia: Repository-First v2.0")
+    logger.info("  • Fuente: Campo 'owner' de repositorios quantum")
+    logger.info("  • Filtro: Solo organizaciones (owner.type == 'Organization')")
     logger.info("  • Deduplicación: por login de organización")
     logger.info("  • Almacenamiento: MongoDB (colección 'organizations')")
     logger.info("  • Rate Limit: batch_size=5, sleep=0.5s")
+    logger.info("  • Garantía: TODAS las orgs tienen repos quantum")
     
-    response = input("\n¿Desea continuar? (s/n): ")
-    if response.lower() not in ['s', 'si', 'sí', 'y', 'yes']:
-        logger.info("❌ Operación cancelada por el usuario")
-        return 0
+    # Verificar auto-confirmación desde variable de entorno
+    auto_confirm = os.getenv('AUTO_CONFIRM', 'false').lower() == 'true'
+    
+    if auto_confirm:
+        logger.info("\n✓ Auto-confirmación activada, continuando...")
+    else:
+        response = input("\n¿Desea continuar? (s/n): ")
+        if response.lower() not in ['s', 'si', 'sí', 'y', 'yes']:
+            logger.info("❌ Operación cancelada por el usuario")
+            return 0
     
     try:
         # Crear repositorios

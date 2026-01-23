@@ -1,0 +1,25 @@
+{
+  "pipeline": {
+    "description": "Configuración del pipeline completo de ingesta y enriquecimiento",
+    "auto_confirm": true,
+    "stop_on_error": true
+  },
+  "enrichment": {
+    "repositories": {
+      "limit": null,
+      "description": "Límite de repositorios a enriquecer (null = todos)"
+    },
+    "users": {
+      "limit": null,
+      "description": "Límite de usuarios a enriquecer (null = todos)"
+    },
+    "organizations": {
+      "limit": null,
+      "description": "Límite de organizaciones a enriquecer (null = todos)"
+    },
+    "batch_size": 5,
+    "batch_size_description": "Tamaño de lote para enriquecimiento (recomendado: 5 para Azure Free Tier)",
+    "force_reenrichment": false,
+    "force_reenrichment_description": "Forzar re-enriquecimiento de datos ya procesados"
+  }
+}

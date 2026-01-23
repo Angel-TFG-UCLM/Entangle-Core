@@ -8,6 +8,25 @@ from datetime import datetime
 from pydantic import BaseModel, Field, validator, root_validator
 
 
+def _truncate_text(text: Optional[str], max_length: int = 500, suffix: str = "... [TRUNCATED]") -> Optional[str]:
+    """
+    Trunca un texto si excede la longitud máxima.
+    
+    Args:
+        text: Texto a truncar
+        max_length: Longitud máxima permitida
+        suffix: Sufijo a añadir cuando se trunca
+    
+    Returns:
+        Texto truncado o None si el texto es None
+    """
+    if not text:
+        return text
+    if len(text) > max_length:
+        return text[:max_length] + suffix
+    return text
+
+
 class UserRepository(BaseModel):
     """Repositorio simplificado (para pinned_repositories)."""
     id: str
@@ -16,6 +35,11 @@ class UserRepository(BaseModel):
     description: Optional[str] = None
     stargazer_count: int = Field(0, alias="stargazerCount")
     primary_language: Optional[str] = None
+    
+    @validator('description', pre=True)
+    def truncate_description(cls, v):
+        """Trunca la descripción si es muy larga."""
+        return _truncate_text(v, max_length=300)
     
     class Config:
         populate_by_name = True
@@ -27,6 +51,11 @@ class UserOrganization(BaseModel):
     login: str
     name: Optional[str] = None
     description: Optional[str] = None
+    
+    @validator('name', 'description', pre=True)
+    def truncate_text_fields(cls, v):
+        """Trunca campos de texto si son muy largos."""
+        return _truncate_text(v, max_length=300)
     
     class Config:
         populate_by_name = True
@@ -175,6 +204,9 @@ class User(BaseModel):
         # Construir diccionario limpio
         user_data = {
             **data,
+            "name": _truncate_text(data.get("name"), max_length=200),
+            "bio": _truncate_text(data.get("bio"), max_length=500),
+            "company": _truncate_text(data.get("company"), max_length=200),
             "organizations": organizations,
             "pinnedRepositories": pinned_repositories,
             "followersCount": followers_count,

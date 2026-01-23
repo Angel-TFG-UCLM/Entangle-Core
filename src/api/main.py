@@ -54,11 +54,17 @@ app = FastAPI(
 )
 
 # Configurar CORS
+# Listado específico de orígenes permitidos (seguro para producción)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # IMPORTANTEEEE En producción, especificar dominios permitidos
+    allow_origins=[
+        "http://localhost:5173",      # Desarrollo local (Vite)
+        "http://localhost:3000",      # Alternativa desarrollo
+        "http://127.0.0.1:5173",      # IP local
+        "https://stentanglefrontend01.z43.web.core.windows.net"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
 

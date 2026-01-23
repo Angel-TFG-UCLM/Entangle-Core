@@ -290,6 +290,11 @@ class UserEnrichmentEngine:
         """
         login = user.get("login")
         
+        if not login:
+            logger.warning(f"⚠️  Usuario sin campo 'login' encontrado (ID: {user.get('_id')}). Saltando...")
+            self.stats["total_errors"] += 1
+            return False
+        
         try:
             logger.info(f"\nEnriqueciendo usuario: {login}")
             
@@ -603,6 +608,15 @@ class UserEnrichmentEngine:
                 # Obtener contribuciones del mapa
                 contributions = contributions_map.get(repo_id, 0)
                 
+                # Manejar primary_language que puede ser string o dict
+                primary_lang = repo.get("primary_language")
+                if isinstance(primary_lang, dict):
+                    primary_lang_name = primary_lang.get("name")
+                elif isinstance(primary_lang, str):
+                    primary_lang_name = primary_lang
+                else:
+                    primary_lang_name = None
+                
                 quantum_repos.append({
                     "id": repo_id,
                     "name": repo.get("name"),
@@ -610,7 +624,7 @@ class UserEnrichmentEngine:
                     "stars": repo.get("stargazer_count", 0),
                     "role": role,
                     "contributions": contributions,
-                    "primary_language": repo.get("primary_language", {}).get("name") if repo.get("primary_language") else None
+                    "primary_language": primary_lang_name
                 })
             
             return quantum_repos if quantum_repos else None

@@ -8,6 +8,10 @@ from pymongo import MongoClient
 from pymongo.database import Database as PyMongoDatabase
 from pymongo.collection import Collection
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+import warnings
+
+# Suppress pymongo warning about CosmosDB cluster
+warnings.filterwarnings("ignore", message="You appear to be connected to a CosmosDB cluster")
 
 from .config import config
 from .logger import logger
@@ -97,12 +101,45 @@ class Database:
     
     def is_connected(self) -> bool:
         """
-        Verifica si la conexión está activa.
+        Verifica si la conexión está activa haciendo un ping real.
         
         Returns:
             bool: True si está conectado, False en caso contrario
         """
-        return self._is_connected and self.client is not None
+        if not self._is_connected or self.client is None:
+            return False
+        
+        try:
+            # Hacer ping real para verificar que la conexión sigue viva
+            self.client.admin.command('ping')
+            return True
+        except Exception as e:
+            logger.warning(f"Conexión a MongoDB caída: {e}")
+            self._is_connected = False
+            return False
+    
+    def ensure_connection(self) -> None:
+        """
+        Asegura que hay una conexión activa, reconectando si es necesario.
+        
+        Raises:
+            Exception: Si no se puede establecer la conexión
+        """
+        if not self.is_connected():
+            logger.info("Reconectando a MongoDB...")
+            try:
+                # Cerrar conexión anterior si existe
+                if self.client:
+                    self.client.close()
+                    self.client = None
+                    self.db = None
+                    self._is_connected = False
+                
+                # Reconectar
+                self.connect()
+            except Exception as e:
+                logger.error(f"Error al reconectar a MongoDB: {e}")
+                raise
     
     def get_database(self) -> PyMongoDatabase:
         """

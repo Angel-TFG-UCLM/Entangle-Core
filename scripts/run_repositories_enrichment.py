@@ -55,18 +55,24 @@ def main():
             unique_fields=["id"]
         )
         
-        # Preguntar cuántos repositorios enriquecer
-        user_input = input("\n¿Cuántos repositorios quieres enriquecer? [Enter = todos]: ").strip()
-        
+        # Leer parámetros desde variables de entorno o usar defaults
         max_repos = None
-        if user_input:
+        enrichment_limit = os.getenv('ENRICHMENT_LIMIT')
+        if enrichment_limit:
             try:
-                max_repos = int(user_input)
+                max_repos = int(enrichment_limit)
                 print(f"✅ Enriquecimiento limitado a {max_repos} repositorios\n")
             except ValueError:
-                print("⚠️  Entrada inválida, enriqueciendo todos los repositorios\n")
+                print("⚠️  Entrada inválida en ENRICHMENT_LIMIT, enriqueciendo todos los repositorios\n")
         else:
             print("✅ Enriqueciendo todos los repositorios\n")
+        
+        # Leer force_reenrich desde variable de entorno
+        force_reenrich_env = os.getenv('FORCE_REENRICHMENT', 'false').lower()
+        force_reenrich = force_reenrich_env == 'true'
+        
+        if force_reenrich:
+            logger.info("📌 Modo force_reenrich: procesando todos los repositorios")
         
         print("=" * 80)
         print("  🔄 PROCESANDO...")
@@ -82,7 +88,10 @@ def main():
         )
         
         # Ejecutar enriquecimiento
-        stats = engine.enrich_all_repositories(max_repos=max_repos)
+        stats = engine.enrich_all_repositories(
+            max_repos=max_repos,
+            force_reenrich=force_reenrich
+        )
         
         # Mostrar resumen final
         print("\n" + "=" * 80)

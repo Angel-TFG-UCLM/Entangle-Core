@@ -3,22 +3,17 @@ Modelos de datos para las entidades del proyecto.
 Incluye modelos Pydantic para MongoDB con todos los campos de GitHub GraphQL API.
 """
 
-# Repository models
+# Repository models v2.0 - OPTIMIZADO (Pydantic v2)
 from .repository import (
     Repository,
-    Language,
-    LanguageEdge,
-    License,
-    Topic,
-    RepositoryTopic,
-    Owner,
-    Collaborator,
-    Commit,
-    Issue,
-    PullRequest,
-    Release,
-    Vulnerability,
-    DependencyGraphManifest
+    LanguageInfo,
+    LicenseInfo,
+    OwnerInfo,
+    CollaboratorInfo,
+    CommitInfo,
+    IssueInfo,
+    PullRequestInfo,
+    ReleaseInfo
 )
 
 # Organization models v1.0 - INGESTA BÁSICA

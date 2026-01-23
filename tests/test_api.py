@@ -312,5 +312,36 @@ class TestFilterEndpoints:
         assert isinstance(data2, list)
 
 
+class TestPipelineEndpoints:
+    """Tests para endpoints del pipeline de ingesta completa."""
+    
+    @patch('subprocess.run')
+    def test_run_full_pipeline(self, mock_subprocess, client):
+        """Verifica que el endpoint de ejecucion del pipeline funcione."""
+        # Mock de subprocess.run
+        mock_subprocess.return_value = MagicMock(
+            returncode=0,
+            stdout="Pipeline ejecutado exitosamente",
+            stderr=""
+        )
+        
+        response = client.post("/api/v1/pipeline/run-all")
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert "task_id" in data
+        assert "message" in data
+        assert "status" in data
+        assert data["status"] == "started"
+    
+    def test_get_pipeline_status_not_found(self, client):
+        """Verifica que el endpoint de status devuelva 404 para task_id inexistente."""
+        response = client.get("/api/v1/pipeline/status/fake-task-id-123")
+        
+        assert response.status_code == 404
+        data = response.json()
+        assert "detail" in data
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

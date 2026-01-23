@@ -388,6 +388,12 @@ class UserIngestionEngine:
             # Formatear datos
             formatted_user = self._format_user_data(user_data)
             
+            # VALIDACIÓN CRÍTICA: Verificar que el usuario tiene login válido
+            if not formatted_user.get("login"):
+                logger.warning(f"⚠️  Usuario con ID {user_id}: Sin campo 'login' válido en respuesta de GitHub. Saltando...")
+                self.stats["total_errors"] += 1
+                return
+            
             # Añadir metadata de extracción
             formatted_user["extracted_from"] = user_stub["extracted_from"]
             formatted_user["is_bot"] = user_stub.get("is_bot", False)
@@ -400,6 +406,12 @@ class UserIngestionEngine:
                 logger.warning(f"⚠️  Usuario {login}: Error de validación: {e}")
                 # Guardar sin validar
                 user_dict = formatted_user
+            
+            # VALIDACIÓN FINAL: Verificar login antes de insertar
+            if not user_dict.get("login"):
+                logger.warning(f"⚠️  Usuario con ID {user_id}: login perdido después de validación. Saltando...")
+                self.stats["total_errors"] += 1
+                return
             
             # Insertar en MongoDB
             self.users_repository.collection.insert_one(user_dict)

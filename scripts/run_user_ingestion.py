@@ -37,10 +37,16 @@ def main():
     logger.info("  • Deduplicación: por ID de usuario")
     logger.info("  • Almacenamiento: MongoDB (colección 'users')")
     
-    response = input("\n¿Desea continuar? (s/n): ")
-    if response.lower() not in ['s', 'si', 'sí', 'y', 'yes']:
-        logger.info("❌ Operación cancelada por el usuario")
-        return
+    # Verificar auto-confirmación desde variable de entorno
+    auto_confirm = os.getenv('AUTO_CONFIRM', 'false').lower() == 'true'
+    
+    if auto_confirm:
+        logger.info("\n✓ Auto-confirmación activada, continuando...")
+    else:
+        response = input("\n¿Desea continuar? (s/n): ")
+        if response.lower() not in ['s', 'si', 'sí', 'y', 'yes']:
+            logger.info("❌ Operación cancelada por el usuario")
+            return
     
     try:
         # Ejecutar ingesta

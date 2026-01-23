@@ -73,8 +73,8 @@ module api './core/host/container-app.bicep' = {
     containerRegistryName: containerRegistry.outputs.name
     containerCpuCoreCount: '1.0'
     containerMemory: '2.0Gi'
-    containerMaxReplicas: 10
-    containerMinReplicas: 1
+    containerMaxReplicas: 1
+    containerMinReplicas: 0
     env: [
       {
         name: 'ENVIRONMENT'
@@ -104,11 +104,11 @@ module api './core/host/container-app.bicep' = {
     secrets: [
       {
         name: 'github-token'
-        value: 'cambiar-esto-en-portal' // Se configura después del despliegue
+        value: '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' // Se configura después del despliegue
       }
       {
         name: 'mongo-uri'
-        value: 'cambiar-esto-en-portal' // Se configura después del despliegue
+        value: 'mongodb://db-entangle-uclm:T3sv72J6kvKJ9BTiWSSy6vZVCzN7velCtb1vmK2PlgC2Bi7Y52448sA22TI708pGcyNPyf0UZnoRACDbbP6lvw==@db-entangle-uclm.mongo.cosmos.azure.com:10255/?ssl=true&replicaSet=globaldb&retrywrites=false&maxIdleTimeMS=120000&appName=@db-entangle-uclm@' // Se configura después del despliegue
       }
     ]
     targetPort: 8000
