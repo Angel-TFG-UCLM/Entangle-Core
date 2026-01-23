@@ -1027,6 +1027,7 @@ def _run_full_pipeline_direct(task_id: str):
                     result.get('enriched', 0) or
                     result.get('new_organizations', 0) or
                     result.get('new_users', 0) or
+                    result.get('users_inserted', 0) or
                     0
                 )
             elif isinstance(result, int):
