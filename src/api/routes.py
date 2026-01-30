@@ -49,8 +49,10 @@ async def health_check():
 @router.get("/stats")
 async def get_stats():
     """
-    Obtiene estadísticas generales del sistema.
+    Obtiene estadísticas generales del sistema (Simple counts).
     Retorna el conteo total de repositorios, usuarios y organizaciones.
+    
+    NOTA: Para dashboard completo con caché, usar /dashboard/stats
     """
     try:
         from ..core.db import db
@@ -76,6 +78,173 @@ async def get_stats():
         }
     except Exception as e:
         error_msg = f"Error al obtener estadísticas: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.get("/dashboard/stats")
+async def get_dashboard_stats():
+    """
+    Endpoint inteligente para dashboard con sistema de caché MongoDB.
+    
+    Estrategia de Caché:
+    - Consulta colección 'metrics' buscando { "type": "dashboard_stats" }
+    - Si existe y updated_at < 24h → Retorna caché (0ms latency)
+    - Si NO existe o es antiguo → Calcula con agregaciones y guarda
+    
+    Retorna:
+    - kpis: { totalRepos, totalUsers, totalOrgs }
+    - topLanguages: [{ name, count, percentage }, ...] (Top 5)
+    - topOrganizations: [{ name, repoCount, totalStars }, ...] (Top 5)
+    - metadata: { cached, calculatedAt, expiresAt }
+    """
+    try:
+        from ..core.db import db
+        from datetime import timedelta
+        
+        # Asegurar conexión activa
+        db.ensure_connection()
+        
+        # Configuración de caché (24 horas)
+        CACHE_TTL_HOURS = 24
+        current_time = datetime.now()
+        
+        # 1. INTENTAR OBTENER CACHÉ
+        metrics_collection = db.get_collection("metrics")
+        cached_stats = metrics_collection.find_one({"type": "dashboard_stats"})
+        
+        if cached_stats:
+            updated_at = cached_stats.get("updated_at")
+            if updated_at and isinstance(updated_at, datetime):
+                age_hours = (current_time - updated_at).total_seconds() / 3600
+                
+                # Si el caché es fresco (< 24h), retornarlo
+                if age_hours < CACHE_TTL_HOURS:
+                    logger.info(f"📊 Cache HIT - Dashboard stats servido desde caché ({age_hours:.1f}h antiguo)")
+                    
+                    # Agregar metadatos de caché
+                    response_data = cached_stats.get("data", {})
+                    response_data["metadata"] = {
+                        "cached": True,
+                        "calculatedAt": updated_at.isoformat(),
+                        "expiresAt": (updated_at + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
+                        "ageHours": round(age_hours, 2)
+                    }
+                    return response_data
+        
+        logger.info("📊 Cache MISS - Calculando dashboard stats desde MongoDB...")
+        
+        # 2. CALCULAR ESTADÍSTICAS (Caché expirado o no existe)
+        repos_collection = db.get_collection("repositories")
+        users_collection = db.get_collection("users")
+        orgs_collection = db.get_collection("organizations")
+        
+        # === KPIs: Conteos básicos ===
+        total_repos = repos_collection.count_documents({}, maxTimeMS=10000)
+        total_users = users_collection.count_documents({}, maxTimeMS=10000)
+        total_orgs = orgs_collection.count_documents({}, maxTimeMS=10000)
+        
+        kpis = {
+            "totalRepos": total_repos,
+            "totalUsers": total_users,
+            "totalOrgs": total_orgs
+        }
+        
+        # === TOP LENGUAJES: Agregación ===
+        # Agrupar repos por primary_language.name, contar y ordenar descendente
+        language_pipeline = [
+            # Filtrar repos que tengan lenguaje definido
+            {"$match": {"primary_language.name": {"$exists": True, "$ne": None}}},
+            # Agrupar por lenguaje
+            {"$group": {
+                "_id": "$primary_language.name",
+                "count": {"$sum": 1}
+            }},
+            # Ordenar por count descendente
+            {"$sort": {"count": -1}},
+            # Limitar a Top 5
+            {"$limit": 5},
+            # Renombrar _id a name
+            {"$project": {
+                "_id": 0,
+                "name": "$_id",
+                "count": 1
+            }}
+        ]
+        
+        top_languages_cursor = repos_collection.aggregate(language_pipeline)
+        top_languages_raw = list(top_languages_cursor)
+        
+        # Calcular porcentajes
+        total_repos_with_lang = sum(item["count"] for item in top_languages_raw)
+        top_languages = [
+            {
+                "name": item["name"],
+                "count": item["count"],
+                "percentage": round((item["count"] / total_repos_with_lang * 100), 2) if total_repos_with_lang > 0 else 0
+            }
+            for item in top_languages_raw
+        ]
+        
+        # === TOP ORGANIZACIONES: Agregación ===
+        # Agrupar repos por owner.login, contar y sumar stars
+        org_pipeline = [
+            # Filtrar repos que tengan owner definido
+            {"$match": {"owner.login": {"$exists": True, "$ne": None}}},
+            # Agrupar por organización
+            {"$group": {
+                "_id": "$owner.login",
+                "repoCount": {"$sum": 1},
+                "totalStars": {"$sum": "$stargazer_count"}
+            }},
+            # Ordenar por repoCount descendente
+            {"$sort": {"repoCount": -1}},
+            # Limitar a Top 5
+            {"$limit": 5},
+            # Renombrar campos
+            {"$project": {
+                "_id": 0,
+                "name": "$_id",
+                "repoCount": 1,
+                "totalStars": 1
+            }}
+        ]
+        
+        top_orgs_cursor = repos_collection.aggregate(org_pipeline)
+        top_organizations = list(top_orgs_cursor)
+        
+        # 3. PREPARAR RESPUESTA
+        response_data = {
+            "kpis": kpis,
+            "topLanguages": top_languages,
+            "topOrganizations": top_organizations,
+            "metadata": {
+                "cached": False,
+                "calculatedAt": current_time.isoformat(),
+                "expiresAt": (current_time + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
+                "ageHours": 0
+            }
+        }
+        
+        # 4. GUARDAR EN CACHÉ (Upsert)
+        cache_document = {
+            "type": "dashboard_stats",
+            "data": response_data,
+            "updated_at": current_time
+        }
+        
+        metrics_collection.update_one(
+            {"type": "dashboard_stats"},
+            {"$set": cache_document},
+            upsert=True
+        )
+        
+        logger.info(f"✅ Dashboard stats calculado y guardado en caché (válido por {CACHE_TTL_HOURS}h)")
+        
+        return response_data
+        
+    except Exception as e:
+        error_msg = f"Error al obtener dashboard stats: {str(e)}"
         logger.error(error_msg, exc_info=True)
         raise HTTPException(status_code=500, detail=error_msg)
 

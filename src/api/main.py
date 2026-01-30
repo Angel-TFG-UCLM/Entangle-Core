@@ -59,8 +59,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",      # Desarrollo local (Vite)
+        "http://localhost:5174",      # Puerto alternativo Vite
         "http://localhost:3000",      # Alternativa desarrollo
         "http://127.0.0.1:5173",      # IP local
+        "http://127.0.0.1:5174",      # IP local puerto alternativo
         "https://stentanglefrontend01.z43.web.core.windows.net"
     ],
     allow_credentials=True,
