@@ -10,6 +10,7 @@ on:
     branches: 
       - main
       - develop
+      - migracion-cloud
     paths:
       - '**'
       - '.github/workflows/azure-container-apps-deploy.yml'
