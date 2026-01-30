@@ -1,0 +1,58 @@
+# ===========================================
+# Entangle Backend - Auto Deploy to Azure Container Apps
+# Basado en el workflow generado automáticamente por Azure
+# ===========================================
+name: Deploy Backend to Azure Container Apps
+
+on:
+  # Trigger automático cuando hay cambios en el repo
+  push:
+    branches: 
+      - main
+      - develop
+    paths:
+      - '**'
+      - '.github/workflows/azure-container-apps-deploy.yml'
+
+  # Permite trigger manual
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions: 
+      id-token: write  # Requerido para obtener OIDC JWT Token
+      contents: read   # Requerido para checkout del repo
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          # Estos secrets fueron creados automáticamente por Azure
+          client-id: ${{ secrets.ENTANGLEAPI_AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.ENTANGLEAPI_AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.ENTANGLEAPI_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and Deploy to Container Apps
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          appSourcePath: ${{ github.workspace }}
+          dockerfilePath: Dockerfile
+          # Usa el registry que ya tienes configurado
+          registryUrl: acrentangle.azurecr.io
+          registryUsername: ${{ secrets.ENTANGLEAPI_REGISTRY_USERNAME }}
+          registryPassword: ${{ secrets.ENTANGLEAPI_REGISTRY_PASSWORD }}
+          # Nombre de tu Container App y Resource Group
+          containerAppName: entangle-api
+          resourceGroup: rg-entangle-prod
+          imageToBuild: acrentangle.azurecr.io/entangle-api:${{ github.sha }}
+
+      - name: Mostrar resultado
+        run: |
+          echo "### ✅ Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "Container App: entangle-api" >> $GITHUB_STEP_SUMMARY
+          echo "Resource Group: rg-entangle-prod" >> $GITHUB_STEP_SUMMARY
+          echo "Image Tag: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

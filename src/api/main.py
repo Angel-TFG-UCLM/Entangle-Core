@@ -46,25 +46,31 @@ async def lifespan(app: FastAPI):
 
 # Crear aplicación FastAPI
 app = FastAPI(
-    title="TFG Backend API",
-    description="API para extraer y analizar datos de GitHub.",
+    title="Entangle Backend API",
+    description="API para extraer y analizar datos de GitHub - Computación Cuántica.",
     version="1.0.0",
     debug=config.DEBUG,
     lifespan=lifespan
 )
 
-# Configurar CORS
-# Listado específico de orígenes permitidos (seguro para producción)
+# Configurar CORS dinámicamente
+# Combina orígenes de desarrollo con los de producción desde variables de entorno
+cors_origins = [
+    "http://localhost:5173",      # Desarrollo local (Vite)
+    "http://localhost:5174",      # Puerto alternativo Vite
+    "http://localhost:3000",      # Alternativa desarrollo
+    "http://127.0.0.1:5173",      # IP local
+    "http://127.0.0.1:5174",      # IP local puerto alternativo
+]
+
+# Agregar URL del frontend desde variable de entorno (Azure Static Web Apps)
+if config.FRONTEND_URL:
+    cors_origins.append(config.FRONTEND_URL)
+    logger.info(f"CORS habilitado para frontend: {config.FRONTEND_URL}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",      # Desarrollo local (Vite)
-        "http://localhost:5174",      # Puerto alternativo Vite
-        "http://localhost:3000",      # Alternativa desarrollo
-        "http://127.0.0.1:5173",      # IP local
-        "http://127.0.0.1:5174",      # IP local puerto alternativo
-        "https://stentanglefrontend01.z43.web.core.windows.net"
-    ],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],

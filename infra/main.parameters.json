@@ -8,8 +8,14 @@
     "location": {
       "value": "${AZURE_LOCATION}"
     },
-    "principalId": {
-      "value": "${AZURE_PRINCIPAL_ID}"
+    "mongoUri": {
+      "value": "${MONGO_URI}"
+    },
+    "githubToken": {
+      "value": "${GITHUB_TOKEN}"
+    },
+    "frontendUrl": {
+      "value": "${FRONTEND_URL}"
     }
   }
 }
