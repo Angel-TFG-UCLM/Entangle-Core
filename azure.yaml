@@ -1,7 +1,11 @@
+# ===========================================
 # Azure Developer CLI (azd) Configuration
-name: tfg-backend
+# Entangle Backend API - GitHub Data Analytics
+# ===========================================
+name: entangle-backend
+
 metadata:
-  template: tfg-backend-api@0.0.1
+  template: entangle-backend@1.0.0
 
 services:
   api:
@@ -12,7 +16,19 @@ services:
       path: ./Dockerfile
       context: .
 
-# Azure resources to provision
+# Infraestructura como código
 infra:
   provider: bicep
   path: ./infra
+
+# Hooks para el ciclo de vida de azd
+hooks:
+  # Después del despliegue, mostrar la URL
+  postdeploy:
+    shell: pwsh
+    run: |
+      Write-Host "============================================"
+      Write-Host "Backend desplegado correctamente!"
+      Write-Host "URL de la API: $env:SERVICE_API_URI"
+      Write-Host "Health Check: $env:SERVICE_API_URI/api/v1/health"
+      Write-Host "============================================"

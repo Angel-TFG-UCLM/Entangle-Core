@@ -35,6 +35,9 @@ class Config:
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     
+    # Frontend URL para CORS (Azure Static Web Apps)
+    FRONTEND_URL = os.getenv("FRONTEND_URL", "")
+    
     @classmethod
     def validate(cls):
         """Valida que las configuraciones críticas estén presentes."""
