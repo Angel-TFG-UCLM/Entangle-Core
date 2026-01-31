@@ -23,13 +23,20 @@ class Config:
     MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "quantum_github")
     
-    # API
-    #API_HOST = os.getenv("API_HOST", "0.0.0.0")
-    #API_PORT = int(os.getenv("API_PORT", "8000"))
+    # API Configuration
+    # Azure Container Apps uses PORT environment variable
+    API_HOST = os.getenv("API_HOST", "0.0.0.0")
+    API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
     
     # Entorno
     ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
     DEBUG = os.getenv("DEBUG", "True").lower() == "true"
+    
+    # Logging
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    
+    # Frontend URL para CORS (Azure Static Web Apps)
+    FRONTEND_URL = os.getenv("FRONTEND_URL", "")
     
     @classmethod
     def validate(cls):
@@ -188,6 +195,22 @@ class IngestionConfig:
         """Versión de la configuración."""
         return self._config_data.get("version", "1.0")
     
+    @property
+    def segmentation(self) -> Optional[Dict[str, Any]]:
+        """
+        Configuración de segmentación para superar el límite de 1000 resultados.
+        
+        Returns:
+            Dict con 'stars' (lista de rangos [min, max]) y 'created_years' (lista de años)
+            o None si no está configurada la segmentación
+        """
+        return self._config_data.get("segmentation", None)
+    
+    @property
+    def enable_segmentation(self) -> bool:
+        """Si está habilitada la segmentación dinámica."""
+        return self.segmentation is not None and self._config_data.get("enable_segmentation", False)
+    
     def get_all_config(self) -> Dict[str, Any]:
         """
         Retorna toda la configuración como diccionario.
@@ -220,3 +243,21 @@ config = Config()
 
 # Instancia global de configuración de ingesta
 ingestion_config = IngestionConfig()
+
+
+def load_ingestion_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Carga y retorna la configuración de ingesta completa.
+    
+    Args:
+        config_path: Ruta opcional al archivo de configuración
+        
+    Returns:
+        Diccionario con toda la configuración
+    """
+    if config_path:
+        config_instance = IngestionConfig(config_path)
+    else:
+        config_instance = ingestion_config
+    
+    return config_instance.get_all_config()
