@@ -1,24 +1,20 @@
 name: Trigger auto deployment for entangle-api
 
-# When this action will be executed
 on:
-  # Automatically trigger it when detected changes in repo
   push:
     branches: 
       [ main, develop ]
     paths:
     - '**'
     - '.github/workflows/entangle-api-AutoDeployTrigger-396ba899-4469-43e2-a00a-9a7b8d3268f2.yml'
-
-  # Allow manual trigger 
   workflow_dispatch:      
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions: 
-      id-token: write #This is required for requesting the OIDC JWT Token
-      contents: read #Required when GH token is used to authenticate with private repo
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout to the branch
@@ -36,7 +32,13 @@ jobs:
             echo "ENVIRONMENT=stagging" >> $GITHUB_ENV
             echo "IMAGE_TAG=stagging-${{ github.sha }}" >> $GITHUB_ENV
           fi
-          echo "Deploying to: ${{ env.CONTAINER_APP_NAME }} (Environment: ${{ env.ENVIRONMENT }})"
+
+      - name: Debug environment variables
+        run: |
+          echo "Branch: ${{ github.ref }}"
+          echo "Container App: $CONTAINER_APP_NAME"
+          echo "Environment: $ENVIRONMENT"
+          echo "Image Tag: $IMAGE_TAG"
 
       - name: Azure Login
         uses: azure/login@v2
@@ -55,5 +57,3 @@ jobs:
           containerAppName: ${{ env.CONTAINER_APP_NAME }}
           resourceGroup: rg-entangle
           imageToBuild: crentangle.azurecr.io/${{ env.CONTAINER_APP_NAME }}:${{ env.IMAGE_TAG }}
-
-
