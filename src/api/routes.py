@@ -1254,7 +1254,7 @@ def _run_full_pipeline_direct(task_id: str):
             lambda: EnrichmentEngine(
                 github_token=github_token,
                 repos_repository=repo_repo,
-                batch_size=10
+                batch_size=100  # ✅ OPTIMIZADO para vCore M30
             ).enrich_all_repositories(max_repos=None)
         )
         results.append(result)
@@ -1277,7 +1277,7 @@ def _run_full_pipeline_direct(task_id: str):
                 github_token=github_token,
                 users_repository=users_repo,
                 repos_repository=repo_repo,
-                batch_size=5
+                batch_size=100  # ✅ OPTIMIZADO para vCore M30
             ).enrich_all_users(
                 max_users=None, 
                 force_reenrich=False
@@ -1295,7 +1295,7 @@ def _run_full_pipeline_direct(task_id: str):
                 github_token=github_token,
                 users_repository=users_repo,
                 organizations_repository=orgs_repo,
-                batch_size=5
+                batch_size=100  # ✅ OPTIMIZADO para vCore M30
             ).run(force_update=False)
         )
         results.append(result)
@@ -1309,7 +1309,7 @@ def _run_full_pipeline_direct(task_id: str):
                 organizations_repository=orgs_repo,
                 repositories_repository=repo_repo,
                 users_repository=users_repo,
-                batch_size=5
+                batch_size=100  # ✅ OPTIMIZADO para vCore M30
             ).enrich_all_organizations(max_orgs=None, force_reenrich=False)
         )
         results.append(result)

@@ -22,7 +22,7 @@ class EnrichmentEngine:
         self,
         github_token: str,
         repos_repository: MongoRepository,
-        batch_size: int = 10,
+        batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
         config: Optional[Dict[str, Any]] = None
     ):
         """
@@ -317,37 +317,15 @@ class EnrichmentEngine:
                 repo_name = repo.get('name_with_owner', 'unknown')
                 logger.info(f"\n🔄 [{batch_num}.{idx}] Procesando: {repo_name}")
                 
-                # Intentar con reintentos para errores de CosmosDB
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        self._enrich_repository(repo)
-                        self.stats["total_enriched"] += 1
-                        logger.info(f"✅ [{batch_num}.{idx}] Completado: {repo_name}")
-                        break  # Éxito, salir del loop de reintentos
-                    except Exception as e:
-                        error_str = str(e)
-                        
-                        # Manejar error 429 de CosmosDB (TooManyRequests)
-                        if "16500" in error_str or "429" in error_str or "TooManyRequests" in error_str:
-                            # Extraer RetryAfterMs si está disponible
-                            import re
-                            retry_match = re.search(r'RetryAfterMs[=:](\d+)', error_str)
-                            wait_ms = int(retry_match.group(1)) if retry_match else 2000
-                            wait_seconds = (wait_ms / 1000) + 0.5  # Añadir margen
-                            
-                            if attempt < max_retries - 1:
-                                logger.warning(f"⏳ [{batch_num}.{idx}] CosmosDB rate limit. Esperando {wait_seconds:.1f}s (intento {attempt + 1}/{max_retries})...")
-                                time.sleep(wait_seconds)
-                                continue  # Reintentar
-                            else:
-                                logger.error(f"❌ [{batch_num}.{idx}] Error en {repo_name} después de {max_retries} intentos: {type(e).__name__}")
-                                self.stats["total_errors"] += 1
-                        else:
-                            # Otros errores no se reintentan
-                            logger.error(f"❌ [{batch_num}.{idx}] Error en {repo_name}: {type(e).__name__}: {e}")
-                            self.stats["total_errors"] += 1
-                            break
+                # NOTA: Retry simplificado - vCore no tiene throttling code 16500
+                # Solo manejar errores inesperados
+                try:
+                    self._enrich_repository(repo)
+                    self.stats["total_enriched"] += 1
+                    logger.info(f"✅ [{batch_num}.{idx}] Completado: {repo_name}")
+                except Exception as e:
+                    logger.error(f"❌ [{batch_num}.{idx}] Error en {repo_name}: {type(e).__name__}: {e}")
+                    self.stats["total_errors"] += 1
                 
                 self.stats["total_processed"] += 1
             
@@ -357,10 +335,8 @@ class EnrichmentEngine:
             logger.info(f"  ❌ Errores: {self.stats['total_errors']}")
             logger.info(f"  🔄 Reintentos totales: {self.stats['total_retries']}")
             
-            # Respetar rate limits entre lotes
-            if i + self.batch_size < total_repos:
-                logger.debug("⏳ Pausa de 2s entre lotes...")
-                time.sleep(2)
+            # NOTA: Sleep removido - solo verificar rate limit de GitHub API
+            # (vCore no necesita throttling de BD)
         
         self.stats["end_time"] = datetime.now()
         duration = (self.stats["end_time"] - self.stats["start_time"]).total_seconds()

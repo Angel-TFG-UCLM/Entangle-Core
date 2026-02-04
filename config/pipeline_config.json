@@ -17,8 +17,8 @@
       "limit": null,
       "description": "Límite de organizaciones a enriquecer (null = todos)"
     },
-    "batch_size": 5,
-    "batch_size_description": "Tamaño de lote para enriquecimiento (recomendado: 5 para Azure Free Tier)",
+    "batch_size": 100,
+    "batch_size_description": "Tamaño de lote para enriquecimiento (optimizado para Azure Cosmos DB vCore M30)",
     "force_reenrichment": false,
     "force_reenrichment_description": "Forzar re-enriquecimiento de datos ya procesados"
   }

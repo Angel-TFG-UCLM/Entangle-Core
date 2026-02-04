@@ -67,7 +67,7 @@ class OrganizationEnrichmentEngine:
         organizations_repository: MongoRepository,
         repositories_repository: MongoRepository,
         users_repository: MongoRepository,
-        batch_size: int = 5,
+        batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
         sleep_time: float = 0.5,
         config: Optional[Dict[str, Any]] = None
     ):
@@ -79,8 +79,8 @@ class OrganizationEnrichmentEngine:
             organizations_repository: Repositorio de organizaciones
             repositories_repository: Repositorio de repositorios (para buscar quantum repos)
             users_repository: Repositorio de usuarios (para contributors)
-            batch_size: Tamaño del lote (default 5 para Rate Limit)
-            sleep_time: Tiempo de espera entre requests (default 0.5s)
+            batch_size: Tamaño del lote (optimizado para vCore)
+            sleep_time: Tiempo de espera entre requests GitHub API (default 0.5s)
             config: Configuración opcional
         """
         self.github_token = github_token
@@ -104,52 +104,25 @@ class OrganizationEnrichmentEngine:
         
         logger.info(f"OrganizationEnrichmentEngine v1.0 inicializado (batch_size={batch_size}, sleep_time={sleep_time}s)")
     
+    # DEPRECATED: Ya no necesario con Azure Cosmos DB for MongoDB (vCore)
     def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
         """
-        Ejecuta una operación con retry automático cuando Cosmos DB retorna 429.
+        DEPRECATED: Método legacy de Cosmos DB RU-based.
+        vCore no tiene throttling code 16500.
+        Se mantiene por compatibilidad pero ahora solo ejecuta la operación directamente.
         
         Args:
             operation: Función a ejecutar
-            max_retries: Número máximo de reintentos (default 5)
+            max_retries: IGNORADO en vCore
             
         Returns:
-            Resultado de la operación o None si falla
+            Resultado de la operación
         """
-        for attempt in range(max_retries):
-            try:
-                return operation()
-            except OperationFailure as e:
-                if e.code == 16500:  # RequestRateTooLarge
-                    # Extraer RetryAfterMs del mensaje de error
-                    error_msg = str(e)
-                    retry_after_ms = 1000  # Default 1s
-                    
-                    # Parsear RetryAfterMs del mensaje
-                    if 'RetryAfterMs=' in error_msg:
-                        try:
-                            start = error_msg.index('RetryAfterMs=') + len('RetryAfterMs=')
-                            end = error_msg.index(',', start) if ',' in error_msg[start:] else error_msg.index(' ', start)
-                            retry_after_ms = int(error_msg[start:end])
-                        except (ValueError, IndexError):
-                            pass
-                    
-                    retry_after_s = retry_after_ms / 1000.0
-                    
-                    if attempt < max_retries - 1:
-                        logger.warning(f"⚠️  Cosmos DB 429: esperando {retry_after_s:.2f}s antes de reintentar (intento {attempt + 1}/{max_retries})")
-                        time.sleep(retry_after_s)
-                    else:
-                        logger.error(f"❌ Cosmos DB 429: máximo de reintentos ({max_retries}) alcanzado")
-                        # No lanzar excepción, retornar None para continuar
-                        return None
-                else:
-                    raise
-            except Exception as e:
-                # Para otros errores, retornar None y continuar
-                logger.error(f"❌ Error en operación: {e}")
-                return None
-        
-        return None
+        try:
+            return operation()
+        except Exception as e:
+            logger.error(f"❌ Error en operación: {e}")
+            raise
     
     def enrich_all_organizations(
         self, 
@@ -318,8 +291,7 @@ class OrganizationEnrichmentEngine:
                 )
             )
             
-            # Sleep para Cosmos DB después de write (RU/s limit)
-            time.sleep(0.3)
+            # NOTA: Sleep removido - vCore no necesita throttling
             
             self.stats["total_enriched"] += 1
             logger.info(f"✅ Organización {login} enriquecida correctamente")
@@ -398,8 +370,7 @@ class OrganizationEnrichmentEngine:
                 }))
             )
             
-            # Sleep para Cosmos DB (RU/s limit)
-            time.sleep(0.2)
+            # NOTA: Sleep removido - vCore no necesita throttling
             
             if quantum_repos is None or not quantum_repos:
                 return None
@@ -456,8 +427,7 @@ class OrganizationEnrichmentEngine:
                 lambda: list(self.users_repository.collection.aggregate(pipeline))
             )
             
-            # Sleep para Cosmos DB (RU/s limit)
-            time.sleep(0.2)
+            # NOTA: Sleep removido - vCore no necesita throttling
             
             if results is None:
                 return []
@@ -504,8 +474,7 @@ class OrganizationEnrichmentEngine:
                 ))
             )
             
-            # Sleep para Cosmos DB (RU/s limit)
-            time.sleep(0.2)
+            # NOTA: Sleep removido - vCore no necesita throttling
             
             if repos is None or not repos:
                 return []
@@ -572,8 +541,7 @@ class OrganizationEnrichmentEngine:
                 ))
             )
             
-            # Sleep para Cosmos DB (RU/s limit)
-            time.sleep(0.2)
+            # NOTA: Sleep removido - vCore no necesita throttling
             
             if repos is None:
                 return 0

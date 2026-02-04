@@ -42,7 +42,7 @@ def main():
     logger.info("  • Filtro: Solo organizaciones (owner.type == 'Organization')")
     logger.info("  • Deduplicación: por login de organización")
     logger.info("  • Almacenamiento: MongoDB (colección 'organizations')")
-    logger.info("  • Rate Limit: batch_size=5, sleep=0.5s")
+    logger.info("  • Rate Limit: batch_size configurable (default 100), sleep=0.5s para GitHub API")
     logger.info("  • Garantía: TODAS las orgs tienen repos quantum")
     
     # Verificar auto-confirmación desde variable de entorno
@@ -68,7 +68,7 @@ def main():
             github_token=github_token,
             users_repository=users_repo,
             organizations_repository=orgs_repo,
-            batch_size=5
+            batch_size=100  # ✅ OPTIMIZADO para vCore
         )
         
         # Ejecutar ingesta

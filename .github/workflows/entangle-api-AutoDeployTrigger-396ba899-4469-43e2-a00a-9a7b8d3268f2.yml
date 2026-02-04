@@ -1,0 +1,59 @@
+name: Trigger auto deployment for entangle-api
+
+# When this action will be executed
+on:
+  # Automatically trigger it when detected changes in repo
+  push:
+    branches: 
+      [ main, develop ]
+    paths:
+    - '**'
+    - '.github/workflows/entangle-api-AutoDeployTrigger-396ba899-4469-43e2-a00a-9a7b8d3268f2.yml'
+
+  # Allow manual trigger 
+  workflow_dispatch:      
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions: 
+      id-token: write #This is required for requesting the OIDC JWT Token
+      contents: read #Required when GH token is used to authenticate with private repo
+
+    steps:
+      - name: Checkout to the branch
+        uses: actions/checkout@v2
+
+      - name: Set environment based on branch
+        id: set-env
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "CONTAINER_APP_NAME=entangle-api" >> $GITHUB_ENV
+            echo "ENVIRONMENT=production" >> $GITHUB_ENV
+            echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+          else
+            echo "CONTAINER_APP_NAME=entangle-api-stagging" >> $GITHUB_ENV
+            echo "ENVIRONMENT=stagging" >> $GITHUB_ENV
+            echo "IMAGE_TAG=stagging-${{ github.sha }}" >> $GITHUB_ENV
+          fi
+          echo "Deploying to: ${{ env.CONTAINER_APP_NAME }} (Environment: ${{ env.ENVIRONMENT }})"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.ENTANGLEAPI_AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.ENTANGLEAPI_AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.ENTANGLEAPI_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push container image to registry
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          appSourcePath: ${{ github.workspace }}
+          registryUrl: crentangle.azurecr.io
+          registryUsername: ${{ secrets.ENTANGLEAPI_REGISTRY_USERNAME }}
+          registryPassword: ${{ secrets.ENTANGLEAPI_REGISTRY_PASSWORD }}
+          containerAppName: ${{ env.CONTAINER_APP_NAME }}
+          resourceGroup: rg-entangle
+          imageToBuild: crentangle.azurecr.io/${{ env.CONTAINER_APP_NAME }}:${{ env.IMAGE_TAG }}
+
+

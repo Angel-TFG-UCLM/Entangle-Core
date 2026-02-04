@@ -1,11 +1,10 @@
-"""
-Motor de enriquecimiento de usuarios de GitHub - Versión 2.0 Optimizada
+""" Motor de enriquecimiento de usuarios de GitHub - Versión 2.0 Optimizada
 
 MEJORAS PRINCIPALES:
 - Una sola super-query GraphQL por usuario (elimina rate limits)
 - Modelo simplificado (30 campos esenciales vs 78 anteriores)
 - Robustez: try-except por usuario, continúa en fallos
-- Optimizado para Azure Free Tier: batch_size=5, sleep 0.5s
+- Optimizado para vCore: batch_size escalable, sin sleeps entre operaciones de BD
 - Preserva lógica core TFG: quantum_repositories, quantum_expertise_score, métricas sociales
 """
 
@@ -174,7 +173,7 @@ class UserEnrichmentEngine:
         github_token: str,
         users_repository: MongoRepository,
         repos_repository: MongoRepository,
-        batch_size: int = 5,  # Optimizado para Azure Free Tier
+        batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
         config: Optional[Dict[str, Any]] = None
     ):
         """
@@ -184,7 +183,7 @@ class UserEnrichmentEngine:
             github_token: Token de GitHub
             users_repository: Repositorio de usuarios
             repos_repository: Repositorio de repositorios
-            batch_size: Tamaño del lote (default 5 para Azure Free Tier)
+            batch_size: Tamaño del lote (optimizado para vCore)
             config: Configuración opcional
         """
         self.github_token = github_token
@@ -271,7 +270,7 @@ class UserEnrichmentEngine:
             for user in batch:
                 self._enrich_single_user(user)
                 
-                # Sleep para evitar rate limits (0.5s entre usuarios)
+                # Sleep para respetar GitHub API Rate Limit
                 time.sleep(0.5)
             
             logger.info(f"✅ Lote {batch_num}/{total_batches} completado")

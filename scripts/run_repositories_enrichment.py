@@ -79,7 +79,7 @@ def main():
         print("=" * 80 + "\n")
         
         # Inicializar motor de enriquecimiento
-        batch_size = config.get('enrichment', {}).get('batch_size', 10)
+        batch_size = config.get('enrichment', {}).get('batch_size', 100)  # ✅ OPTIMIZADO para vCore
         engine = EnrichmentEngine(
             github_token=github_token,
             repos_repository=repos_repository,

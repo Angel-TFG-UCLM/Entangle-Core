@@ -55,7 +55,7 @@ class OrganizationIngestionEngine:
         github_token: str,
         users_repository: MongoRepository,
         organizations_repository: MongoRepository,
-        batch_size: int = 5,
+        batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
         config: Optional[Dict[str, Any]] = None
     ):
         """
@@ -89,51 +89,25 @@ class OrganizationIngestionEngine:
         
         logger.info(f"OrganizationIngestionEngine v2.0 inicializado (batch_size={batch_size})")
     
+    # DEPRECATED: Ya no necesario con Azure Cosmos DB for MongoDB (vCore)
     def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
         """
-        Ejecuta una operación con retry automático cuando Cosmos DB retorna 429.
+        DEPRECATED: Método legacy de Cosmos DB RU-based.
+        vCore no tiene throttling code 16500.
+        Se mantiene por compatibilidad pero ahora solo ejecuta la operación directamente.
         
         Args:
             operation: Función a ejecutar
-            max_retries: Número máximo de reintentos (default 5)
+            max_retries: IGNORADO en vCore
             
         Returns:
-            Resultado de la operación o None si falla
+            Resultado de la operación
         """
-        for attempt in range(max_retries):
-            try:
-                return operation()
-            except OperationFailure as e:
-                if e.code == 16500:  # Cosmos DB throttling
-                    # Parsear RetryAfterMs del mensaje de error
-                    error_msg = str(e)
-                    retry_after_ms = 1000  # default fallback
-                    
-                    if 'RetryAfterMs=' in error_msg:
-                        start = error_msg.index('RetryAfterMs=') + len('RetryAfterMs=')
-                        end = error_msg.index(',', start)
-                        retry_after_ms = int(error_msg[start:end])
-                    
-                    retry_after_s = retry_after_ms / 1000.0
-                    
-                    if attempt < max_retries - 1:
-                        logger.warning(
-                            f"⚠️  Cosmos DB 429: esperando {retry_after_s:.2f}s "
-                            f"(intento {attempt + 1}/{max_retries})"
-                        )
-                        time.sleep(retry_after_s)
-                    else:
-                        logger.error(
-                            f"❌ Max reintentos alcanzado tras {max_retries} intentos"
-                        )
-                        return None  # Degradación graciosa
-                else:
-                    raise  # Otro tipo de OperationFailure
-            except Exception as e:
-                logger.error(f"❌ Error inesperado: {e}")
-                return None
-        
-        return None
+        try:
+            return operation()
+        except Exception as e:
+            logger.error(f"❌ Error en operación: {e}")
+            raise
     
     def run(self, force_update: bool = False) -> Dict[str, Any]:
         """
@@ -209,13 +183,12 @@ class OrganizationIngestionEngine:
                 {"$sort": {"repo_count": -1}}
             ]
             
-            # Ejecutar con retry automático para Cosmos DB throttling
+            # Ejecutar agregación (deprecado: retry legacy de Cosmos DB RU)
             results = self._retry_on_cosmos_throttle(
                 lambda: list(repos_collection.aggregate(pipeline))
             )
             
-            # Sleep después de lectura
-            time.sleep(0.2)
+            # NOTA: Sleep removido - vCore no necesita throttling
             
             if results is None:
                 logger.error("❌ No se pudo descubrir organizaciones tras reintentos")
@@ -289,13 +262,12 @@ class OrganizationIngestionEngine:
         try:
             logger.debug(f"\nProcesando organización: {login}")
             
-            # Verificar si ya existe con retry automático
+            # Verificar si ya existe
             existing = self._retry_on_cosmos_throttle(
                 lambda: self.organizations_repository.collection.find_one({"login": login})
             )
             
-            # Sleep después de lectura
-            time.sleep(0.2)
+            # NOTA: Sleep removido - vCore no necesita throttling
             
             if existing and not force_update:
                 logger.debug(f"   ⏭️  Organización {login} ya existe (saltando)")
@@ -322,7 +294,8 @@ class OrganizationIngestionEngine:
             # Log de relevancia
             logger.debug(f"   ✅ Organización {login} - {len(discovered_repos or [])} repos quantum")
             
-            # Guardar en BD con retry para Cosmos DB throttling
+            # ==================== GUARDAR EN BD ====================
+            # Deprecado: retry legacy de Cosmos DB RU (vCore no necesita esto)
             if existing:
                 # ✅ Preservar campos enriquecidos durante actualización
                 enriched_fields = [
@@ -385,8 +358,7 @@ class OrganizationIngestionEngine:
                     self.stats["total_errors"] += 1
                     return False
             
-            # Sleep adicional para Cosmos DB (después de escritura)
-            time.sleep(0.3)
+            # NOTA: Sleep removido - vCore no necesita throttling
             
             self.stats["total_processed"] += 1
             return True

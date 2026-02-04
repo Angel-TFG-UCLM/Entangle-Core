@@ -55,7 +55,7 @@ def main():
     max_orgs = int(max_orgs_env) if max_orgs_env else None
     
     batch_size_env = os.getenv('BATCH_SIZE')
-    batch_size = int(batch_size_env) if batch_size_env else 5
+    batch_size = int(batch_size_env) if batch_size_env else 100  # ✅ OPTIMIZADO para vCore
     
     force_reenrich_env = os.getenv('FORCE_REENRICHMENT', 'false').lower()
     force_reenrich = force_reenrich_env == 'true'
@@ -91,7 +91,7 @@ def main():
             repositories_repository=repos_repo,
             users_repository=users_repo,
             batch_size=batch_size,
-            sleep_time=1.0  # Aumentado para Cosmos DB RU/s
+            sleep_time=0.5  # Para respetar GitHub API Rate Limit
         )
         
         # Ejecutar enriquecimiento
