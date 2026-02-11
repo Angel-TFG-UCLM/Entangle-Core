@@ -73,7 +73,7 @@ def main():
         # Crear motor de ingesta
         engine = IngestionEngine(
             incremental=False,
-            batch_size=50
+            batch_size=500  # ✅ OPTIMIZADO para vCore
         )
         
         # Ejecutar ingesta completa con segmentación

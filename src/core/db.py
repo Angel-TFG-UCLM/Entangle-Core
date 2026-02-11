@@ -10,8 +10,8 @@ from pymongo.collection import Collection
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import warnings
 
-# Suppress pymongo warning about CosmosDB cluster
-warnings.filterwarnings("ignore", message="You appear to be connected to a CosmosDB cluster")
+# DEPRECATED: Ya no es necesario con Azure Cosmos DB for MongoDB (vCore)
+# warnings.filterwarnings("ignore", message="You appear to be connected to a CosmosDB cluster")
 
 from .config import config
 from .logger import logger
@@ -44,14 +44,20 @@ class Database:
             return
             
         try:
-            logger.info(f"Conectando a MongoDB: {config.MONGO_URI}")
+            logger.info(f"Conectando a MongoDB (Azure Cosmos DB for MongoDB vCore): {config.MONGO_URI}")
+            
+            # OPTIMIZADO PARA AZURE COSMOS DB FOR MONGODB (vCore)
+            # Configuración de alto rendimiento para MongoDB nativo
             self.client = MongoClient(
                 config.MONGO_URI,
                 serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=10000,
-                socketTimeoutMS=10000,
+                socketTimeoutMS=30000,  # Aumentado para operaciones bulk
                 retryReads=True,
-                retryWrites=False
+                retryWrites=True,  # ✅ HABILITADO: vCore soporta retry writes nativamente
+                maxPoolSize=100,    # ✅ ALTO RENDIMIENTO: Pool grande para concurrencia
+                minPoolSize=10,     # ✅ ALTO RENDIMIENTO: Mantener conexiones activas
+                maxIdleTimeMS=45000
             )
             
             # Verificar la conexión con ping
@@ -61,6 +67,7 @@ class Database:
             self._is_connected = True
             
             logger.info(f"✅ Conexión exitosa a la base de datos: {config.MONGO_DB_NAME}")
+            logger.info(f"🚀 Configuración optimizada para vCore: maxPoolSize=100, retryWrites=True")
             
         except ConnectionFailure as e:
             logger.error(f"❌ Error al conectar a MongoDB: {e}")

@@ -63,7 +63,7 @@ def main():
     max_users = int(max_users_env) if max_users_env else None
     
     batch_size_env = os.getenv('BATCH_SIZE')
-    batch_size = int(batch_size_env) if batch_size_env else 5
+    batch_size = int(batch_size_env) if batch_size_env else 100  # ✅ OPTIMIZADO para vCore
     
     force_reenrich_env = os.getenv('FORCE_REENRICHMENT', 'false').lower()
     force_reenrich = force_reenrich_env == 'true'

@@ -41,7 +41,7 @@ class UserIngestionEngine:
         github_client: GitHubGraphQLClient,
         repos_repository: MongoRepository,
         users_repository: MongoRepository,
-        batch_size: int = 50
+        batch_size: int = 500  # ✅ OPTIMIZADO para vCore
     ):
         """
         Inicializa el motor de ingesta de usuarios.
@@ -472,7 +472,7 @@ class UserIngestionEngine:
         }
 
 
-def run_user_ingestion(max_repos: Optional[int] = None, batch_size: int = 50) -> Dict[str, Any]:
+def run_user_ingestion(max_repos: Optional[int] = None, batch_size: int = 500) -> Dict[str, Any]:  # ✅ OPTIMIZADO
     """
     Función helper para ejecutar ingesta de usuarios desde colaboradores.
     

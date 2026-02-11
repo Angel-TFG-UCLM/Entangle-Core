@@ -73,7 +73,7 @@ def load_pipeline_config():
                 'repositories': {'limit': None},
                 'users': {'limit': None},
                 'organizations': {'limit': None},
-                'batch_size': 5,
+                'batch_size': 100,  # ✅ OPTIMIZADO para vCore M30
                 'force_reenrichment': False
             }
         }
@@ -94,7 +94,7 @@ def get_script_env_vars(script_name):
     env['AUTO_CONFIRM'] = 'true' if auto_confirm else 'false'
     
     enrichment = PIPELINE_CONFIG.get('enrichment', {})
-    batch_size = enrichment.get('batch_size', 5)
+    batch_size = enrichment.get('batch_size', 100)  # ✅ OPTIMIZADO para vCore M30
     force_reenrich = enrichment.get('force_reenrichment', False)
     
     # Variables específicas por script

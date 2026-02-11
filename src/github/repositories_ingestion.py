@@ -43,7 +43,7 @@ class IngestionEngine:
         client: Optional[GitHubGraphQLClient] = None,
         config: Optional[IngestionConfig] = None,
         incremental: bool = False,
-        batch_size: int = 50
+        batch_size: int = 500  # ✅ OPTIMIZADO para vCore: batch masivo
     ):
         """
         Inicializa el motor de ingesta.
@@ -134,51 +134,26 @@ class IngestionEngine:
         except Exception:
             return {"error": "Could not sanitize data"}
     
+    # DEPRECATED: Ya no necesario con Azure Cosmos DB for MongoDB (vCore)
+    # vCore es MongoDB nativo sin throttling code 16500
     def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
         """
-        Ejecuta una operación con retry automático cuando Cosmos DB retorna 429.
+        DEPRECATED: Método legacy de Cosmos DB RU-based.
+        vCore no tiene throttling code 16500.
+        Se mantiene por compatibilidad pero ahora solo ejecuta la operación directamente.
         
         Args:
             operation: Función a ejecutar
-            max_retries: Número máximo de reintentos (default 5)
+            max_retries: IGNORADO en vCore
             
         Returns:
-            Resultado de la operación o None si falla
+            Resultado de la operación
         """
-        for attempt in range(max_retries):
-            try:
-                return operation()
-            except OperationFailure as e:
-                if e.code == 16500:  # Cosmos DB throttling
-                    # Parsear RetryAfterMs del mensaje de error
-                    error_msg = str(e)
-                    retry_after_ms = 1000  # default fallback
-                    
-                    if 'RetryAfterMs=' in error_msg:
-                        start = error_msg.index('RetryAfterMs=') + len('RetryAfterMs=')
-                        end = error_msg.index(',', start)
-                        retry_after_ms = int(error_msg[start:end])
-                    
-                    retry_after_s = retry_after_ms / 1000.0
-                    
-                    if attempt < max_retries - 1:
-                        logger.warning(
-                            f"⚠️  Cosmos DB 429: esperando {retry_after_s:.2f}s "
-                            f"(intento {attempt + 1}/{max_retries})"
-                        )
-                        time.sleep(retry_after_s)
-                    else:
-                        logger.error(
-                            f"❌ Max reintentos alcanzado tras {max_retries} intentos"
-                        )
-                        return None  # Degradación graciosa
-                else:
-                    raise  # Otro tipo de OperationFailure
-            except Exception as e:
-                logger.error(f"❌ Error inesperado: {e}")
-                return None
-        
-        return None
+        try:
+            return operation()
+        except Exception as e:
+            logger.error(f"❌ Error en operación: {e}")
+            raise
     
     def run(
         self,
@@ -509,7 +484,7 @@ class IngestionEngine:
             logger.debug(f"  Procesando lote {batch_num}/{total_batches} ({len(batch)} repos)...")
             
             try:
-                # Bulk upsert con retry automático para throttling de Cosmos DB
+                # Bulk upsert (deprecado: retry automático legacy de Cosmos DB RU)
                 result = self._retry_on_cosmos_throttle(
                     lambda: self.repo_db.bulk_upsert(
                         documents=batch,
@@ -527,8 +502,7 @@ class IngestionEngine:
                         f"{result['modified_count']} actualizados"
                     )
                     
-                    # Sleep para evitar sobrecarga en Cosmos DB
-                    time.sleep(0.5)
+                    # NOTA: Sleep removido - vCore no necesita throttling
                 else:
                     logger.warning(f"⚠️  Lote {batch_num} falló tras reintentos. Intentando uno por uno...")
                     # Fallback a inserción individual
@@ -559,8 +533,7 @@ class IngestionEngine:
                                 total_updated += 1
                                 successful_in_batch += 1
                             
-                            # Sleep entre repos individuales
-                            time.sleep(0.2)
+                            # NOTA: Sleep removido - vCore no necesita throttling
                         else:
                             failed_in_batch += 1
                             logger.warning(f"⚠️  No se pudo persistir {repo.full_name if hasattr(repo, 'full_name') else repo.id}: falló tras reintentos")
@@ -919,7 +892,7 @@ class IngestionEngine:
 def run_ingestion(
     max_results: Optional[int] = None,
     incremental: bool = False,
-    batch_size: int = 50,
+    batch_size: int = 500,  # ✅ OPTIMIZADO para vCore
     save_to_json: bool = True,
     output_file: str = "ingestion_results.json"
 ) -> Dict[str, Any]:
@@ -949,7 +922,7 @@ def run_ingestion(
 
 def run_incremental_ingestion(
     max_results: Optional[int] = None,
-    batch_size: int = 100
+    batch_size: int = 500  # ✅ OPTIMIZADO para vCore
 ) -> Dict[str, Any]:
     """
     Ejecuta una ingesta incremental (solo actualiza documentos modificados).
