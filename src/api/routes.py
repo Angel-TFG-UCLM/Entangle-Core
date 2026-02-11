@@ -83,20 +83,33 @@ async def get_stats():
 
 
 @router.get("/dashboard/stats")
-async def get_dashboard_stats():
+async def get_dashboard_stats(
+    force_refresh: bool = Query(default=False, description="Forzar recálculo ignorando caché"),
+    org: Optional[str] = Query(default=None, description="Filtrar por organización (login)"),
+    language: Optional[str] = Query(default=None, description="Filtrar por lenguaje de programación"),
+    repo: Optional[str] = Query(default=None, description="Filtrar por repositorio (full_name)"),
+    collab_type: Optional[str] = Query(default=None, description="Tipo de colaborador: 'contributors' (con commits), 'reviewers' (solo mencionables), 'all'"),
+    include_bots: bool = Query(default=False, description="Incluir cuentas de bots en el análisis de colaboradores")
+):
     """
-    Endpoint inteligente para dashboard con sistema de caché MongoDB.
+    Endpoint COMPLETO para dashboard con sistema de caché MongoDB.
+    
+    Pre-calcula TODAS las métricas que necesita el frontend:
+    - KPIs: totales, promedios, top language
+    - Gráficos: top orgs, top repos, top users, distribución de lenguajes
+    - Grafo: nodos y enlaces pre-filtrados (top elementos)
+    - Tablas: top repos y users para detalle
+    
+    Filtros opcionales:
+    - org: filtra repos por owner.login y users por organizations
+    - language: filtra repos por primary_language
+    - repo: filtra por repositorio específico (muestra sus colaboradores)
+    - collab_type: tipo de colaborador (contributors/reviewers/all)
+    - include_bots: incluir bots (dependabot, github-actions, etc.)
     
     Estrategia de Caché:
-    - Consulta colección 'metrics' buscando { "type": "dashboard_stats" }
-    - Si existe y updated_at < 24h → Retorna caché (0ms latency)
-    - Si NO existe o es antiguo → Calcula con agregaciones y guarda
-    
-    Retorna:
-    - kpis: { totalRepos, totalUsers, totalOrgs }
-    - topLanguages: [{ name, count, percentage }, ...] (Top 5)
-    - topOrganizations: [{ name, repoCount, totalStars }, ...] (Top 5)
-    - metadata: { cached, calculatedAt, expiresAt }
+    - Solo usa caché cuando NO hay filtros activos
+    - Con filtros: calcula en tiempo real (~50-100ms)
     """
     try:
         from ..core.db import db
@@ -105,141 +118,643 @@ async def get_dashboard_stats():
         # Asegurar conexión activa
         db.ensure_connection()
         
-        # Configuración de caché (24 horas)
-        CACHE_TTL_HOURS = 24
+        # Configuración de caché (1 hora - más frecuente para datos dinámicos)
+        CACHE_TTL_HOURS = 1
         current_time = datetime.now()
         
-        # 1. INTENTAR OBTENER CACHÉ
+        # Detectar si hay filtros activos
+        has_filters = bool(org or language or repo or collab_type or not include_bots)
+        
+        # 1. INTENTAR OBTENER CACHÉ (solo si no hay filtros y no se fuerza refresh)
         metrics_collection = db.get_collection("metrics")
-        cached_stats = metrics_collection.find_one({"type": "dashboard_stats"})
         
-        if cached_stats:
-            updated_at = cached_stats.get("updated_at")
-            if updated_at and isinstance(updated_at, datetime):
-                age_hours = (current_time - updated_at).total_seconds() / 3600
-                
-                # Si el caché es fresco (< 24h), retornarlo
-                if age_hours < CACHE_TTL_HOURS:
-                    logger.info(f"📊 Cache HIT - Dashboard stats servido desde caché ({age_hours:.1f}h antiguo)")
+        if not force_refresh and not has_filters:
+            cached_stats = metrics_collection.find_one({"type": "dashboard_stats"})
+            
+            if cached_stats:
+                updated_at = cached_stats.get("updated_at")
+                if updated_at and isinstance(updated_at, datetime):
+                    age_hours = (current_time - updated_at).total_seconds() / 3600
                     
-                    # Agregar metadatos de caché
-                    response_data = cached_stats.get("data", {})
-                    response_data["metadata"] = {
-                        "cached": True,
-                        "calculatedAt": updated_at.isoformat(),
-                        "expiresAt": (updated_at + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
-                        "ageHours": round(age_hours, 2)
-                    }
-                    return response_data
+                    # Si el caché es fresco (< 1h), retornarlo
+                    if age_hours < CACHE_TTL_HOURS:
+                        logger.info(f"📊 Cache HIT - Dashboard stats servido desde caché ({age_hours:.1f}h antiguo)")
+                        
+                        # Agregar metadatos de caché
+                        response_data = cached_stats.get("data", {})
+                        response_data["metadata"] = {
+                            "cached": True,
+                            "calculatedAt": updated_at.isoformat(),
+                            "expiresAt": (updated_at + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
+                            "ageHours": round(age_hours, 2)
+                        }
+                        return response_data
         
-        logger.info("📊 Cache MISS - Calculando dashboard stats desde MongoDB...")
+        # Log de filtros activos
+        if has_filters:
+            logger.info(f"📊 Calculando dashboard stats CON FILTROS: org={org}, language={language}, repo={repo}")
+        else:
+            logger.info("📊 Calculando dashboard stats COMPLETO desde MongoDB...")
         
-        # 2. CALCULAR ESTADÍSTICAS (Caché expirado o no existe)
+        # 2. CALCULAR ESTADÍSTICAS
         repos_collection = db.get_collection("repositories")
         users_collection = db.get_collection("users")
         orgs_collection = db.get_collection("organizations")
         
-        # === KPIs: Conteos básicos ===
-        total_repos = repos_collection.count_documents({}, maxTimeMS=10000)
-        total_users = users_collection.count_documents({}, maxTimeMS=10000)
-        total_orgs = orgs_collection.count_documents({}, maxTimeMS=10000)
+        # === Construir filtros base para MongoDB ===
+        repo_filter = {}
+        user_filter = {}
+        org_filter = {}
+        
+        if org:
+            repo_filter["$or"] = [
+                {"owner.login": org},
+                {"organization.login": org}
+            ]
+            # Filtrar usuarios que pertenecen a esta org
+            # organizations puede ser array de strings o array de objetos con login
+            user_filter["$or"] = [
+                {"organizations": org},
+                {"organizations.login": org},
+                {"organizations": {"$elemMatch": {"login": org}}}
+            ]
+            # Filtrar solo la org seleccionada
+            org_filter["login"] = org
+        
+        if language:
+            repo_filter["$or"] = repo_filter.get("$or", [])
+            # Añadir filtro de lenguaje (puede ser string o objeto con .name)
+            lang_filter = {"$or": [
+                {"primary_language.name": language},
+                {"primary_language": language}
+            ]}
+            if repo_filter.get("$or"):
+                # Combinar con filtro de org usando $and
+                existing_or = repo_filter.pop("$or")
+                repo_filter["$and"] = [{"$or": existing_or}, lang_filter]
+            else:
+                repo_filter.update(lang_filter)
+        
+        # === KPIs: Conteos (filtrados si aplica) ===
+        total_repos = repos_collection.count_documents(repo_filter, maxTimeMS=10000) if repo_filter else repos_collection.count_documents({}, maxTimeMS=10000)
+        
+        # Para usuarios, si hay filtro de org o language, contar desde colaboradores de repos
+        if org or language:
+            # Contar usuarios únicos desde los colaboradores de los repos filtrados
+            users_pipeline = [
+                {"$match": repo_filter} if repo_filter else {"$match": {}},
+                {"$unwind": {"path": "$collaborators", "preserveNullAndEmptyArrays": False}},
+                {"$group": {"_id": "$collaborators.login"}},
+                {"$count": "total"}
+            ]
+            users_count_result = list(repos_collection.aggregate(users_pipeline, maxTimeMS=15000))
+            total_users = users_count_result[0]["total"] if users_count_result else 0
+        else:
+            total_users = users_collection.count_documents({}, maxTimeMS=10000)
+        
+        # Orgs: si hay filtro, contar solo las orgs relevantes
+        if org:
+            total_orgs = orgs_collection.count_documents(org_filter, maxTimeMS=10000)
+        elif language:
+            # Contar orgs únicas que tienen repos en ese lenguaje
+            orgs_pipeline = [
+                {"$match": repo_filter},
+                {"$group": {"_id": {"$ifNull": ["$owner.login", "$organization.login"]}}},
+                {"$match": {"_id": {"$ne": None}}},
+                {"$count": "total"}
+            ]
+            orgs_count_result = list(repos_collection.aggregate(orgs_pipeline, maxTimeMS=15000))
+            total_orgs = orgs_count_result[0]["total"] if orgs_count_result else 0
+        else:
+            total_orgs = orgs_collection.count_documents({}, maxTimeMS=10000)
+        
+        # === KPIs: Promedios (filtrados si aplica) ===
+        avg_stars_pipeline = []
+        if repo_filter:
+            avg_stars_pipeline.append({"$match": repo_filter})
+        avg_stars_pipeline.append({"$group": {"_id": None, "avgStars": {"$avg": "$stargazer_count"}}})
+        avg_stars_result = list(repos_collection.aggregate(avg_stars_pipeline))
+        avg_stars = round(avg_stars_result[0]["avgStars"], 2) if avg_stars_result else 0
+        
+        avg_expertise_pipeline = [
+            {"$match": {"quantum_expertise_score": {"$exists": True, "$ne": None}}},
+            {"$group": {"_id": None, "avgExpertise": {"$avg": "$quantum_expertise_score"}}}
+        ]
+        avg_expertise_result = list(users_collection.aggregate(avg_expertise_pipeline))
+        avg_expertise = round(avg_expertise_result[0]["avgExpertise"], 2) if avg_expertise_result else 0
+        
+        # === DISTRIBUCIÓN DE LENGUAJES (para el PieChart) ===
+        # IMPORTANTE: Solo filtrar por org, NO por language
+        # (filtrar lenguajes por lenguaje no tiene sentido - mostraría solo 1 al 100%)
+        lang_match = {"primary_language": {"$exists": True, "$ne": None}}
+        if org:
+            # Solo aplicar filtro de organización, no de lenguaje
+            lang_match["$or"] = [
+                {"owner.login": org},
+                {"organization.login": org}
+            ]
+        
+        language_pipeline = [
+            {"$match": lang_match},
+            {"$group": {
+                "_id": {"$ifNull": ["$primary_language.name", "$primary_language"]},
+                "count": {"$sum": 1}
+            }},
+            {"$sort": {"count": -1}},
+            {"$project": {"_id": 0, "name": "$_id", "value": "$count"}}
+        ]
+        language_distribution = list(repos_collection.aggregate(language_pipeline))
+        
+        # Top language para KPI
+        top_language = language_distribution[0]["name"] if language_distribution else "N/A"
         
         kpis = {
             "totalRepos": total_repos,
             "totalUsers": total_users,
-            "totalOrgs": total_orgs
+            "totalOrgs": total_orgs,
+            "avgStars": avg_stars,
+            "avgExpertise": avg_expertise,
+            "topLanguage": top_language
         }
         
-        # === TOP LENGUAJES: Agregación ===
-        # Agrupar repos por primary_language.name, contar y ordenar descendente
-        language_pipeline = [
-            # Filtrar repos que tengan lenguaje definido
-            {"$match": {"primary_language.name": {"$exists": True, "$ne": None}}},
-            # Agrupar por lenguaje
-            {"$group": {
-                "_id": "$primary_language.name",
-                "count": {"$sum": 1}
-            }},
-            # Ordenar por count descendente
-            {"$sort": {"count": -1}},
-            # Limitar a Top 5
-            {"$limit": 5},
-            # Renombrar _id a name
+        # === CHART: TOP 10 ORGANIZACIONES (por repos) ===
+        # Si hay filtro de lenguaje, calcular dinámicamente desde repos
+        # Si no, usar datos pre-calculados de la colección organizations
+        if language:
+            # Calcular repos por org filtrando por lenguaje
+            lang_filter_for_orgs = {"$or": [
+                {"primary_language.name": language},
+                {"primary_language": language}
+            ]}
+            
+            top_orgs_pipeline = [
+                {"$match": lang_filter_for_orgs},
+                {"$group": {
+                    "_id": {"$ifNull": ["$owner.login", "$organization.login"]},
+                    "quantum_repositories_count": {"$sum": 1},
+                    "total_stars": {"$sum": {"$ifNull": ["$stargazer_count", 0]}}
+                }},
+                {"$match": {"_id": {"$ne": None}}},
+                {"$sort": {"quantum_repositories_count": -1}},
+                {"$limit": 10},
+                {"$lookup": {
+                    "from": "organizations",
+                    "localField": "_id",
+                    "foreignField": "login",
+                    "as": "org_info"
+                }},
+                {"$project": {
+                    "_id": 0,
+                    "login": "$_id",
+                    "name": {"$arrayElemAt": ["$org_info.name", 0]},
+                    "avatar_url": {"$arrayElemAt": ["$org_info.avatar_url", 0]},
+                    "quantum_repositories_count": 1,
+                    "total_stars": 1,
+                    "quantum_focus_score": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_focus_score", 0]}, 0]}
+                }}
+            ]
+            chart_orgs = list(repos_collection.aggregate(top_orgs_pipeline))
+        else:
+            # Sin filtro de lenguaje: usar datos pre-calculados
+            top_orgs_pipeline = [
+                {"$project": {
+                    "_id": 0,
+                    "login": 1,
+                    "name": 1,
+                    "avatar_url": 1,
+                    "quantum_repositories_count": {"$ifNull": ["$quantum_repositories_count", 0]},
+                    "total_stars": {"$ifNull": ["$total_stars", 0]},
+                    "quantum_focus_score": {"$ifNull": ["$quantum_focus_score", 0]}
+                }},
+                {"$sort": {"quantum_repositories_count": -1}},
+                {"$limit": 10}
+            ]
+            chart_orgs = list(orgs_collection.aggregate(top_orgs_pipeline))
+        
+        # === CHART: TOP 10 REPOSITORIOS POR DIFERENTES MÉTRICAS ===
+        repo_base_projection = {
+            "_id": 0,
+            "id": 1,
+            "name": 1,
+            "full_name": 1,
+            "description": 1,
+            "stargazer_count": {"$ifNull": ["$stargazer_count", 0]},
+            "fork_count": {"$ifNull": ["$fork_count", 0]},
+            "collaborators_count": {"$ifNull": ["$collaborators_count", 0]},
+            "primary_language": 1,
+            "owner": 1
+        }
+        
+        # Crear pipeline base con filtro opcional
+        def make_repo_pipeline(sort_field, limit=10):
+            pipeline = []
+            if repo_filter:
+                pipeline.append({"$match": repo_filter})
+            pipeline.append({"$project": repo_base_projection})
+            pipeline.append({"$sort": {sort_field: -1}})
+            pipeline.append({"$limit": limit})
+            return pipeline
+        
+        # Top 10 por estrellas
+        chart_repos_stars = list(repos_collection.aggregate(make_repo_pipeline("stargazer_count")))
+        
+        # Top 10 por forks
+        chart_repos_forks = list(repos_collection.aggregate(make_repo_pipeline("fork_count")))
+        
+        # Top 10 por colaboradores
+        chart_repos_collabs = list(repos_collection.aggregate(make_repo_pipeline("collaborators_count")))
+        
+        # Helper para detectar si un login es un bot
+        def is_bot(login: str) -> bool:
+            if not login:
+                return False
+            login_lower = login.lower()
+            return (
+                "[bot]" in login_lower or
+                login_lower.endswith("-bot") or
+                login_lower.startswith("bot-") or
+                login_lower in ["dependabot", "renovate", "greenkeeper", "snyk-bot", "codecov", "sonarcloud"]
+            )
+        
+        # === CHART: TOP 10 USUARIOS (por contribuciones) ===
+        # Prioridad de filtros: repo > language > org > global
+        if repo:
+            # Filtro por repo específico: mostrar sus colaboradores directamente
+            repo_doc = repos_collection.find_one({"full_name": repo})
+            if repo_doc and repo_doc.get("collaborators"):
+                # Extraer colaboradores del repo
+                collaborators = repo_doc.get("collaborators", [])
+                
+                # Filtrar bots si no se incluyen
+                if not include_bots:
+                    collaborators = [c for c in collaborators if not is_bot(c.get("login", ""))]
+                
+                # Filtrar por tipo de colaborador si se especifica
+                if collab_type == "contributors":
+                    # Solo los que han hecho commits
+                    collaborators = [c for c in collaborators if c.get("has_commits", False)]
+                elif collab_type == "reviewers":
+                    # Solo los que son mencionables pero NO han hecho commits (triage/reviewers)
+                    collaborators = [c for c in collaborators if c.get("is_mentionable", False) and not c.get("has_commits", False)]
+                # collab_type == "all" o None -> no filtrar
+                
+                # Enriquecer con info de users
+                chart_users = []
+                for collab in sorted(collaborators, key=lambda x: x.get("contributions", 0), reverse=True)[:10]:
+                    user_info = users_collection.find_one({"login": collab.get("login")})
+                    chart_users.append({
+                        "login": collab.get("login"),
+                        "name": user_info.get("name") if user_info else None,
+                        "avatar_url": collab.get("avatar_url") or (user_info.get("avatar_url") if user_info else None),
+                        "relevant_repos_count": 1,
+                        "total_contributions": collab.get("contributions", 0),
+                        "has_commits": collab.get("has_commits", False),
+                        "is_mentionable": collab.get("is_mentionable", False),
+                        "total_commit_contributions": user_info.get("total_commit_contributions", 0) if user_info else 0,
+                        "total_pr_contributions": user_info.get("total_pr_contributions", 0) if user_info else 0,
+                        "total_pr_review_contributions": user_info.get("total_pr_review_contributions", 0) if user_info else 0,
+                        "total_issue_contributions": user_info.get("total_issue_contributions", 0) if user_info else 0,
+                        "organizations": user_info.get("organizations", []) if user_info else []
+                    })
+            else:
+                chart_users = []
+        elif language:
+            # Filtrar repos por lenguaje y extraer colaboradores
+            lang_filter_for_users = {"$or": [
+                {"primary_language.name": language},
+                {"primary_language": language}
+            ]}
+            
+            # Agregar filtro de org si también está activo
+            if org:
+                lang_filter_for_users["$and"] = [
+                    {"$or": lang_filter_for_users.pop("$or")},
+                    {"$or": [{"owner.login": org}, {"organization.login": org}]}
+                ]
+            
+            # Pipeline: repos -> unwind collaborators -> group by user -> lookup user info
+            top_users_pipeline = [
+                {"$match": lang_filter_for_users},
+                {"$match": {"collaborators": {"$exists": True, "$ne": []}}},
+                {"$unwind": "$collaborators"},
+            ]
+            
+            # Filtrar bots si no se incluyen
+            if not include_bots:
+                top_users_pipeline.append({"$match": {
+                    "collaborators.login": {
+                        "$not": {"$regex": "\\[bot\\]|^bot-|-bot$", "$options": "i"}
+                    }
+                }})
+            
+            # Filtrar por tipo de colaborador si se especifica
+            if collab_type == "contributors":
+                # Solo los que han hecho commits
+                top_users_pipeline.append({"$match": {"collaborators.has_commits": True}})
+            elif collab_type == "reviewers":
+                # Solo los mencionables que NO han hecho commits
+                top_users_pipeline.append({"$match": {
+                    "collaborators.is_mentionable": True,
+                    "$or": [
+                        {"collaborators.has_commits": False},
+                        {"collaborators.has_commits": {"$exists": False}}
+                    ]
+                }})
+            
+            # Continuar con agrupación y proyección
+            top_users_pipeline.extend([
+                {"$group": {
+                    "_id": "$collaborators.login",
+                    "repos_in_language": {"$sum": 1},
+                    "total_contributions": {"$sum": {"$ifNull": ["$collaborators.contributions", 0]}},
+                    "has_commits": {"$max": {"$ifNull": ["$collaborators.has_commits", False]}},
+                    "is_mentionable": {"$max": {"$ifNull": ["$collaborators.is_mentionable", False]}}
+                }},
+                {"$match": {"_id": {"$ne": None}}},
+                {"$sort": {"total_contributions": -1, "repos_in_language": -1}},
+                {"$limit": 10},
+                {"$lookup": {
+                    "from": "users",
+                    "localField": "_id",
+                    "foreignField": "login",
+                    "as": "user_info"
+                }},
+                {"$project": {
+                    "_id": 0,
+                    "login": "$_id",
+                    "name": {"$arrayElemAt": ["$user_info.name", 0]},
+                    "avatar_url": {"$arrayElemAt": ["$user_info.avatar_url", 0]},
+                    "relevant_repos_count": "$repos_in_language",
+                    "total_contributions": 1,
+                    "has_commits": 1,
+                    "is_mentionable": 1,
+                    "total_commit_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_commit_contributions", 0]}, 0]},
+                    "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
+                    "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
+                    "total_issue_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_issue_contributions", 0]}, 0]},
+                    "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]}
+                }}
+            ])
+            chart_users = list(repos_collection.aggregate(top_users_pipeline))
+        else:
+            # Sin filtro de lenguaje ni repo
+            # Si hay collab_type o filtro de bots, necesitamos agregar desde repos
+            if (collab_type and collab_type != "all") or not include_bots:
+                # Pipeline desde repos para filtrar por tipo de colaborador
+                base_match = {"collaborators": {"$exists": True, "$ne": []}}
+                if org:
+                    base_match["$or"] = [{"owner.login": org}, {"organization.login": org}]
+                
+                top_users_pipeline = [
+                    {"$match": base_match},
+                    {"$unwind": "$collaborators"},
+                ]
+                
+                # Filtrar bots si no se incluyen
+                if not include_bots:
+                    top_users_pipeline.append({"$match": {
+                        "collaborators.login": {
+                            "$not": {"$regex": "\\[bot\\]|^bot-|-bot$", "$options": "i"}
+                        }
+                    }})
+                
+                # Filtrar por tipo de colaborador
+                if collab_type == "contributors":
+                    top_users_pipeline.append({"$match": {"collaborators.has_commits": True}})
+                elif collab_type == "reviewers":
+                    top_users_pipeline.append({"$match": {
+                        "collaborators.is_mentionable": True,
+                        "$or": [
+                            {"collaborators.has_commits": False},
+                            {"collaborators.has_commits": {"$exists": False}}
+                        ]
+                    }})
+                
+                top_users_pipeline.extend([
+                    {"$group": {
+                        "_id": "$collaborators.login",
+                        "repos_count": {"$sum": 1},
+                        "total_contributions": {"$sum": {"$ifNull": ["$collaborators.contributions", 0]}},
+                        "has_commits": {"$max": {"$ifNull": ["$collaborators.has_commits", False]}},
+                        "is_mentionable": {"$max": {"$ifNull": ["$collaborators.is_mentionable", False]}}
+                    }},
+                    {"$match": {"_id": {"$ne": None}}},
+                    {"$sort": {"total_contributions": -1, "repos_count": -1}},
+                    {"$limit": 10},
+                    {"$lookup": {
+                        "from": "users",
+                        "localField": "_id",
+                        "foreignField": "login",
+                        "as": "user_info"
+                    }},
+                    {"$project": {
+                        "_id": 0,
+                        "login": "$_id",
+                        "name": {"$arrayElemAt": ["$user_info.name", 0]},
+                        "avatar_url": {"$arrayElemAt": ["$user_info.avatar_url", 0]},
+                        "relevant_repos_count": "$repos_count",
+                        "total_contributions": 1,
+                        "has_commits": 1,
+                        "is_mentionable": 1,
+                        "total_commit_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_commit_contributions", 0]}, 0]},
+                        "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
+                        "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
+                        "total_issue_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_issue_contributions", 0]}, 0]},
+                        "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]}
+                    }}
+                ])
+                chart_users = list(repos_collection.aggregate(top_users_pipeline))
+            else:
+                # Sin collab_type: usar datos pre-calculados de users collection
+                user_match = {"relevant_repos_count": {"$gt": 0}}
+                if user_filter:
+                    user_match.update(user_filter)
+                
+                top_users_pipeline = [
+                    {"$match": user_match},
+                    {"$project": {
+                        "_id": 0,
+                        "id": 1,
+                        "login": 1,
+                        "name": 1,
+                        "avatar_url": 1,
+                        "relevant_repos_count": {"$ifNull": ["$relevant_repos_count", 0]},
+                        "total_commit_contributions": {"$ifNull": ["$total_commit_contributions", 0]},
+                        "total_pr_contributions": {"$ifNull": ["$total_pr_contributions", 0]},
+                        "total_pr_review_contributions": {"$ifNull": ["$total_pr_review_contributions", 0]},
+                        "total_issue_contributions": {"$ifNull": ["$total_issue_contributions", 0]},
+                        "total_contributions": {
+                            "$add": [
+                                {"$ifNull": ["$total_commit_contributions", 0]},
+                                {"$ifNull": ["$total_pr_contributions", 0]},
+                                {"$ifNull": ["$total_pr_review_contributions", 0]},
+                                {"$ifNull": ["$total_issue_contributions", 0]}
+                            ]
+                        },
+                        "organizations": 1
+                    }},
+                    {"$sort": {"total_contributions": -1, "relevant_repos_count": -1}},
+                    {"$limit": 10}
+                ]
+                chart_users = list(users_collection.aggregate(top_users_pipeline))
+        
+        # === GRAFO: Nodos y enlaces pre-calculados ===
+        # Top 15 orgs para el grafo
+        graph_orgs_pipeline = [
             {"$project": {
                 "_id": 0,
-                "name": "$_id",
-                "count": 1
-            }}
-        ]
-        
-        top_languages_cursor = repos_collection.aggregate(language_pipeline)
-        top_languages_raw = list(top_languages_cursor)
-        
-        # Calcular porcentajes
-        total_repos_with_lang = sum(item["count"] for item in top_languages_raw)
-        top_languages = [
-            {
-                "name": item["name"],
-                "count": item["count"],
-                "percentage": round((item["count"] / total_repos_with_lang * 100), 2) if total_repos_with_lang > 0 else 0
-            }
-            for item in top_languages_raw
-        ]
-        
-        # === TOP ORGANIZACIONES: Agregación ===
-        # Agrupar repos por owner.login, contar y sumar stars
-        org_pipeline = [
-            # Filtrar repos que tengan owner definido
-            {"$match": {"owner.login": {"$exists": True, "$ne": None}}},
-            # Agrupar por organización
-            {"$group": {
-                "_id": "$owner.login",
-                "repoCount": {"$sum": 1},
-                "totalStars": {"$sum": "$stargazer_count"}
+                "id": 1,
+                "login": 1,
+                "name": 1,
+                "avatar_url": 1,
+                "quantum_focus_score": {"$ifNull": ["$quantum_focus_score", 0]}
             }},
-            # Ordenar por repoCount descendente
-            {"$sort": {"repoCount": -1}},
-            # Limitar a Top 5
-            {"$limit": 5},
-            # Renombrar campos
+            {"$sort": {"quantum_focus_score": -1}},
+            {"$limit": 15}
+        ]
+        graph_orgs = list(orgs_collection.aggregate(graph_orgs_pipeline))
+        
+        # Top 25 repos para el grafo (con owner para enlaces)
+        graph_repos_pipeline = [
             {"$project": {
                 "_id": 0,
-                "name": "$_id",
-                "repoCount": 1,
-                "totalStars": 1
-            }}
+                "id": 1,
+                "name": 1,
+                "full_name": 1,
+                "stargazer_count": {"$ifNull": ["$stargazer_count", 0]},
+                "owner": 1,
+                "collaborators": {"$slice": [{"$ifNull": ["$collaborators", []]}, 10]}  # Max 10 collaborators
+            }},
+            {"$sort": {"stargazer_count": -1}},
+            {"$limit": 25}
         ]
+        graph_repos = list(repos_collection.aggregate(graph_repos_pipeline))
         
-        top_orgs_cursor = repos_collection.aggregate(org_pipeline)
-        top_organizations = list(top_orgs_cursor)
+        # Top 40 users para el grafo (con organizations para enlaces)
+        graph_users_pipeline = [
+            {"$match": {"quantum_expertise_score": {"$exists": True}}},
+            {"$project": {
+                "_id": 0,
+                "id": 1,
+                "login": 1,
+                "name": 1,
+                "avatar_url": 1,
+                "quantum_expertise_score": {"$ifNull": ["$quantum_expertise_score", 0]},
+                "organizations": {"$slice": [{"$ifNull": ["$organizations", []]}, 5]},  # Max 5 orgs
+                "company": 1
+            }},
+            {"$sort": {"quantum_expertise_score": -1}},
+            {"$limit": 40}
+        ]
+        graph_users = list(users_collection.aggregate(graph_users_pipeline))
         
-        # 3. PREPARAR RESPUESTA
+        # === TABLAS: Top 20 para detalle ===
+        table_repos_pipeline = [
+            {"$project": {
+                "_id": 0,
+                "id": 1,
+                "name": 1,
+                "full_name": 1,
+                "description": 1,
+                "stargazer_count": {"$ifNull": ["$stargazer_count", 0]},
+                "fork_count": {"$ifNull": ["$fork_count", 0]},
+                "primary_language": 1,
+                "owner": 1,
+                "url": 1
+            }},
+            {"$sort": {"stargazer_count": -1}},
+            {"$limit": 20}
+        ]
+        table_repos = list(repos_collection.aggregate(table_repos_pipeline))
+        
+        table_users_pipeline = [
+            {"$match": {"quantum_expertise_score": {"$exists": True}}},
+            {"$project": {
+                "_id": 0,
+                "id": 1,
+                "login": 1,
+                "name": 1,
+                "avatar_url": 1,
+                "quantum_expertise_score": {"$ifNull": ["$quantum_expertise_score", 0]},
+                "followers_count": {"$ifNull": ["$followers_count", 0]},
+                "relevant_repos_count": {"$ifNull": ["$relevant_repos_count", 0]},
+                "organizations": {"$slice": [{"$ifNull": ["$organizations", []]}, 5]},
+                "url": 1
+            }},
+            {"$sort": {"quantum_expertise_score": -1}},
+            {"$limit": 20}
+        ]
+        table_users = list(users_collection.aggregate(table_users_pipeline))
+        
+        # === LISTAS PARA FILTROS ===
+        # Lista de todas las orgs (solo login y name para dropdown)
+        filter_orgs_pipeline = [
+            {"$project": {"_id": 0, "login": 1, "name": 1}},
+            {"$sort": {"login": 1}}
+        ]
+        filter_orgs = list(orgs_collection.aggregate(filter_orgs_pipeline))
+        
+        # Lista de todos los lenguajes únicos
+        filter_languages = [lang["name"] for lang in language_distribution]
+        
+        # 3. PREPARAR RESPUESTA COMPLETA
         response_data = {
             "kpis": kpis,
-            "topLanguages": top_languages,
-            "topOrganizations": top_organizations,
+            "charts": {
+                "organizations": chart_orgs,
+                "repositories": {
+                    "byStars": chart_repos_stars,
+                    "byForks": chart_repos_forks,
+                    "byCollaborators": chart_repos_collabs
+                },
+                "users": chart_users,
+                "languageDistribution": language_distribution
+            },
+            "graph": {
+                "organizations": graph_orgs,
+                "repositories": graph_repos,
+                "users": graph_users
+            },
+            "tables": {
+                "repositories": table_repos,
+                "users": table_users
+            },
+            "filters": {
+                "organizations": filter_orgs,
+                "languages": filter_languages
+            },
             "metadata": {
                 "cached": False,
                 "calculatedAt": current_time.isoformat(),
                 "expiresAt": (current_time + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
-                "ageHours": 0
+                "ageHours": 0,
+                "activeFilters": {
+                    "org": org,
+                    "language": language,
+                    "repo": repo,
+                    "collab_type": collab_type,
+                    "include_bots": include_bots
+                } if has_filters else None
             }
         }
         
-        # 4. GUARDAR EN CACHÉ (Upsert)
-        cache_document = {
-            "type": "dashboard_stats",
-            "data": response_data,
-            "updated_at": current_time
-        }
-        
-        metrics_collection.update_one(
-            {"type": "dashboard_stats"},
-            {"$set": cache_document},
-            upsert=True
-        )
-        
-        logger.info(f"✅ Dashboard stats calculado y guardado en caché (válido por {CACHE_TTL_HOURS}h)")
+        # 4. GUARDAR EN CACHÉ (Upsert) - SOLO si no hay filtros activos
+        if not has_filters:
+            cache_document = {
+                "type": "dashboard_stats",
+                "data": response_data,
+                "updated_at": current_time
+            }
+            
+            metrics_collection.update_one(
+                {"type": "dashboard_stats"},
+                {"$set": cache_document},
+                upsert=True
+            )
+            
+            logger.info(f"✅ Dashboard stats COMPLETO calculado y guardado en caché (válido por {CACHE_TTL_HOURS}h)")
+        else:
+            logger.info(f"✅ Dashboard stats CON FILTROS calculado (no cacheado)")
         
         return response_data
         
@@ -247,6 +762,20 @@ async def get_dashboard_stats():
         error_msg = f"Error al obtener dashboard stats: {str(e)}"
         logger.error(error_msg, exc_info=True)
         raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.post("/dashboard/refresh-metrics")
+async def refresh_dashboard_metrics():
+    """
+    Fuerza el recálculo de métricas del dashboard.
+    Útil después de ingestas/enriquecimientos.
+    """
+    try:
+        # Llamar al endpoint de stats con force_refresh
+        return await get_dashboard_stats(force_refresh=True)
+    except Exception as e:
+        logger.error(f"Error al refrescar métricas: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/rate-limit")
@@ -363,7 +892,7 @@ async def search_repos(
 @router.get("/repositories")
 async def list_repositories(
     skip: int = Query(default=0, ge=0, description="Número de documentos a saltar"),
-    limit: int = Query(default=50, ge=1, le=1000, description="Límite de resultados"),
+    limit: int = Query(default=0, ge=0, description="Límite de resultados (0 = sin límite)"),
     language: Optional[str] = Query(None, description="Filtrar por lenguaje"),
     min_stars: Optional[int] = Query(None, ge=0, description="Estrellas mínimas")
 ):
@@ -382,7 +911,10 @@ async def list_repositories(
         
         # Obtener repositorios
         repo_collection = db.get_collection("repositories")
-        repositories = list(repo_collection.find(filter_query).skip(skip).limit(limit))
+        cursor = repo_collection.find(filter_query).skip(skip)
+        if limit > 0:
+            cursor = cursor.limit(limit)
+        repositories = list(cursor)
         
         # Convertir ObjectId a string
         for repo in repositories:
@@ -419,7 +951,7 @@ async def get_repository_by_id(repo_id: str):
 @router.get("/users")
 async def list_users(
     skip: int = Query(default=0, ge=0, description="Número de documentos a saltar"),
-    limit: int = Query(default=50, ge=1, le=1000, description="Límite de resultados")
+    limit: int = Query(default=0, ge=0, description="Límite de resultados (0 = sin límite)")
 ):
     """
     Lista usuarios desde la base de datos con paginación.
@@ -428,7 +960,10 @@ async def list_users(
         from ..core.db import db
         
         user_collection = db.get_collection("users")
-        users = list(user_collection.find({}).skip(skip).limit(limit))
+        cursor = user_collection.find({}).skip(skip)
+        if limit > 0:
+            cursor = cursor.limit(limit)
+        users = list(cursor)
         
         # Convertir ObjectId a string
         for user in users:
@@ -465,7 +1000,7 @@ async def get_user_by_id(user_id: str):
 @router.get("/organizations")
 async def list_organizations(
     skip: int = Query(default=0, ge=0, description="Número de documentos a saltar"),
-    limit: int = Query(default=50, ge=1, le=1000, description="Límite de resultados")
+    limit: int = Query(default=0, ge=0, description="Límite de resultados (0 = sin límite)")
 ):
     """
     Lista organizaciones desde la base de datos con paginación.
@@ -474,7 +1009,10 @@ async def list_organizations(
         from ..core.db import db
         
         org_collection = db.get_collection("organizations")
-        organizations = list(org_collection.find({}).skip(skip).limit(limit))
+        cursor = org_collection.find({}).skip(skip)
+        if limit > 0:
+            cursor = cursor.limit(limit)
+        organizations = list(cursor)
         
         # Convertir ObjectId a string
         for org in organizations:
