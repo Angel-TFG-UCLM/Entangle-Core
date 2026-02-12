@@ -778,6 +778,789 @@ async def refresh_dashboard_metrics():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================================
+# COLLABORATION DISCOVERY - Auto-detección de colaboración real
+# ============================================================================
+
+@router.get("/collaboration/discover")
+async def discover_collaboration(force: bool = False):
+    """
+    Auto-descubre patrones de colaboración analizando TODA la base de datos.
+    Usa caché en MongoDB (colección 'metrics', doc 'collaboration_graph')
+    para servir resultados instantáneamente. Pasar ?force=true recalcula.
+    
+    Busca automáticamente:
+    1. Bridge Users: Usuarios que contribuyen a 2+ repositorios
+    2. Repos conectados: Repositorios que comparten colaboradores
+    3. Colaboración cross-org: Usuarios que participan en múltiples organizaciones
+    
+    Returns:
+        - available: bool - Si hay colaboración detectable
+        - summary: Resumen textual de lo descubierto
+        - graph: Grafo completo con nodos y enlaces reales
+        - metrics: Estadísticas de colaboración
+        - bridge_users: Top usuarios puente
+        - connected_pairs: Pares de repos/orgs más conectados
+    """
+    try:
+        from ..core.db import db
+        
+        db.ensure_connection()
+        
+        # ── CACHÉ: intentar servir desde metrics ──
+        if not force:
+            metrics_collection = db.get_collection("metrics")
+            cached = metrics_collection.find_one({"_id": "collaboration_graph"})
+            if cached:
+                cached.pop("_id", None)
+                cached.pop("cached_at", None)
+                logger.info(f"[DISCOVER] Sirviendo grafo desde caché MongoDB ({cached.get('metrics', {}).get('graph_nodes', '?')} nodos)")
+                return cached
+        
+        repos_collection = db.get_collection("repositories")
+        users_collection = db.get_collection("users")
+        orgs_collection = db.get_collection("organizations")
+        
+        # ============================================================
+        # PASO 1: Mapear todos los repos y sus colaboradores
+        # ============================================================
+        
+        # Helper para detectar bots por login
+        def _is_bot_login(login: str) -> bool:
+            if not login:
+                return False
+            ll = login.lower()
+            return (
+                "[bot]" in ll or
+                ll.endswith("-bot") or
+                ll.startswith("bot-") or
+                ll in ["dependabot", "renovate", "greenkeeper", "snyk-bot", "codecov", "sonarcloud"]
+            )
+        
+        all_repos = list(repos_collection.find(
+            {"collaborators": {"$exists": True, "$ne": []}},
+            {"_id": 0, "name": 1, "full_name": 1, "owner": 1, "stargazer_count": 1,
+             "primary_language": 1, "collaborators": 1, "organization": 1}
+        ))
+        
+        # Mapa: user_login → [repos donde contribuye]
+        user_to_repos = {}
+        # Mapa: repo_full_name → set(user_logins)
+        repo_to_users = {}
+        
+        for repo in all_repos:
+            full_name = repo.get("full_name")
+            if not full_name:
+                continue
+            
+            collabs = set()
+            for c in repo.get("collaborators", []):
+                login = c.get("login")
+                if login:
+                    collabs.add(login)
+                    if login not in user_to_repos:
+                        user_to_repos[login] = []
+                    user_to_repos[login].append({
+                        "full_name": full_name,
+                        "name": repo.get("name"),
+                        "stars": repo.get("stargazer_count", 0),
+                        "owner": repo.get("owner", {}).get("login", ""),
+                        "language": repo.get("primary_language", {}).get("name") if isinstance(repo.get("primary_language"), dict) else repo.get("primary_language")
+                    })
+            
+            repo_to_users[full_name] = collabs
+        
+        # ============================================================
+        # PASO 2: Identificar Bridge Users (usuarios en 2+ repos)
+        # ============================================================
+        bridge_users = {}
+        for login, repos_list in user_to_repos.items():
+            if len(repos_list) >= 2:
+                bridge_users[login] = repos_list
+        
+        # ============================================================
+        # PASO 3: Encontrar pares de repos conectados (via índice invertido)
+        # ============================================================
+        # En vez de O(N²) comparando todos los pares de repos,
+        # iteramos los bridge users y generamos pares desde sus repos
+        pair_shared = {}  # (repo_a, repo_b) → set(shared_users)
+        for login, repos_list in bridge_users.items():
+            repo_fns = [r["full_name"] for r in repos_list]
+            for i in range(len(repo_fns)):
+                for j in range(i + 1, len(repo_fns)):
+                    a, b = min(repo_fns[i], repo_fns[j]), max(repo_fns[i], repo_fns[j])
+                    key = (a, b)
+                    if key not in pair_shared:
+                        pair_shared[key] = set()
+                    pair_shared[key].add(login)
+        
+        connected_repo_pairs = [
+            {"repo_a": k[0], "repo_b": k[1], "shared_users": list(v), "shared_count": len(v)}
+            for k, v in pair_shared.items()
+        ]
+        connected_repo_pairs.sort(key=lambda x: x["shared_count"], reverse=True)
+        
+        # ============================================================
+        # PASO 4: Colaboración cross-org
+        # ============================================================
+        # Mapear usuarios a sus organizaciones
+        user_to_orgs = {}
+        all_org_logins = set()
+        
+        # Desde la colección de users
+        all_users_cursor = users_collection.find(
+            {"organizations": {"$exists": True, "$ne": []}},
+            {"_id": 0, "login": 1, "organizations": 1}
+        )
+        
+        for user_doc in all_users_cursor:
+            login = user_doc.get("login")
+            if not login:
+                continue
+            user_orgs = []
+            for org in (user_doc.get("organizations") or []):
+                org_login = org.get("login") if isinstance(org, dict) else org
+                if org_login:
+                    user_orgs.append(org_login)
+                    all_org_logins.add(org_login)
+            if len(user_orgs) >= 2:
+                user_to_orgs[login] = user_orgs
+        
+        # También desde repos: usuario contribuye a repos de distintas orgs
+        user_repo_orgs = {}
+        for login in bridge_users:
+            repo_orgs = set()
+            for r in bridge_users[login]:
+                owner = r.get("owner")
+                if owner:
+                    repo_orgs.add(owner)
+            if len(repo_orgs) >= 2:
+                user_repo_orgs[login] = list(repo_orgs)
+        
+        # Combinar cross-org users
+        cross_org_users = set(user_to_orgs.keys()) | set(user_repo_orgs.keys())
+        
+        # ============================================================
+        # PASO 5: Determinar si hay colaboración disponible
+        # ============================================================
+        has_collaboration = len(bridge_users) > 0 or len(connected_repo_pairs) > 0
+        
+        if not has_collaboration:
+            return {
+                "available": False,
+                "summary": "No se detectaron patrones de colaboración entre los datos actuales.",
+                "graph": {"nodes": [], "links": []},
+                "metrics": {
+                    "total_repos": len(all_repos),
+                    "total_users": len(user_to_repos),
+                    "bridge_users": 0,
+                    "connected_repo_pairs": 0,
+                    "cross_org_users": 0
+                },
+                "bridge_users": [],
+                "connected_pairs": []
+            }
+        
+        # ============================================================
+        # PASO 6: Construir grafo de colaboración
+        # ============================================================
+        nodes = []
+        links = []
+        added_nodes = set()
+        
+        # 6a) Filtrar bots ANTES de rankear bridge users
+        human_bridge_users = {
+            login: repos_list for login, repos_list in bridge_users.items()
+            if not _is_bot_login(login)
+        }
+        bot_bridge_users = {
+            login: repos_list for login, repos_list in bridge_users.items()
+            if _is_bot_login(login)
+        }
+        
+        # 6b) Ordenar bridge users humanos por número de repos (más conectados primero)
+        sorted_bridge = sorted(human_bridge_users.items(), key=lambda x: len(x[1]), reverse=True)
+        
+        # Tomar TODOS los bridge users humanos (sin límite artificial)
+        top_bridge_users = sorted_bridge
+        
+        # 6c) Recopilar repos conectados por bridge users
+        connected_repos = set()
+        for login, repos_list in top_bridge_users:
+            for r in repos_list:
+                connected_repos.add(r["full_name"])
+        
+        # 6d) Añadir nodos de repos
+        for repo in all_repos:
+            full_name = repo.get("full_name")
+            if full_name in connected_repos:
+                node_id = f"repo_{full_name}"
+                if node_id not in added_nodes:
+                    org_login = repo.get("owner", {}).get("login", "")
+                    nodes.append({
+                        "id": node_id,
+                        "type": "repo",
+                        "name": repo.get("name"),
+                        "full_name": full_name,
+                        "stars": repo.get("stargazer_count", 0),
+                        "language": repo.get("primary_language", {}).get("name") if isinstance(repo.get("primary_language"), dict) else None,
+                        "org": org_login
+                    })
+                    added_nodes.add(node_id)
+        
+        # 6e) Bulk fetch de datos de usuarios bridge
+        all_user_logins_needed = set()
+        for login, _ in top_bridge_users:
+            all_user_logins_needed.add(login)
+        
+        user_info_cache = {}
+        if all_user_logins_needed:
+            cursor = users_collection.find(
+                {"login": {"$in": list(all_user_logins_needed)}},
+                {"_id": 0, "login": 1, "name": 1, "avatar_url": 1, "quantum_expertise_score": 1, "is_bot": 1}
+            )
+            for doc in cursor:
+                user_info_cache[doc["login"]] = doc
+        
+        def _make_user_node(login, repos_list, is_bridge):
+            user_info = user_info_cache.get(login)
+            user_is_bot = False
+            if user_info and "is_bot" in user_info:
+                user_is_bot = bool(user_info["is_bot"])
+            else:
+                user_is_bot = _is_bot_login(login)
+            return {
+                "id": f"user_{login}",
+                "type": "user",
+                "login": login,
+                "name": (user_info.get("name") if user_info else None) or login,
+                "avatar_url": user_info.get("avatar_url") if user_info else None,
+                "repos_count": len(repos_list) if repos_list else 1,
+                "isBridge": is_bridge,
+                "isBot": user_is_bot,
+                "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0
+            }
+        
+        # 6f) Añadir nodos de bridge users + links a sus repos
+        enriched_bridge_list = []
+        for login, repos_list in top_bridge_users:
+            user_id = f"user_{login}"
+            user_node = _make_user_node(login, repos_list, True)
+            
+            if user_id not in added_nodes:
+                nodes.append(user_node)
+                added_nodes.add(user_id)
+            
+            # Links usuario → repos
+            for r in repos_list:
+                repo_node_id = f"repo_{r['full_name']}"
+                if repo_node_id in added_nodes:
+                    links.append({
+                        "source": user_id,
+                        "target": repo_node_id,
+                        "type": "contributed_to"
+                    })
+            
+            enriched_bridge_list.append({
+                "login": login,
+                "name": user_node["name"],
+                "avatar_url": user_node.get("avatar_url"),
+                "quantum_expertise_score": user_node.get("quantum_expertise_score", 0),
+                "repos": [r["full_name"] for r in repos_list],
+                "repos_count": len(repos_list),
+                "cross_org": login in cross_org_users
+            })
+        
+        # 6g) Añadir nodos de organizaciones (las que contienen repos conectados)
+        org_logins_in_graph = set()
+        for repo in all_repos:
+            full_name = repo.get("full_name")
+            if full_name in connected_repos:
+                org_login = repo.get("owner", {}).get("login", "")
+                if org_login and org_login not in org_logins_in_graph:
+                    org_logins_in_graph.add(org_login)
+        
+        for org_login in org_logins_in_graph:
+            org_id = f"org_{org_login}"
+            if org_id not in added_nodes:
+                org_doc = orgs_collection.find_one(
+                    {"login": org_login},
+                    {"_id": 0, "name": 1, "avatar_url": 1}
+                )
+                nodes.append({
+                    "id": org_id,
+                    "type": "org",
+                    "login": org_login,
+                    "name": (org_doc.get("name") if org_doc else None) or org_login,
+                    "avatar_url": org_doc.get("avatar_url") if org_doc else None,
+                })
+                added_nodes.add(org_id)
+                
+                # Links org → sus repos
+                for repo in all_repos:
+                    if repo.get("owner", {}).get("login") == org_login:
+                        repo_id = f"repo_{repo.get('full_name')}"
+                        if repo_id in added_nodes:
+                            links.append({
+                                "source": org_id,
+                                "target": repo_id,
+                                "type": "owns"
+                            })
+        
+        # ============================================================
+        # PASO 7: Construir resumen textual
+        # ============================================================
+        summary_parts = []
+        if len(bridge_users) > 0:
+            summary_parts.append(f"{len(bridge_users)} usuarios puente entre {len(connected_repos)} repositorios")
+        if len(connected_repo_pairs) > 0:
+            summary_parts.append(f"{len(connected_repo_pairs)} pares de repos conectados")
+        if len(cross_org_users) > 0:
+            summary_parts.append(f"{len(cross_org_users)} usuarios cross-org")
+        
+        summary = " · ".join(summary_parts)
+        
+        # Density: ratio of actual links to possible links
+        max_possible_links = len(nodes) * (len(nodes) - 1) / 2 if len(nodes) > 1 else 1
+        density = round(len(links) / max(max_possible_links, 1) * 100, 2)
+        
+        # Contar nodos por tipo para métricas
+        user_nodes_in_graph = [n for n in nodes if n["type"] == "user"]
+        bridge_nodes_in_graph = [n for n in user_nodes_in_graph if n.get("isBridge")]
+        
+        result = {
+            "available": True,
+            "summary": summary,
+            "graph": {"nodes": nodes, "links": links},
+            "metrics": {
+                "total_repos_analyzed": len(all_repos),
+                "total_users_mapped": len(user_to_repos),
+                "bridge_users_count": len(bridge_nodes_in_graph),
+                "total_bridge_users_found": len(human_bridge_users),
+                "connected_repo_pairs": len(connected_repo_pairs),
+                "cross_org_users": len(cross_org_users),
+                "graph_nodes": len(nodes),
+                "graph_links": len(links),
+                "collaboration_density": density
+            },
+            "bridge_users": enriched_bridge_list,
+            "connected_pairs": connected_repo_pairs[:20]
+        }
+        
+        # ── GUARDAR EN CACHÉ MongoDB ──
+        try:
+            from datetime import datetime, timezone
+            metrics_collection = db.get_collection("metrics")
+            cache_doc = {**result, "_id": "collaboration_graph", "cached_at": datetime.now(timezone.utc).isoformat()}
+            metrics_collection.replace_one({"_id": "collaboration_graph"}, cache_doc, upsert=True)
+            logger.info(f"[DISCOVER] Grafo guardado en caché MongoDB ({len(nodes)} nodos, {len(links)} links)")
+        except Exception as cache_err:
+            logger.warning(f"[DISCOVER] No se pudo cachear el grafo: {cache_err}")
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Error en descubrimiento de colaboración: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.post("/collaboration/discover/invalidate")
+async def invalidate_collaboration_cache():
+    """Invalida la caché del grafo de colaboración. Útil tras una ingesta de datos."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        metrics_collection = db.get_collection("metrics")
+        result = metrics_collection.delete_one({"_id": "collaboration_graph"})
+        deleted = result.deleted_count > 0
+        logger.info(f"[DISCOVER] Caché invalidada: {'eliminada' if deleted else 'no existía'}")
+        return {"invalidated": deleted, "message": "Caché del grafo eliminada" if deleted else "No había caché"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/collaboration/analyze")
+async def analyze_collaboration(
+    repos: Optional[list] = Query(default=None, description="Lista de repositorios (full_name) a analizar"),
+    orgs: Optional[list] = Query(default=None, description="Lista de organizaciones (login) a analizar"),
+    user: Optional[str] = Query(default=None, description="Usuario específico para ver sus colaboraciones")
+):
+    """
+    Análisis de colaboración entre repos/orgs/usuarios.
+    
+    Modos de operación:
+    1. repos=[repo1, repo2...]: Encuentra usuarios compartidos entre repos
+    2. orgs=[org1, org2...]: Encuentra usuarios compartidos entre orgs
+    3. user=login: Muestra con quién ha colaborado y en qué repos/orgs
+    
+    Returns:
+        - shared_users: Usuarios que aparecen en múltiples selecciones
+        - collaboration_graph: Nodos y enlaces para visualización
+        - metrics: Estadísticas de colaboración
+    """
+    try:
+        from ..core.db import db
+        
+        db.ensure_connection()
+        repos_collection = db.get_collection("repositories")
+        users_collection = db.get_collection("users")
+        orgs_collection = db.get_collection("organizations")
+        
+        result = {
+            "mode": None,
+            "selections": [],
+            "shared_users": [],
+            "collaboration_graph": {"nodes": [], "links": []},
+            "metrics": {}
+        }
+        
+        # ============================================================
+        # MODO 1: Análisis de colaboración de un USUARIO específico
+        # ============================================================
+        if user:
+            result["mode"] = "user_focus"
+            result["selections"] = [user]
+            
+            # Buscar el usuario
+            user_doc = users_collection.find_one({"login": user})
+            if not user_doc:
+                raise HTTPException(status_code=404, detail=f"Usuario {user} no encontrado")
+            
+            # Obtener todos los repos donde este usuario es colaborador
+            user_repos = list(repos_collection.find(
+                {"collaborators.login": user},
+                {"_id": 1, "name": 1, "full_name": 1, "owner": 1, "stargazer_count": 1, 
+                 "collaborators": 1, "primary_language": 1}
+            ))
+            
+            # Extraer co-colaboradores (personas con las que ha trabajado)
+            co_collaborators = {}
+            for repo in user_repos:
+                for collab in repo.get("collaborators", []):
+                    login = collab.get("login")
+                    if login and login != user:
+                        if login not in co_collaborators:
+                            co_collaborators[login] = {
+                                "login": login,
+                                "shared_repos": [],
+                                "total_shared_contributions": 0
+                            }
+                        co_collaborators[login]["shared_repos"].append({
+                            "name": repo.get("name"),
+                            "full_name": repo.get("full_name")
+                        })
+                        co_collaborators[login]["total_shared_contributions"] += collab.get("contributions", 0)
+            
+            # Ordenar por número de repos compartidos
+            sorted_collaborators = sorted(
+                co_collaborators.values(),
+                key=lambda x: len(x["shared_repos"]),
+                reverse=True
+            )[:20]
+            
+            # Enriquecer con datos de usuario
+            for collab in sorted_collaborators:
+                user_info = users_collection.find_one({"login": collab["login"]})
+                if user_info:
+                    collab["name"] = user_info.get("name")
+                    collab["avatar_url"] = user_info.get("avatar_url")
+                    collab["quantum_expertise_score"] = user_info.get("quantum_expertise_score", 0)
+            
+            # Construir grafo
+            nodes = [{
+                "id": f"user_{user}",
+                "type": "user",
+                "login": user,
+                "name": user_doc.get("name") or user,
+                "avatar_url": user_doc.get("avatar_url"),
+                "isCenter": True
+            }]
+            links = []
+            
+            # Añadir repos como nodos
+            for repo in user_repos[:15]:
+                repo_id = f"repo_{repo.get('full_name')}"
+                nodes.append({
+                    "id": repo_id,
+                    "type": "repo",
+                    "name": repo.get("name"),
+                    "full_name": repo.get("full_name"),
+                    "stars": repo.get("stargazer_count", 0)
+                })
+                links.append({
+                    "source": f"user_{user}",
+                    "target": repo_id,
+                    "type": "contributed_to"
+                })
+            
+            # Añadir co-colaboradores como nodos
+            for collab in sorted_collaborators[:10]:
+                collab_id = f"user_{collab['login']}"
+                nodes.append({
+                    "id": collab_id,
+                    "type": "user",
+                    "login": collab["login"],
+                    "name": collab.get("name") or collab["login"],
+                    "avatar_url": collab.get("avatar_url"),
+                    "shared_count": len(collab["shared_repos"])
+                })
+                links.append({
+                    "source": f"user_{user}",
+                    "target": collab_id,
+                    "type": "collaborated_with",
+                    "weight": len(collab["shared_repos"])
+                })
+            
+            # Obtener organizaciones del usuario
+            user_orgs = user_doc.get("organizations", [])
+            for org in user_orgs[:5]:
+                org_login = org.get("login") if isinstance(org, dict) else org
+                if org_login:
+                    nodes.append({
+                        "id": f"org_{org_login}",
+                        "type": "org",
+                        "login": org_login,
+                        "name": org.get("name") if isinstance(org, dict) else org_login
+                    })
+                    links.append({
+                        "source": f"user_{user}",
+                        "target": f"org_{org_login}",
+                        "type": "member_of"
+                    })
+            
+            result["shared_users"] = sorted_collaborators
+            result["collaboration_graph"] = {"nodes": nodes, "links": links}
+            result["metrics"] = {
+                "total_repos": len(user_repos),
+                "total_co_collaborators": len(co_collaborators),
+                "total_organizations": len(user_orgs)
+            }
+            
+            return result
+        
+        # ============================================================
+        # MODO 2: Análisis de REPOS seleccionados
+        # ============================================================
+        if repos and len(repos) >= 2:
+            result["mode"] = "repos_comparison"
+            result["selections"] = repos
+            
+            # Obtener colaboradores de cada repo
+            repo_collaborators = {}
+            all_users = set()
+            
+            for repo_name in repos:
+                repo_doc = repos_collection.find_one(
+                    {"full_name": repo_name},
+                    {"_id": 1, "name": 1, "full_name": 1, "collaborators": 1, 
+                     "stargazer_count": 1, "primary_language": 1, "owner": 1}
+                )
+                if repo_doc and repo_doc.get("collaborators"):
+                    collabs = {c.get("login") for c in repo_doc.get("collaborators", []) if c.get("login")}
+                    repo_collaborators[repo_name] = {
+                        "doc": repo_doc,
+                        "collaborators": collabs
+                    }
+                    all_users.update(collabs)
+            
+            # Encontrar usuarios compartidos (aparecen en 2+ repos)
+            user_appearances = {}
+            for user_login in all_users:
+                repos_with_user = [
+                    repo_name for repo_name, data in repo_collaborators.items()
+                    if user_login in data["collaborators"]
+                ]
+                if len(repos_with_user) >= 2:
+                    user_appearances[user_login] = repos_with_user
+            
+            # Enriquecer usuarios compartidos
+            shared_users = []
+            for login, repos_list in sorted(user_appearances.items(), key=lambda x: len(x[1]), reverse=True)[:20]:
+                user_info = users_collection.find_one({"login": login})
+                shared_users.append({
+                    "login": login,
+                    "name": user_info.get("name") if user_info else None,
+                    "avatar_url": user_info.get("avatar_url") if user_info else None,
+                    "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0,
+                    "shared_repos": repos_list,
+                    "shared_count": len(repos_list)
+                })
+            
+            # Construir grafo
+            nodes = []
+            links = []
+            
+            # Añadir repos como nodos
+            for repo_name, data in repo_collaborators.items():
+                nodes.append({
+                    "id": f"repo_{repo_name}",
+                    "type": "repo",
+                    "name": data["doc"].get("name"),
+                    "full_name": repo_name,
+                    "stars": data["doc"].get("stargazer_count", 0)
+                })
+            
+            # Añadir usuarios compartidos
+            for user in shared_users[:15]:
+                user_id = f"user_{user['login']}"
+                nodes.append({
+                    "id": user_id,
+                    "type": "user",
+                    "login": user["login"],
+                    "name": user.get("name") or user["login"],
+                    "avatar_url": user.get("avatar_url"),
+                    "shared_count": user["shared_count"]
+                })
+                # Enlaces a repos
+                for repo_name in user["shared_repos"]:
+                    links.append({
+                        "source": user_id,
+                        "target": f"repo_{repo_name}",
+                        "type": "contributed_to"
+                    })
+            
+            result["shared_users"] = shared_users
+            result["collaboration_graph"] = {"nodes": nodes, "links": links}
+            result["metrics"] = {
+                "total_repos_analyzed": len(repo_collaborators),
+                "total_unique_users": len(all_users),
+                "shared_users_count": len(user_appearances),
+                "collaboration_density": round(len(user_appearances) / max(len(all_users), 1) * 100, 2)
+            }
+            
+            return result
+        
+        # ============================================================
+        # MODO 3: Análisis de ORGS seleccionadas
+        # ============================================================
+        if orgs and len(orgs) >= 2:
+            result["mode"] = "orgs_comparison"
+            result["selections"] = orgs
+            
+            # Obtener usuarios de cada org
+            org_users = {}
+            all_users = set()
+            
+            for org_login in orgs:
+                # Buscar repos de la org
+                org_repos = list(repos_collection.find(
+                    {"$or": [{"owner.login": org_login}, {"organization.login": org_login}]},
+                    {"collaborators": 1, "full_name": 1}
+                ))
+                
+                # Extraer usuarios únicos
+                users_in_org = set()
+                for repo in org_repos:
+                    for collab in repo.get("collaborators", []):
+                        if collab.get("login"):
+                            users_in_org.add(collab.get("login"))
+                
+                # También buscar usuarios que declaren pertenecer a la org
+                users_declaring_org = users_collection.find(
+                    {"$or": [
+                        {"organizations": org_login},
+                        {"organizations.login": org_login}
+                    ]},
+                    {"login": 1}
+                )
+                for u in users_declaring_org:
+                    users_in_org.add(u.get("login"))
+                
+                org_users[org_login] = users_in_org
+                all_users.update(users_in_org)
+            
+            # Encontrar usuarios compartidos
+            user_appearances = {}
+            for user_login in all_users:
+                orgs_with_user = [
+                    org_login for org_login, users in org_users.items()
+                    if user_login in users
+                ]
+                if len(orgs_with_user) >= 2:
+                    user_appearances[user_login] = orgs_with_user
+            
+            # Enriquecer usuarios compartidos
+            shared_users = []
+            for login, orgs_list in sorted(user_appearances.items(), key=lambda x: len(x[1]), reverse=True)[:20]:
+                user_info = users_collection.find_one({"login": login})
+                shared_users.append({
+                    "login": login,
+                    "name": user_info.get("name") if user_info else None,
+                    "avatar_url": user_info.get("avatar_url") if user_info else None,
+                    "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0,
+                    "shared_orgs": orgs_list,
+                    "shared_count": len(orgs_list)
+                })
+            
+            # Construir grafo
+            nodes = []
+            links = []
+            
+            # Añadir orgs como nodos
+            for org_login in orgs:
+                org_doc = orgs_collection.find_one({"login": org_login})
+                nodes.append({
+                    "id": f"org_{org_login}",
+                    "type": "org",
+                    "login": org_login,
+                    "name": org_doc.get("name") if org_doc else org_login,
+                    "avatar_url": org_doc.get("avatar_url") if org_doc else None
+                })
+            
+            # Añadir usuarios compartidos
+            for user in shared_users[:15]:
+                user_id = f"user_{user['login']}"
+                nodes.append({
+                    "id": user_id,
+                    "type": "user",
+                    "login": user["login"],
+                    "name": user.get("name") or user["login"],
+                    "avatar_url": user.get("avatar_url"),
+                    "shared_count": user["shared_count"]
+                })
+                # Enlaces a orgs
+                for org_login in user["shared_orgs"]:
+                    links.append({
+                        "source": user_id,
+                        "target": f"org_{org_login}",
+                        "type": "member_of"
+                    })
+            
+            result["shared_users"] = shared_users
+            result["collaboration_graph"] = {"nodes": nodes, "links": links}
+            result["metrics"] = {
+                "total_orgs_analyzed": len(org_users),
+                "total_unique_users": len(all_users),
+                "shared_users_count": len(user_appearances),
+                "collaboration_density": round(len(user_appearances) / max(len(all_users), 1) * 100, 2)
+            }
+            
+            return result
+        
+        # Si no hay parámetros válidos
+        raise HTTPException(
+            status_code=400,
+            detail="Se requiere: user=login, repos=[repo1,repo2,...] (mínimo 2), o orgs=[org1,org2,...] (mínimo 2)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Error en análisis de colaboración: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.get("/collaboration/user/{user_login}")
+async def get_user_collaboration_network(user_login: str):
+    """
+    Obtiene la red de colaboración de un usuario específico.
+    Endpoint simplificado para llamadas GET directas.
+    """
+    return await analyze_collaboration(user=user_login)
+
+
 @router.get("/rate-limit")
 async def rate_limit():
     """
