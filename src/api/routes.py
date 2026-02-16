@@ -22,6 +22,7 @@ from ..github.graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
 from ..core.config import config, ingestion_config
 from ..core.mongo_repository import MongoRepository
+from ..analysis.network_metrics import CollaborationNetworkAnalyzer
 
 # Router principal
 router = APIRouter()
@@ -1559,6 +1560,152 @@ async def get_user_collaboration_network(user_login: str):
     Endpoint simplificado para llamadas GET directas.
     """
     return await analyze_collaboration(user=user_login)
+
+
+# ==========================================
+# ENDPOINTS DE ANÁLISIS DE RED (NetworkX)
+# ==========================================
+
+# Caché en memoria del resultado de análisis (evita recalcular en cada request)
+# Almacena tanto el dict como los bytes JSON serializados con orjson
+_network_metrics_cache = {"json_bytes": None, "computed_at": None, "analyzer": None}
+
+@router.get("/collaboration/network-metrics")
+async def get_network_metrics(force_refresh: bool = Query(default=False)):
+    """
+    Computa métricas de red de colaboración optimizadas para el frontend.
+    Devuelve solo: node_metrics (compacto), communities, global_metrics.
+    Omite edge_metrics, searchable_nodes, bus_factors (no usados por UI).
+    Caché en memoria: 1 hora de TTL. Usa orjson para serialización rápida.
+    """
+    try:
+        import orjson
+        from datetime import timedelta
+        from fastapi.responses import Response
+        from ..core.db import db
+        
+        # Verificar caché en memoria (devuelve bytes JSON directamente)
+        cache = _network_metrics_cache
+        if not force_refresh and cache["json_bytes"] and cache["computed_at"]:
+            age = datetime.utcnow() - cache["computed_at"]
+            if age < timedelta(hours=1):
+                logger.info("[NetworkMetrics] Devolviendo desde caché en memoria")
+                return Response(
+                    content=cache["json_bytes"],
+                    media_type="application/json"
+                )
+        
+        db.ensure_connection()
+        
+        # Construir grafo y computar métricas
+        logger.info("[NetworkMetrics] Construyendo grafo y computando métricas...")
+        repos_col = db.get_collection("repositories")
+        users_col = db.get_collection("users")
+        orgs_col = db.get_collection("organizations")
+        
+        analyzer = CollaborationNetworkAnalyzer()
+        analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
+        full = analyzer.get_full_analysis()
+        
+        # Construir respuesta compacta — solo lo que el frontend necesita
+        compact_node_metrics = {}
+        for node_id, m in full.get("node_metrics", {}).items():
+            entry = {
+                "betweenness": m.get("betweenness", 0),
+                "degree": m.get("degree", 0),
+                "collab_centrality": m.get("collab_centrality", 0),
+                "collab_connectivity": m.get("collab_connectivity", 0),
+                "collab_centrality_raw": m.get("collab_centrality_raw", 0),
+                "collab_connectivity_raw": m.get("collab_connectivity_raw", 0),
+            }
+            if "community_id" in m:
+                entry["community_id"] = m["community_id"]
+                entry["community_color"] = m.get("community_color", "#888888")
+            if "bus_factor_risk" in m:
+                entry["bus_factor"] = m.get("bus_factor", 0)
+                entry["bus_factor_risk"] = m["bus_factor_risk"]
+                tc = m.get("top_contributors", [])
+                if tc:
+                    entry["top_contributors"] = [
+                        {"login": c["login"], "percentage": c.get("percentage", 0)}
+                        for c in tc[:3]
+                    ]
+            compact_node_metrics[node_id] = entry
+        
+        # Comunidades compactas
+        compact_communities = [
+            {
+                "id": c["id"],
+                "color": c["color"],
+                "size": c["size"],
+                "label": c["label"],
+            }
+            for c in full.get("communities", [])
+        ]
+        
+        result = {
+            "node_metrics": compact_node_metrics,
+            "communities": compact_communities,
+            "global_metrics": full.get("global_metrics", {}),
+        }
+        
+        # Serializar con orjson (~10x más rápido que json.dumps)
+        json_bytes = orjson.dumps(result)
+        
+        # Guardar en caché en memoria
+        _network_metrics_cache["json_bytes"] = json_bytes
+        _network_metrics_cache["computed_at"] = datetime.utcnow()
+        _network_metrics_cache["analyzer"] = analyzer
+        
+        logger.info(
+            f"[NetworkMetrics] Respuesta: {len(compact_node_metrics)} nodos, "
+            f"{len(compact_communities)} comunidades, "
+            f"{len(json_bytes) / 1024:.0f} KB (cacheado en memoria)"
+        )
+        return Response(content=json_bytes, media_type="application/json")
+        
+    except Exception as e:
+        error_msg = f"Error computing network metrics: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.get("/collaboration/quantum-tunneling")
+async def quantum_tunneling(
+    source: str = Query(..., description="ID del nodo origen (ej: user_octocat)"),
+    target: str = Query(..., description="ID del nodo destino (ej: repo_qiskit/qiskit)")
+):
+    """
+    Encuentra el camino más corto entre dos entidades de la red (Quantum Tunneling).
+    Retorna: nodos del camino, aristas, descripción, longitud.
+    Reutiliza el grafo cacheado de network-metrics si está disponible.
+    """
+    try:
+        from ..core.db import db
+        
+        # Reutilizar analyzer del caché si existe
+        analyzer = _network_metrics_cache.get("analyzer")
+        if not analyzer:
+            logger.info("[QuantumTunneling] Sin caché, construyendo grafo...")
+            db.ensure_connection()
+            repos_col = db.get_collection("repositories")
+            users_col = db.get_collection("users")
+            orgs_col = db.get_collection("organizations")
+            
+            analyzer = CollaborationNetworkAnalyzer()
+            analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
+            # Guardar para futuros requests
+            _network_metrics_cache["analyzer"] = analyzer
+        else:
+            logger.info("[QuantumTunneling] Usando grafo cacheado en memoria")
+        
+        result = analyzer.find_path(source, target)
+        return result
+        
+    except Exception as e:
+        error_msg = f"Error in quantum tunneling: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @router.get("/rate-limit")
