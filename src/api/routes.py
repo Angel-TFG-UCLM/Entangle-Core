@@ -53,6 +53,9 @@ async def get_stats():
     Obtiene estadísticas generales del sistema (Simple counts).
     Retorna el conteo total de repositorios, usuarios y organizaciones.
     
+    Caché PERMANENTE en colección 'metrics'. Se invalida vía refresh-metrics
+    o al completarse ingestas/enriquecimientos.
+    
     NOTA: Para dashboard completo con caché, usar /dashboard/stats
     """
     try:
@@ -61,7 +64,15 @@ async def get_stats():
         # Asegurar conexión activa (reconecta automáticamente si está caída)
         db.ensure_connection()
         
-        # Obtener colecciones
+        metrics_collection = db.get_collection("metrics")
+        
+        # 1. Intentar servir desde caché permanente
+        cached = metrics_collection.find_one({"type": "simple_counts"})
+        if cached and "data" in cached:
+            logger.info("📊 /stats servido desde caché permanente")
+            return cached["data"]
+        
+        # 2. Calcular y guardar en caché
         repos_collection = db.get_collection("repositories")
         users_collection = db.get_collection("users")
         orgs_collection = db.get_collection("organizations")
@@ -71,12 +82,22 @@ async def get_stats():
         users_count = users_collection.count_documents({}, maxTimeMS=5000)
         orgs_count = orgs_collection.count_documents({}, maxTimeMS=5000)
         
-        return {
+        result = {
             "repositories": repos_count,
             "users": users_count,
             "organizations": orgs_count,
             "timestamp": datetime.now().isoformat()
         }
+        
+        # Guardar en caché permanente
+        metrics_collection.update_one(
+            {"type": "simple_counts"},
+            {"$set": {"type": "simple_counts", "data": result, "updated_at": datetime.now()}},
+            upsert=True
+        )
+        logger.info(f"📊 /stats calculado y cacheado: {repos_count} repos, {users_count} users, {orgs_count} orgs")
+        
+        return result
     except Exception as e:
         error_msg = f"Error al obtener estadísticas: {str(e)}"
         logger.error(error_msg, exc_info=True)
@@ -119,37 +140,29 @@ async def get_dashboard_stats(
         # Asegurar conexión activa
         db.ensure_connection()
         
-        # Configuración de caché (1 hora - más frecuente para datos dinámicos)
-        CACHE_TTL_HOURS = 1
         current_time = datetime.now()
         
         # Detectar si hay filtros activos
-        has_filters = bool(org or language or repo or collab_type or not include_bots)
+        # include_bots=False es el default, solo cuenta como filtro si es True
+        has_filters = bool(org or language or repo or collab_type or include_bots)
         
         # 1. INTENTAR OBTENER CACHÉ (solo si no hay filtros y no se fuerza refresh)
+        # Caché PERMANENTE: sin TTL, persiste hasta invalidación explícita
         metrics_collection = db.get_collection("metrics")
         
         if not force_refresh and not has_filters:
             cached_stats = metrics_collection.find_one({"type": "dashboard_stats"})
             
             if cached_stats:
-                updated_at = cached_stats.get("updated_at")
-                if updated_at and isinstance(updated_at, datetime):
-                    age_hours = (current_time - updated_at).total_seconds() / 3600
-                    
-                    # Si el caché es fresco (< 1h), retornarlo
-                    if age_hours < CACHE_TTL_HOURS:
-                        logger.info(f"📊 Cache HIT - Dashboard stats servido desde caché ({age_hours:.1f}h antiguo)")
-                        
-                        # Agregar metadatos de caché
-                        response_data = cached_stats.get("data", {})
-                        response_data["metadata"] = {
-                            "cached": True,
-                            "calculatedAt": updated_at.isoformat(),
-                            "expiresAt": (updated_at + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
-                            "ageHours": round(age_hours, 2)
-                        }
-                        return response_data
+                updated_at = cached_stats.get("updated_at", current_time)
+                logger.info(f"📊 Cache HIT - Dashboard stats servido desde caché permanente")
+                
+                response_data = cached_stats.get("data", {})
+                response_data["metadata"] = {
+                    "cached": True,
+                    "calculatedAt": updated_at.isoformat() if isinstance(updated_at, datetime) else str(updated_at),
+                }
+                return response_data
         
         # Log de filtros activos
         if has_filters:
@@ -727,8 +740,6 @@ async def get_dashboard_stats(
             "metadata": {
                 "cached": False,
                 "calculatedAt": current_time.isoformat(),
-                "expiresAt": (current_time + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
-                "ageHours": 0,
                 "activeFilters": {
                     "org": org,
                     "language": language,
@@ -753,7 +764,7 @@ async def get_dashboard_stats(
                 upsert=True
             )
             
-            logger.info(f"✅ Dashboard stats COMPLETO calculado y guardado en caché (válido por {CACHE_TTL_HOURS}h)")
+            logger.info("✅ Dashboard stats COMPLETO calculado y guardado en caché permanente")
         else:
             logger.info(f"✅ Dashboard stats CON FILTROS calculado (no cacheado)")
         
@@ -765,17 +776,71 @@ async def get_dashboard_stats(
         raise HTTPException(status_code=500, detail=error_msg)
 
 
+def invalidate_all_caches():
+    """
+    Invalida TODAS las cachés de la aplicación (MongoDB + memoria).
+    
+    Se llama desde:
+    - POST /dashboard/refresh-metrics (botón de actualizar)
+    - Al completarse cualquier tarea de ingesta o enriquecimiento
+    
+    Cachés invalidadas:
+    - collaboration_graph (chunked en metrics)
+    - network_metrics (chunked en metrics + in-memory)
+    - dashboard_stats (doc en metrics)
+    - simple_counts (doc en metrics)
+    - collab_analysis_* (docs de análisis por usuario/repos/orgs en metrics)
+    """
+    from ..core.db import db
+    from ..core.chunked_cache import delete_chunked
+    
+    db.ensure_connection()
+    metrics = db.get_collection("metrics")
+    
+    # Cachés chunked (documentos grandes >2MB)
+    graph_deleted = delete_chunked(metrics, "collaboration_graph")
+    nm_deleted = delete_chunked(metrics, "network_metrics")
+    
+    # Caché en memoria de network metrics
+    _network_metrics_cache["json_bytes"] = None
+    _network_metrics_cache["computed_at"] = None
+    _network_metrics_cache["analyzer"] = None
+    
+    # Cachés de documento simple
+    stats_deleted = metrics.delete_one({"type": "dashboard_stats"}).deleted_count
+    counts_deleted = metrics.delete_one({"type": "simple_counts"}).deleted_count
+    
+    # Cachés de análisis de colaboración (por usuario/repos/orgs)
+    analyze_deleted = metrics.delete_many(
+        {"_id": {"$regex": "^collab_analysis_"}}
+    ).deleted_count
+    
+    summary = {
+        "collaboration_graph_chunks": graph_deleted,
+        "network_metrics_chunks": nm_deleted,
+        "dashboard_stats": stats_deleted,
+        "simple_counts": counts_deleted,
+        "collaboration_analyses": analyze_deleted,
+    }
+    
+    logger.info(f"[INVALIDATE_ALL] Todas las cachés invalidadas: {summary}")
+    return summary
+
+
 @router.post("/dashboard/refresh-metrics")
 async def refresh_dashboard_metrics():
     """
-    Fuerza el recálculo de métricas del dashboard.
-    Útil después de ingestas/enriquecimientos.
+    Invalida TODAS las cachés de la aplicación.
+    El frontend se encarga de recargar datos frescos con force_refresh
+    después de llamar a este endpoint.
+    
+    Útil después de ingestas/enriquecimientos o al pulsar el botón de actualizar.
     """
     try:
-        # Llamar al endpoint de stats con force_refresh
-        return await get_dashboard_stats(force_refresh=True)
+        result = invalidate_all_caches()
+        return {"invalidated": True, "details": result}
     except Exception as e:
-        logger.error(f"Error al refrescar métricas: {e}")
+        logger.error(f"Error al invalidar cachés: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -804,19 +869,20 @@ async def discover_collaboration(force: bool = False):
         - connected_pairs: Pares de repos/orgs más conectados
     """
     try:
+        import orjson
+        from fastapi.responses import Response
         from ..core.db import db
+        from ..core.chunked_cache import load_chunked, save_chunked
         
         db.ensure_connection()
         
-        # ── CACHÉ: intentar servir desde metrics ──
+        # ── CACHÉ: intentar servir desde metrics (chunked para >2MB) ──
         if not force:
             metrics_collection = db.get_collection("metrics")
-            cached = metrics_collection.find_one({"_id": "collaboration_graph"})
+            cached = load_chunked(metrics_collection, "collaboration_graph")
             if cached:
-                cached.pop("_id", None)
-                cached.pop("cached_at", None)
-                logger.info(f"[DISCOVER] Sirviendo grafo desde caché MongoDB ({cached.get('metrics', {}).get('graph_nodes', '?')} nodos)")
-                return cached
+                logger.info(f"[DISCOVER] Sirviendo grafo desde caché chunked ({cached.get('metrics', {}).get('graph_nodes', '?')} nodos)")
+                return Response(content=orjson.dumps(cached), media_type="application/json")
         
         repos_collection = db.get_collection("repositories")
         users_collection = db.get_collection("users")
@@ -1004,7 +1070,7 @@ async def discover_collaboration(force: bool = False):
                         "name": repo.get("name"),
                         "full_name": full_name,
                         "stars": repo.get("stargazer_count", 0),
-                        "language": repo.get("primary_language", {}).get("name") if isinstance(repo.get("primary_language"), dict) else None,
+                        "language": repo.get("primary_language", {}).get("name") if isinstance(repo.get("primary_language"), dict) else repo.get("primary_language"),
                         "org": org_login
                     })
                     added_nodes.add(node_id)
@@ -1212,17 +1278,20 @@ async def discover_collaboration(force: bool = False):
             "connected_pairs": connected_repo_pairs[:20]
         }
         
-        # ── GUARDAR EN CACHÉ MongoDB ──
+        # ── GUARDAR EN CACHÉ MongoDB (chunked para >2MB) ──
         try:
-            from datetime import datetime, timezone
             metrics_collection = db.get_collection("metrics")
-            cache_doc = {**result, "_id": "collaboration_graph", "cached_at": datetime.now(timezone.utc).isoformat()}
-            metrics_collection.replace_one({"_id": "collaboration_graph"}, cache_doc, upsert=True)
-            logger.info(f"[DISCOVER] Grafo guardado en caché MongoDB ({len(nodes)} nodos, {len(links)} links)")
+            save_chunked(
+                metrics_collection,
+                "collaboration_graph",
+                result,
+                large_fields=["graph.nodes", "graph.links", "bridge_users"]
+            )
+            logger.info(f"[DISCOVER] Grafo guardado en caché chunked ({len(nodes)} nodos, {len(links)} links)")
         except Exception as cache_err:
             logger.warning(f"[DISCOVER] No se pudo cachear el grafo: {cache_err}")
         
-        return result
+        return Response(content=orjson.dumps(result), media_type="application/json")
         
     except Exception as e:
         error_msg = f"Error en descubrimiento de colaboración: {str(e)}"
@@ -1235,12 +1304,13 @@ async def invalidate_collaboration_cache():
     """Invalida la caché del grafo de colaboración. Útil tras una ingesta de datos."""
     try:
         from ..core.db import db
+        from ..core.chunked_cache import delete_chunked
         db.ensure_connection()
         metrics_collection = db.get_collection("metrics")
-        result = metrics_collection.delete_one({"_id": "collaboration_graph"})
-        deleted = result.deleted_count > 0
-        logger.info(f"[DISCOVER] Caché invalidada: {'eliminada' if deleted else 'no existía'}")
-        return {"invalidated": deleted, "message": "Caché del grafo eliminada" if deleted else "No había caché"}
+        deleted_count = delete_chunked(metrics_collection, "collaboration_graph")
+        deleted = deleted_count > 0
+        logger.info(f"[DISCOVER] Caché invalidada: {'eliminada' if deleted else 'no existía'} ({deleted_count} docs)")
+        return {"invalidated": deleted, "message": f"Caché del grafo eliminada ({deleted_count} docs)" if deleted else "No había caché"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1271,6 +1341,29 @@ async def analyze_collaboration(
         repos_collection = db.get_collection("repositories")
         users_collection = db.get_collection("users")
         orgs_collection = db.get_collection("organizations")
+        metrics_collection = db.get_collection("metrics")
+        
+        # ── CACHÉ PERMANENTE: construir clave única según parámetros ──
+        import hashlib
+        if user:
+            cache_key = f"collab_analysis_user_{user}"
+        elif repos and len(repos) >= 2:
+            sorted_repos = sorted(repos)
+            cache_key = f"collab_analysis_repos_{hashlib.md5('|'.join(sorted_repos).encode()).hexdigest()}"
+        elif orgs and len(orgs) >= 2:
+            sorted_orgs = sorted(orgs)
+            cache_key = f"collab_analysis_orgs_{hashlib.md5('|'.join(sorted_orgs).encode()).hexdigest()}"
+        else:
+            cache_key = None
+        
+        # Intentar servir desde caché permanente
+        if cache_key:
+            cached = metrics_collection.find_one({"_id": cache_key})
+            if cached:
+                cached.pop("_id", None)
+                cached.pop("_cached_at", None)
+                logger.info(f"[Analyze] Cache HIT: {cache_key}")
+                return cached
         
         result = {
             "mode": None,
@@ -1402,6 +1495,18 @@ async def analyze_collaboration(
                 "total_organizations": len(user_orgs)
             }
             
+            # Guardar en caché permanente
+            if cache_key:
+                try:
+                    metrics_collection.update_one(
+                        {"_id": cache_key},
+                        {"$set": {**result, "_cached_at": datetime.now().isoformat()}},
+                        upsert=True
+                    )
+                    logger.info(f"[Analyze] Cacheado: {cache_key}")
+                except Exception as ce:
+                    logger.warning(f"[Analyze] Error cacheando: {ce}")
+            
             return result
         
         # ============================================================
@@ -1493,6 +1598,18 @@ async def analyze_collaboration(
                 "shared_users_count": len(user_appearances),
                 "collaboration_density": round(len(user_appearances) / max(len(all_users), 1) * 100, 2)
             }
+            
+            # Guardar en caché permanente
+            if cache_key:
+                try:
+                    metrics_collection.update_one(
+                        {"_id": cache_key},
+                        {"$set": {**result, "_cached_at": datetime.now().isoformat()}},
+                        upsert=True
+                    )
+                    logger.info(f"[Analyze] Cacheado: {cache_key}")
+                except Exception as ce:
+                    logger.warning(f"[Analyze] Error cacheando: {ce}")
             
             return result
         
@@ -1601,6 +1718,18 @@ async def analyze_collaboration(
                 "collaboration_density": round(len(user_appearances) / max(len(all_users), 1) * 100, 2)
             }
             
+            # Guardar en caché permanente
+            if cache_key:
+                try:
+                    metrics_collection.update_one(
+                        {"_id": cache_key},
+                        {"$set": {**result, "_cached_at": datetime.now().isoformat()}},
+                        upsert=True
+                    )
+                    logger.info(f"[Analyze] Cacheado: {cache_key}")
+                except Exception as ce:
+                    logger.warning(f"[Analyze] Error cacheando: {ce}")
+            
             return result
         
         # Si no hay parámetros válidos
@@ -1632,6 +1761,7 @@ async def get_user_collaboration_network(user_login: str):
 
 # Caché en memoria del resultado de análisis (evita recalcular en cada request)
 # Almacena tanto el dict como los bytes JSON serializados con orjson
+# Fallback: si la caché en memoria está vacía, intenta cargar desde MongoDB (chunked)
 _network_metrics_cache = {"json_bytes": None, "computed_at": None, "analyzer": None}
 
 @router.get("/collaboration/network-metrics")
@@ -1640,28 +1770,39 @@ async def get_network_metrics(force_refresh: bool = Query(default=False)):
     Computa métricas de red de colaboración optimizadas para el frontend.
     Devuelve solo: node_metrics (compacto), communities, global_metrics.
     Omite edge_metrics, searchable_nodes, bus_factors (no usados por UI).
-    Caché en memoria: 1 hora de TTL. Usa orjson para serialización rápida.
+    Caché PERMANENTE: memoria + MongoDB chunked. Sin TTL. Usa orjson.
+    Invalidación solo vía POST /dashboard/refresh-metrics o tras ingesta/enriquecimiento.
     """
     try:
         import orjson
-        from datetime import timedelta
         from fastapi.responses import Response
         from ..core.db import db
+        from ..core.chunked_cache import load_chunked, save_chunked
         
-        # Verificar caché en memoria (devuelve bytes JSON directamente)
+        # ── 1. Caché en memoria (más rápido, sin TTL) ──
         cache = _network_metrics_cache
         if not force_refresh and cache["json_bytes"] and cache["computed_at"]:
-            age = datetime.utcnow() - cache["computed_at"]
-            if age < timedelta(hours=1):
-                logger.info("[NetworkMetrics] Devolviendo desde caché en memoria")
-                return Response(
-                    content=cache["json_bytes"],
-                    media_type="application/json"
-                )
+            logger.info("[NetworkMetrics] Devolviendo desde caché en memoria (permanente)")
+            return Response(
+                content=cache["json_bytes"],
+                media_type="application/json"
+            )
         
         db.ensure_connection()
+        metrics_collection = db.get_collection("metrics")
         
-        # Construir grafo y computar métricas
+        # ── 2. Caché en MongoDB chunked (sobrevive restarts, sin TTL) ──
+        if not force_refresh:
+            cached_result = load_chunked(metrics_collection, "network_metrics")
+            if cached_result:
+                json_bytes = orjson.dumps(cached_result)
+                # Poblar caché en memoria
+                _network_metrics_cache["json_bytes"] = json_bytes
+                _network_metrics_cache["computed_at"] = datetime.utcnow()
+                logger.info(f"[NetworkMetrics] Restaurado desde caché MongoDB chunked permanente ({len(json_bytes) / 1024:.0f} KB)")
+                return Response(content=json_bytes, media_type="application/json")
+        
+        # ── 3. Computar desde cero ──
         logger.info("[NetworkMetrics] Construyendo grafo y computando métricas...")
         repos_col = db.get_collection("repositories")
         users_col = db.get_collection("users")
@@ -1721,10 +1862,21 @@ async def get_network_metrics(force_refresh: bool = Query(default=False)):
         _network_metrics_cache["computed_at"] = datetime.utcnow()
         _network_metrics_cache["analyzer"] = analyzer
         
+        # Guardar en MongoDB chunked (persistente, sobrevive restarts)
+        try:
+            save_chunked(
+                metrics_collection,
+                "network_metrics",
+                result,
+                large_fields=["node_metrics"]
+            )
+        except Exception as mongo_err:
+            logger.warning(f"[NetworkMetrics] No se pudo persistir a MongoDB: {mongo_err}")
+        
         logger.info(
             f"[NetworkMetrics] Respuesta: {len(compact_node_metrics)} nodos, "
             f"{len(compact_communities)} comunidades, "
-            f"{len(json_bytes) / 1024:.0f} KB (cacheado en memoria)"
+            f"{len(json_bytes) / 1024:.0f} KB (cacheado en memoria + MongoDB)"
         )
         return Response(content=json_bytes, media_type="application/json")
         
@@ -1750,16 +1902,33 @@ async def quantum_tunneling(
         # Reutilizar analyzer del caché si existe
         analyzer = _network_metrics_cache.get("analyzer")
         if not analyzer:
-            logger.info("[QuantumTunneling] Sin caché, construyendo grafo...")
+            # Intentar restaurar desde caché MongoDB chunked (persistente)
+            from ..core.chunked_cache import load_chunked
             db.ensure_connection()
-            repos_col = db.get_collection("repositories")
-            users_col = db.get_collection("users")
-            orgs_col = db.get_collection("organizations")
+            metrics_collection = db.get_collection("metrics")
+            cached_nm = load_chunked(metrics_collection, "network_metrics")
             
-            analyzer = CollaborationNetworkAnalyzer()
-            analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
-            # Guardar para futuros requests
-            _network_metrics_cache["analyzer"] = analyzer
+            if cached_nm:
+                # Reconstruir grafo NetworkX desde los node_metrics cacheados
+                logger.info("[QuantumTunneling] Reconstruyendo analyzer desde caché MongoDB...")
+                repos_col = db.get_collection("repositories")
+                users_col = db.get_collection("users")
+                orgs_col = db.get_collection("organizations")
+                
+                analyzer = CollaborationNetworkAnalyzer()
+                analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
+                _network_metrics_cache["analyzer"] = analyzer
+                logger.info("[QuantumTunneling] Analyzer reconstruido y cacheado en memoria")
+            else:
+                logger.info("[QuantumTunneling] Sin caché, construyendo grafo completo...")
+                db.ensure_connection()
+                repos_col = db.get_collection("repositories")
+                users_col = db.get_collection("users")
+                orgs_col = db.get_collection("organizations")
+                
+                analyzer = CollaborationNetworkAnalyzer()
+                analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
+                _network_metrics_cache["analyzer"] = analyzer
         else:
             logger.info("[QuantumTunneling] Usando grafo cacheado en memoria")
         
@@ -2434,7 +2603,12 @@ def _run_repository_ingestion(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -2472,7 +2646,12 @@ def _run_user_ingestion(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -2512,7 +2691,12 @@ def _run_repository_enrichment(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -2554,7 +2738,12 @@ def _run_user_enrichment(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -2592,7 +2781,12 @@ def _run_organization_ingestion(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -2636,7 +2830,12 @@ def _run_organization_enrichment(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -2885,6 +3084,13 @@ def _run_full_pipeline_direct(task_id: str):
         background_tasks_status[task_id]["total_records"] = total_records
         background_tasks_status[task_id]["duration_seconds"] = total_duration
         
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info("🧹 Cachés invalidadas tras pipeline completo")
+        except Exception as cache_err:
+            logger.warning(f"⚠️ Error al invalidar cachés tras pipeline: {cache_err}")
+        
     except Exception as e:
         logger.error(f"❌ Error crítico en pipeline {task_id}: {e}")
         logger.error(traceback.format_exc())
@@ -2937,6 +3143,13 @@ def _run_full_pipeline_script(task_id: str):
         background_tasks_status[task_id]["exit_code"] = result.returncode
         
         logger.info(f"Pipeline completado - Task ID: {task_id}, Exit Code: {result.returncode}")
+        
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info("🧹 Cachés invalidadas tras pipeline script")
+        except Exception as cache_err:
+            logger.warning(f"⚠️ Error al invalidar cachés tras pipeline script: {cache_err}")
         
     except Exception as e:
         logger.error(f"Error ejecutando pipeline {task_id}: {e}")
