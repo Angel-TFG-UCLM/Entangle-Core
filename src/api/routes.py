@@ -1072,7 +1072,35 @@ async def discover_collaboration(force: bool = False):
                 "cross_org": login in cross_org_users
             })
         
-        # 6g) Añadir nodos de organizaciones (las que contienen repos conectados)
+        # 6g) Añadir nodos de usuarios normales (no bridge) vinculados a repos en el grafo
+        normal_user_count = 0
+        for login, repos_list in user_to_repos.items():
+            if login in bridge_users or _is_bot_login(login):
+                continue
+            user_id = f"user_{login}"
+            if user_id in added_nodes:
+                continue
+            # Solo añadir si al menos uno de sus repos ya está en el grafo
+            linked_repo_id = None
+            for r in repos_list:
+                repo_node_id = f"repo_{r['full_name']}"
+                if repo_node_id in added_nodes:
+                    linked_repo_id = repo_node_id
+                    break
+            if linked_repo_id:
+                user_node = _make_user_node(login, repos_list, False)
+                nodes.append(user_node)
+                added_nodes.add(user_id)
+                links.append({
+                    "source": user_id,
+                    "target": linked_repo_id,
+                    "type": "contributed_to"
+                })
+                normal_user_count += 1
+        
+        logger.info(f"[DISCOVER] Usuarios normales añadidos: {normal_user_count}")
+        
+        # 6h) Añadir nodos de organizaciones (las que contienen repos conectados)
         org_logins_in_graph = set()
         for repo in all_repos:
             full_name = repo.get("full_name")
@@ -1109,7 +1137,42 @@ async def discover_collaboration(force: bool = False):
                             })
         
         # ============================================================
-        # PASO 7: Construir resumen textual
+        # PASO 7: Links de entrelazamiento org↔org (bridge users compartidos)
+        # ============================================================
+        # Para cada par de orgs, contar cuántos bridge users contribuyen a repos de ambas
+        org_pair_bridges = {}  # (org_a, org_b) → set(logins)
+        for login, repos_list in human_bridge_users.items():
+            user_org_set = set()
+            for r in repos_list:
+                owner = r.get("owner")
+                if owner and f"org_{owner}" in added_nodes:
+                    user_org_set.add(owner)
+            if len(user_org_set) >= 2:
+                org_list = sorted(user_org_set)
+                for i in range(len(org_list)):
+                    for j in range(i + 1, len(org_list)):
+                        key = (org_list[i], org_list[j])
+                        if key not in org_pair_bridges:
+                            org_pair_bridges[key] = set()
+                        org_pair_bridges[key].add(login)
+        
+        # Solo emitir links con ≥ 3 bridge users compartidos para evitar ruido
+        entanglement_count = 0
+        for (org_a, org_b), shared_logins in org_pair_bridges.items():
+            strength = len(shared_logins)
+            if strength >= 3:
+                links.append({
+                    "source": f"org_{org_a}",
+                    "target": f"org_{org_b}",
+                    "type": "entangled_with",
+                    "strength": strength
+                })
+                entanglement_count += 1
+        
+        logger.info(f"[DISCOVER] Entrelazamientos org↔org: {entanglement_count} (threshold ≥3 bridge users)")
+        
+        # ============================================================
+        # PASO 8: Construir resumen textual
         # ============================================================
         summary_parts = []
         if len(bridge_users) > 0:
@@ -1137,6 +1200,7 @@ async def discover_collaboration(force: bool = False):
                 "total_repos_analyzed": len(all_repos),
                 "total_users_mapped": len(user_to_repos),
                 "bridge_users_count": len(bridge_nodes_in_graph),
+                "normal_users_count": normal_user_count,
                 "total_bridge_users_found": len(human_bridge_users),
                 "connected_repo_pairs": len(connected_repo_pairs),
                 "cross_org_users": len(cross_org_users),
