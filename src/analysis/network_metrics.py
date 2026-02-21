@@ -4,13 +4,13 @@ ENTANGLE Network Analysis Engine
 Computes graph-theory metrics on the collaboration network using NetworkX.
 
 Métricas implementadas:
-  ◈ Betweenness Centrality  — ¿Quién es el puente más crítico?
-  ◈ Degree Centrality       — ¿Quién tiene más conexiones directas?
-  ◈ Community Detection     — ¿Existen clusters naturales? (Louvain)
-  ◈ Bus Factor              — ¿Cuál es el riesgo si un contributor se va?
-  ◈ Collaboration Intensity — ¿Cuán fuerte es cada conexión?
-  ◈ Shortest Path           — Quantum Tunneling entre dos entidades
-  ◈ Global Graph Metrics    — Densidad, clustering, modularidad, diámetro
+  ◈ Betweenness Centrality  - ¿Quién es el puente más crítico?
+  ◈ Degree Centrality       - ¿Quién tiene más conexiones directas?
+  ◈ Community Detection     - ¿Existen clusters naturales? (Louvain)
+  ◈ Bus Factor              - ¿Cuál es el riesgo si un contributor se va?
+  ◈ Collaboration Intensity - ¿Cuán fuerte es cada conexión?
+  ◈ Shortest Path           - Quantum Tunneling entre dos entidades
+  ◈ Global Graph Metrics    - Densidad, clustering, modularidad, diámetro
 
 Node IDs use the same scheme as /collaboration/discover:
   org_{login}, repo_{full_name}, user_{login}
@@ -24,7 +24,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# PALETTE — Generación programática con máxima separación visual
+# PALETTE - Generación programática con máxima separación visual
 # ============================================================================
 # En vez de 20 colores estáticos que se repiten cada 20 comunidades,
 # usamos el ángulo áureo (137.508°) para distribuir hues de forma
@@ -41,11 +41,11 @@ def _hsl_to_hex(h: float, s: float, l: float) -> str:
     return f'#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}'
 
 
-# 3 tiers (sat%, lum%) — optimizados para fondo oscuro (#0a0a1a)
+# 3 tiers (sat%, lum%) - optimizados para fondo oscuro (#0a0a1a)
 _TIERS = [
-    (85, 62),  # Vivid medium   — saturados, luminosidad media
-    (92, 50),  # Vivid dark     — muy saturados, más oscuros
-    (72, 74),  # Soft bright    — suaves, más claros
+    (85, 62),  # Vivid medium   - saturados, luminosidad media
+    (92, 50),  # Vivid dark     - muy saturados, más oscuros
+    (72, 74),  # Soft bright    - suaves, más claros
 ]
 
 
@@ -130,7 +130,9 @@ class CollaborationNetworkAnalyzer:
                 contributions = max(collab.get("contributions", 1), 1)
 
                 if not self.G.has_node(user_id):
-                    self.G.add_node(user_id, type="user", login=login)
+                    # Detectar bots por login (heurística rápida)
+                    is_bot = self._detect_bot_by_login(login)
+                    self.G.add_node(user_id, type="user", login=login, is_bot=is_bot)
 
                 self.G.add_edge(user_id, repo_id,
                     weight=contributions,
@@ -146,7 +148,7 @@ class CollaborationNetworkAnalyzer:
                     self.G.add_node(org_id, type="org", login=org_login)
                 self.G.add_edge(org_id, repo_id, weight=1, type="owns")
 
-        # 4. Enrich user nodes from users collection
+        # 4. Enrich user nodes from users collection (including is_bot flag)
         user_logins = [
             n.replace("user_", "") for n in self.G.nodes
             if self.G.nodes[n].get("type") == "user"
@@ -156,15 +158,18 @@ class CollaborationNetworkAnalyzer:
                 {"login": {"$in": user_logins}},
                 {
                     "_id": 0, "login": 1, "name": 1, "avatar_url": 1,
-                    "quantum_expertise_score": 1
+                    "quantum_expertise_score": 1, "is_bot": 1
                 }
             ):
                 uid = f"user_{doc['login']}"
                 if self.G.has_node(uid):
+                    # is_bot from DB takes precedence, fallback to login heuristic
+                    db_is_bot = doc.get("is_bot", False)
                     self.G.nodes[uid].update({
                         "name": doc.get("name"),
                         "avatar_url": doc.get("avatar_url"),
-                        "quantum_expertise_score": doc.get("quantum_expertise_score", 0)
+                        "quantum_expertise_score": doc.get("quantum_expertise_score", 0),
+                        "is_bot": db_is_bot or self.G.nodes[uid].get("is_bot", False)
                     })
 
         # 5. Enrich org nodes from orgs collection
@@ -232,7 +237,7 @@ class CollaborationNetworkAnalyzer:
         }
 
     # ========================================================================
-    # COLLABORATION SCORES — Meaningful centrality & connectivity per type
+    # COLLABORATION SCORES - Meaningful centrality & connectivity per type
     # ========================================================================
 
     def compute_collaboration_scores(self):
@@ -619,7 +624,7 @@ class CollaborationNetworkAnalyzer:
             except Exception:
                 pass
 
-        # diameter and avg_path_length are very expensive — skip for large components
+        # diameter and avg_path_length are very expensive - skip for large components
         diameter = 0
         avg_path_length = 0
         if largest_size > 1 and largest_size < 2000:
@@ -647,13 +652,31 @@ class CollaborationNetworkAnalyzer:
         }
 
     # ========================================================================
-    # SHORTEST PATH — Quantum Tunneling
+    # BOT DETECTION (heuristic by login name)
+    # ========================================================================
+
+    @staticmethod
+    def _detect_bot_by_login(login: str) -> bool:
+        """Quick heuristic bot detection by login name."""
+        low = login.lower()
+        if low.endswith("[bot]"):
+            return True
+        bot_patterns = [
+            "dependabot", "renovate", "greenkeeper", "snyk",
+            "codecov", "github-actions", "automation", "auto-",
+            "mergify", "stale", "allcontributors",
+        ]
+        return any(p in low for p in bot_patterns)
+
+    # ========================================================================
+    # SHORTEST PATH - Quantum Tunneling
     # ========================================================================
 
     def find_path(self, source_id, target_id):
         """
         Find shortest path between two nodes.
-        Returns detailed path with node info and edge info.
+        Avoids bot nodes as intermediaries (bots can still be source/target).
+        Falls back to full graph if no bot-free path exists.
         """
         if not self.G.has_node(source_id):
             return {"found": False, "error": f"Nodo origen '{source_id}' no encontrado"}
@@ -661,7 +684,20 @@ class CollaborationNetworkAnalyzer:
             return {"found": False, "error": f"Nodo destino '{target_id}' no encontrado"}
 
         try:
-            path_nodes = nx.shortest_path(self.G, source_id, target_id)
+            # Build subgraph excluding bots (but keep source/target even if bots)
+            non_bot_nodes = [
+                n for n in self.G.nodes
+                if not self.G.nodes[n].get("is_bot", False)
+                or n == source_id or n == target_id
+            ]
+            G_no_bots = self.G.subgraph(non_bot_nodes)
+
+            # Try bot-free path first
+            try:
+                path_nodes = nx.shortest_path(G_no_bots, source_id, target_id)
+            except nx.NetworkXNoPath:
+                # Fallback to full graph if no bot-free path exists
+                path_nodes = nx.shortest_path(self.G, source_id, target_id)
 
             path_details = []
             for node_id in path_nodes:
@@ -714,7 +750,7 @@ class CollaborationNetworkAnalyzer:
             return {"found": False, "error": str(e)}
 
     # ========================================================================
-    # SEARCHABLE NODES — For autocomplete in Quantum Tunneling UI
+    # SEARCHABLE NODES - For autocomplete in Quantum Tunneling UI
     # ========================================================================
 
     def get_searchable_nodes(self):
@@ -737,7 +773,7 @@ class CollaborationNetworkAnalyzer:
         return nodes
 
     # ========================================================================
-    # FULL ANALYSIS — Runs everything and returns combined result
+    # FULL ANALYSIS - Runs everything and returns combined result
     # ========================================================================
 
     def get_full_analysis(self):

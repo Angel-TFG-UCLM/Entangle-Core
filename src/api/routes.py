@@ -1812,7 +1812,7 @@ async def get_network_metrics(force_refresh: bool = Query(default=False)):
         analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
         full = analyzer.get_full_analysis()
         
-        # Construir respuesta compacta — solo lo que el frontend necesita
+        # Construir respuesta compacta - solo lo que el frontend necesita
         compact_node_metrics = {}
         for node_id, m in full.get("node_metrics", {}).items():
             entry = {
