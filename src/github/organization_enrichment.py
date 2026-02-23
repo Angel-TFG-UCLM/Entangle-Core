@@ -244,6 +244,10 @@ class OrganizationEnrichmentEngine:
                 updates["top_quantum_contributors"] = top_contributors
                 updates["quantum_contributors_count"] = len(top_contributors)
                 
+                # Total de contributors únicos (de collaborators en los repos)
+                total_unique = self._count_unique_contributors(quantum_repos_data["repos"])
+                updates["total_unique_contributors"] = total_unique
+                
                 # Stack tecnológico (top lenguajes)
                 top_languages = self._calculate_top_languages(quantum_repos_data["repo_ids"])
                 updates["top_languages"] = top_languages
@@ -256,6 +260,7 @@ class OrganizationEnrichmentEngine:
                 updates["quantum_repositories_count"] = 0
                 updates["top_quantum_contributors"] = []
                 updates["quantum_contributors_count"] = 0
+                updates["total_unique_contributors"] = 0
                 updates["top_languages"] = []
                 updates["total_stars"] = 0
             
@@ -449,6 +454,29 @@ class OrganizationEnrichmentEngine:
             logger.error(f"❌ Error buscando top contributors: {e}")
             return []
     
+    def _count_unique_contributors(self, repos: list) -> int:
+        """
+        Cuenta el total de contributors únicos sumando los collaborators
+        de todos los repos de la organización.
+        
+        Args:
+            repos: Lista de documentos de repositorio completos
+            
+        Returns:
+            Número de contributors únicos
+        """
+        try:
+            unique_logins = set()
+            for repo in repos:
+                for collab in (repo.get("collaborators") or []):
+                    login = collab.get("login", "")
+                    if login:
+                        unique_logins.add(login)
+            return len(unique_logins)
+        except Exception as e:
+            logger.error(f"❌ Error contando contributors únicos: {e}")
+            return 0
+
     def _calculate_top_languages(self, repo_ids: List[str], limit: int = 10) -> List[Dict[str, Any]]:
         """
         Calcula el stack tecnológico (top lenguajes) de los repos quantum.

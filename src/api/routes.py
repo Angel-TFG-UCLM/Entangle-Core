@@ -322,9 +322,24 @@ async def get_dashboard_stats(
                     "login": "$_id",
                     "name": {"$arrayElemAt": ["$org_info.name", 0]},
                     "avatar_url": {"$arrayElemAt": ["$org_info.avatar_url", 0]},
+                    "description": {"$arrayElemAt": ["$org_info.description", 0]},
+                    "members_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.members_count", 0]}, 0]},
                     "quantum_repositories_count": 1,
                     "total_stars": 1,
-                    "quantum_focus_score": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_focus_score", 0]}, 0]}
+                    "quantum_focus_score": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_focus_score", 0]}, 0]},
+                    "location": {"$arrayElemAt": ["$org_info.location", 0]},
+                    "is_verified": {"$ifNull": [{"$arrayElemAt": ["$org_info.is_verified", 0]}, False]},
+                    "created_at": {"$arrayElemAt": ["$org_info.created_at", 0]},
+                    "website_url": {"$arrayElemAt": ["$org_info.website_url", 0]},
+                    "twitter_username": {"$arrayElemAt": ["$org_info.twitter_username", 0]},
+                    "email": {"$arrayElemAt": ["$org_info.email", 0]},
+                    "quantum_contributors_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_contributors_count", 0]}, 0]},
+                    "total_repositories_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_repositories_count", 0]}, 0]},
+                    "total_members_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_members_count", 0]}, 0]},
+                    "total_unique_contributors": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_unique_contributors", 0]}, 0]},
+                    "top_languages": {"$ifNull": [{"$arrayElemAt": ["$org_info.top_languages", 0]}, []]},
+                    "is_quantum_focused": {"$ifNull": [{"$arrayElemAt": ["$org_info.is_quantum_focused", 0]}, False]},
+                    "top_quantum_contributors": {"$slice": [{"$ifNull": [{"$arrayElemAt": ["$org_info.top_quantum_contributors", 0]}, []]}, 5]}
                 }}
             ]
             chart_orgs = list(repos_collection.aggregate(top_orgs_pipeline))
@@ -336,9 +351,24 @@ async def get_dashboard_stats(
                     "login": 1,
                     "name": 1,
                     "avatar_url": 1,
+                    "description": 1,
+                    "members_count": {"$ifNull": ["$members_count", 0]},
                     "quantum_repositories_count": {"$ifNull": ["$quantum_repositories_count", 0]},
                     "total_stars": {"$ifNull": ["$total_stars", 0]},
-                    "quantum_focus_score": {"$ifNull": ["$quantum_focus_score", 0]}
+                    "quantum_focus_score": {"$ifNull": ["$quantum_focus_score", 0]},
+                    "location": 1,
+                    "is_verified": {"$ifNull": ["$is_verified", False]},
+                    "created_at": 1,
+                    "website_url": 1,
+                    "twitter_username": 1,
+                    "email": 1,
+                    "quantum_contributors_count": {"$ifNull": ["$quantum_contributors_count", 0]},
+                    "total_repositories_count": {"$ifNull": ["$total_repositories_count", 0]},
+                    "total_members_count": {"$ifNull": ["$total_members_count", 0]},
+                    "total_unique_contributors": {"$ifNull": ["$total_unique_contributors", 0]},
+                    "top_languages": {"$ifNull": ["$top_languages", []]},
+                    "is_quantum_focused": {"$ifNull": ["$is_quantum_focused", False]},
+                    "top_quantum_contributors": {"$ifNull": [{"$slice": ["$top_quantum_contributors", 5]}, []]}
                 }},
                 {"$sort": {"quantum_repositories_count": -1}},
                 {"$limit": 10}
@@ -356,7 +386,27 @@ async def get_dashboard_stats(
             "fork_count": {"$ifNull": ["$fork_count", 0]},
             "collaborators_count": {"$ifNull": ["$collaborators_count", 0]},
             "primary_language": 1,
-            "owner": 1
+            "owner": 1,
+            "url": 1,
+            "homepage_url": 1,
+            "repository_topics": 1,
+            "created_at": 1,
+            "updated_at": 1,
+            "pushed_at": 1,
+            "commits_count": {"$ifNull": ["$commits_count", 0]},
+            "issues_count": {"$ifNull": ["$issues_count", 0]},
+            "open_issues_count": {"$ifNull": ["$open_issues_count", 0]},
+            "pull_requests_count": {"$ifNull": ["$pull_requests_count", 0]},
+            "merged_pull_requests_count": {"$ifNull": ["$merged_pull_requests_count", 0]},
+            "open_pull_requests_count": {"$ifNull": ["$open_pull_requests_count", 0]},
+            "releases_count": {"$ifNull": ["$releases_count", 0]},
+            "latest_release": 1,
+            "license_info": 1,
+            "is_fork": {"$ifNull": ["$is_fork", False]},
+            "is_archived": {"$ifNull": ["$is_archived", False]},
+            "watchers_count": {"$ifNull": ["$watchers_count", 0]},
+            "languages": {"$ifNull": [{"$slice": ["$languages", 6]}, []]},
+            "default_branch_ref_name": 1
         }
         
         # Crear pipeline base con filtro opcional
@@ -428,7 +478,20 @@ async def get_dashboard_stats(
                         "total_pr_contributions": user_info.get("total_pr_contributions", 0) if user_info else 0,
                         "total_pr_review_contributions": user_info.get("total_pr_review_contributions", 0) if user_info else 0,
                         "total_issue_contributions": user_info.get("total_issue_contributions", 0) if user_info else 0,
-                        "organizations": user_info.get("organizations", []) if user_info else []
+                        "organizations": user_info.get("organizations", []) if user_info else [],
+                        "bio": user_info.get("bio") if user_info else None,
+                        "company": user_info.get("company") if user_info else None,
+                        "location": user_info.get("location") if user_info else None,
+                        "created_at": user_info.get("created_at") if user_info else None,
+                        "followers_count": user_info.get("followers_count", 0) if user_info else 0,
+                        "following_count": user_info.get("following_count", 0) if user_info else 0,
+                        "public_repos_count": user_info.get("public_repos_count", 0) if user_info else 0,
+                        "top_languages": user_info.get("top_languages", []) if user_info else [],
+                        "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0,
+                        "url": user_info.get("url") if user_info else None,
+                        "website_url": user_info.get("website_url") if user_info else None,
+                        "twitter_username": user_info.get("twitter_username") if user_info else None,
+                        "is_hireable": user_info.get("is_hireable", False) if user_info else False,
                     })
             else:
                 chart_users = []
@@ -506,15 +569,28 @@ async def get_dashboard_stats(
                     "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
                     "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
                     "total_issue_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_issue_contributions", 0]}, 0]},
-                    "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]}
+                    "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]},
+                    "bio": {"$arrayElemAt": ["$user_info.bio", 0]},
+                    "company": {"$arrayElemAt": ["$user_info.company", 0]},
+                    "location": {"$arrayElemAt": ["$user_info.location", 0]},
+                    "created_at": {"$arrayElemAt": ["$user_info.created_at", 0]},
+                    "followers_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.followers_count", 0]}, 0]},
+                    "following_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.following_count", 0]}, 0]},
+                    "public_repos_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.public_repos_count", 0]}, 0]},
+                    "top_languages": {"$ifNull": [{"$arrayElemAt": ["$user_info.top_languages", 0]}, []]},
+                    "quantum_expertise_score": {"$ifNull": [{"$arrayElemAt": ["$user_info.quantum_expertise_score", 0]}, 0]},
+                    "url": {"$arrayElemAt": ["$user_info.url", 0]},
+                    "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
+                    "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
+                    "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
                 }}
             ])
             chart_users = list(repos_collection.aggregate(top_users_pipeline))
         else:
             # Sin filtro de lenguaje ni repo
-            # Si hay collab_type o filtro de bots, necesitamos agregar desde repos
-            if (collab_type and collab_type != "all") or not include_bots:
-                # Pipeline desde repos para filtrar por tipo de colaborador
+            # Si hay org, collab_type, o filtro de bots, agregar desde repos
+            if org or (collab_type and collab_type != "all") or not include_bots:
+                # Pipeline desde repos para extraer colaboradores reales
                 base_match = {"collaborators": {"$exists": True, "$ne": []}}
                 if org:
                     base_match["$or"] = [{"owner.login": org}, {"organization.login": org}]
@@ -574,7 +650,20 @@ async def get_dashboard_stats(
                         "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
                         "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
                         "total_issue_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_issue_contributions", 0]}, 0]},
-                        "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]}
+                        "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]},
+                        "bio": {"$arrayElemAt": ["$user_info.bio", 0]},
+                        "company": {"$arrayElemAt": ["$user_info.company", 0]},
+                        "location": {"$arrayElemAt": ["$user_info.location", 0]},
+                        "created_at": {"$arrayElemAt": ["$user_info.created_at", 0]},
+                        "followers_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.followers_count", 0]}, 0]},
+                        "following_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.following_count", 0]}, 0]},
+                        "public_repos_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.public_repos_count", 0]}, 0]},
+                        "top_languages": {"$ifNull": [{"$arrayElemAt": ["$user_info.top_languages", 0]}, []]},
+                        "quantum_expertise_score": {"$ifNull": [{"$arrayElemAt": ["$user_info.quantum_expertise_score", 0]}, 0]},
+                        "url": {"$arrayElemAt": ["$user_info.url", 0]},
+                        "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
+                        "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
+                        "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
                     }}
                 ])
                 chart_users = list(repos_collection.aggregate(top_users_pipeline))
@@ -605,7 +694,20 @@ async def get_dashboard_stats(
                                 {"$ifNull": ["$total_issue_contributions", 0]}
                             ]
                         },
-                        "organizations": 1
+                        "organizations": 1,
+                        "bio": 1,
+                        "company": 1,
+                        "location": 1,
+                        "created_at": 1,
+                        "followers_count": {"$ifNull": ["$followers_count", 0]},
+                        "following_count": {"$ifNull": ["$following_count", 0]},
+                        "public_repos_count": {"$ifNull": ["$public_repos_count", 0]},
+                        "top_languages": {"$ifNull": ["$top_languages", []]},
+                        "quantum_expertise_score": {"$ifNull": ["$quantum_expertise_score", 0]},
+                        "url": 1,
+                        "website_url": 1,
+                        "twitter_username": 1,
+                        "is_hireable": {"$ifNull": ["$is_hireable", False]}
                     }},
                     {"$sort": {"total_contributions": -1, "relevant_repos_count": -1}},
                     {"$limit": 10}
@@ -3157,3 +3259,674 @@ def _run_full_pipeline_script(task_id: str):
         background_tasks_status[task_id]["progress"] = f"Error: {str(e)}"
         background_tasks_status[task_id]["error"] = str(e)
         background_tasks_status[task_id]["failed_at"] = datetime.now().isoformat()
+
+
+# ============================================================================
+# FAVORITOS Y VISTAS PERSONALIZADAS
+# ============================================================================
+
+@router.get("/favorites")
+async def get_favorites():
+    """Obtiene todos los favoritos guardados."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        prefs = db.get_collection("user_preferences")
+        doc = prefs.find_one({"type": "favorites"})
+        
+        return {"favorites": doc.get("items", []) if doc else []}
+    except Exception as e:
+        logger.error(f"Error obteniendo favoritos: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/favorites")
+async def add_favorite(favorite: Dict[str, Any]):
+    """
+    Añade una entidad a favoritos.
+    Body: { id, type, name, avatar_url? }
+    """
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        required = ["id", "type", "name"]
+        for field in required:
+            if field not in favorite:
+                raise HTTPException(status_code=400, detail=f"Campo requerido: {field}")
+        
+        prefs = db.get_collection("user_preferences")
+        
+        item = {
+            "id": favorite["id"],
+            "type": favorite["type"],
+            "name": favorite["name"],
+            "avatar_url": favorite.get("avatar_url"),
+            "added_at": datetime.now().isoformat()
+        }
+        
+        # Upsert: crear doc si no existe, añadir al array evitando duplicados
+        prefs.update_one(
+            {"type": "favorites"},
+            {"$pull": {"items": {"id": favorite["id"]}}},
+            upsert=True
+        )
+        prefs.update_one(
+            {"type": "favorites"},
+            {
+                "$push": {"items": item},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        logger.info(f"Favorito añadido: {favorite['name']} ({favorite['type']})")
+        return {"success": True, "favorite": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error añadiendo favorito: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/favorites/{entity_id:path}")
+async def remove_favorite(entity_id: str):
+    """Elimina una entidad de favoritos por su ID."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        prefs = db.get_collection("user_preferences")
+        result = prefs.update_one(
+            {"type": "favorites"},
+            {
+                "$pull": {"items": {"id": entity_id}},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Favorito no encontrado")
+        
+        logger.info(f"Favorito eliminado: {entity_id}")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error eliminando favorito: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/views")
+async def get_views():
+    """Obtiene todas las vistas personalizadas."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        prefs = db.get_collection("user_preferences")
+        doc = prefs.find_one({"type": "custom_views"})
+        
+        return {"views": doc.get("items", []) if doc else []}
+    except Exception as e:
+        logger.error(f"Error obteniendo vistas: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/views")
+async def save_view(view: Dict[str, Any]):
+    """
+    Crea o actualiza una vista personalizada.
+    Body: { id?, name, entity_ids[], color? }
+    """
+    try:
+        from ..core.db import db
+        import uuid
+        db.ensure_connection()
+        
+        if "name" not in view or "entity_ids" not in view:
+            raise HTTPException(status_code=400, detail="Campos requeridos: name, entity_ids")
+        
+        if not isinstance(view["entity_ids"], list) or len(view["entity_ids"]) == 0:
+            raise HTTPException(status_code=400, detail="entity_ids debe ser un array no vacío")
+        
+        prefs = db.get_collection("user_preferences")
+        
+        view_id = view.get("id", str(uuid.uuid4())[:8])
+        
+        item = {
+            "id": view_id,
+            "name": view["name"],
+            "entity_ids": view["entity_ids"],
+            "color": view.get("color", "#00ffaa"),
+            "created_at": view.get("created_at", datetime.now().isoformat()),
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        prefs.update_one(
+            {"type": "custom_views"},
+            {"$pull": {"items": {"id": view_id}}},
+            upsert=True
+        )
+        prefs.update_one(
+            {"type": "custom_views"},
+            {
+                "$push": {"items": item},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        logger.info(f"Vista guardada: '{view['name']}' con {len(view['entity_ids'])} entidades")
+        return {"success": True, "view": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error guardando vista: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/views/{view_id}")
+async def delete_view(view_id: str):
+    """Elimina una vista personalizada."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        prefs = db.get_collection("user_preferences")
+        result = prefs.update_one(
+            {"type": "custom_views"},
+            {
+                "$pull": {"items": {"id": view_id}},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Vista no encontrada")
+        
+        logger.info(f"Vista eliminada: {view_id}")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error eliminando vista: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/views/{view_id}/data")
+async def get_view_data(view_id: str, body: Dict[str, Any] = None):
+    """
+    Obtiene datos del dashboard filtrados para una vista personalizada.
+    Calcula KPIs, charts y tables solo para las entidades de la vista.
+    """
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        # Obtener entity_ids del body o de la vista guardada
+        entity_ids = None
+        if body and "entity_ids" in body:
+            entity_ids = body["entity_ids"]
+        else:
+            prefs = db.get_collection("user_preferences")
+            doc = prefs.find_one({"type": "custom_views"})
+            if doc:
+                view_item = next((v for v in doc.get("items", []) if v["id"] == view_id), None)
+                if view_item:
+                    entity_ids = view_item.get("entity_ids", [])
+        
+        if not entity_ids:
+            raise HTTPException(status_code=404, detail="Vista no encontrada o sin entidades")
+        
+        # Separar IDs por tipo (prefijo: user_, repo_, org_)
+        user_ids = []
+        repo_ids = []
+        org_ids = []
+        for eid in entity_ids:
+            if eid.startswith("user_"):
+                user_ids.append(eid[5:])
+            elif eid.startswith("repo_"):
+                repo_ids.append(eid[5:])
+            elif eid.startswith("org_"):
+                org_ids.append(eid[4:])
+        
+        repos_col = db.get_collection("repositories")
+        users_col = db.get_collection("users")
+        orgs_col = db.get_collection("organizations")
+
+        # ── Expansión jerárquica: org → repos → users ──
+        # Si hay orgs, añadir automáticamente sus repos
+        if org_ids:
+            org_repos = list(repos_col.find(
+                {"$or": [
+                    {"owner.login": {"$in": org_ids}},
+                    {"organization.login": {"$in": org_ids}},
+                ]},
+                {"full_name": 1, "collaborators": 1}
+            ))
+            for r in org_repos:
+                fn = r.get("full_name", "")
+                if fn and fn not in repo_ids:
+                    repo_ids.append(fn)
+
+        # Si hay repos (originales + derivados de orgs), añadir sus colaboradores
+        if repo_ids:
+            collab_repos = list(repos_col.find(
+                {"full_name": {"$in": repo_ids}},
+                {"collaborators": 1}
+            ))
+            for r in collab_repos:
+                for c in r.get("collaborators", []):
+                    login = c.get("login", "")
+                    if login and login not in user_ids:
+                        user_ids.append(login)
+        
+        # === Repos ===
+        repos = []
+        if repo_ids:
+            repos = list(repos_col.find(
+                {"full_name": {"$in": repo_ids}},
+                {"_id": 0, "full_name": 1, "name": 1, "description": 1,
+                 "stargazer_count": 1, "fork_count": 1, "primary_language": 1,
+                 "owner": 1, "organization": 1, "watchers_count": 1,
+                 "open_issues_count": 1, "created_at": 1, "updated_at": 1,
+                 "collaborators": 1, "collaborators_count": 1, "topics": 1,
+                 "language": 1, "size": 1, "license": 1, "is_fork": 1}
+            ))
+        
+        # === Users ===
+        users = []
+        if user_ids:
+            users = list(users_col.find(
+                {"login": {"$in": user_ids}},
+                {"_id": 0, "login": 1, "name": 1, "avatar_url": 1,
+                 "bio": 1, "company": 1, "location": 1,
+                 "public_repos": 1, "public_repos_count": 1,
+                 "followers": 1, "followers_count": 1,
+                 "following": 1, "following_count": 1,
+                 "contributions_last_year": 1, "quantum_expertise_score": 1,
+                 "organizations": 1, "created_at": 1,
+                 "top_languages": 1, "url": 1, "website_url": 1,
+                 "twitter_username": 1, "is_hireable": 1,
+                 "total_commit_contributions": 1, "total_pr_contributions": 1,
+                 "total_pr_review_contributions": 1, "total_issue_contributions": 1}
+            ))
+        
+        # === Orgs ===
+        orgs = []
+        if org_ids:
+            orgs = list(orgs_col.find(
+                {"login": {"$in": org_ids}},
+                {"_id": 0, "login": 1, "name": 1, "avatar_url": 1,
+                 "description": 1, "public_repos": 1, "followers": 1,
+                 "members_count": 1, "created_at": 1, "location": 1,
+                 "quantum_focus_score": 1, "is_verified": 1,
+                 "website_url": 1, "twitter_username": 1, "email": 1,
+                 "quantum_contributors_count": 1, "total_repositories_count": 1,
+                 "total_members_count": 1, "total_unique_contributors": 1, "top_languages": 1,
+                 "is_quantum_focused": 1, "top_quantum_contributors": 1}
+            ))
+        
+        # === Calcular KPIs ===
+        total_repos = len(repos)
+        total_users = len(users)
+        total_orgs = len(orgs)
+        
+        avg_stars = sum((r.get("stargazer_count") or 0) for r in repos) / max(total_repos, 1)
+        avg_expertise = sum((u.get("quantum_expertise_score") or 0) for u in users) / max(total_users, 1)
+        
+        lang_counts = {}
+        for r in repos:
+            lang = r.get("primary_language", {})
+            if isinstance(lang, dict):
+                lang = lang.get("name", "")
+            lang = lang or r.get("language", "")
+            if lang:
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
+        
+        top_language = max(lang_counts, key=lang_counts.get) if lang_counts else "N/A"
+        lang_distribution = [{"name": k, "value": v} for k, v in
+                            sorted(lang_counts.items(), key=lambda x: -x[1])[:10]]
+        
+        # === Calcular datos de charts compatibles con el dashboard global ===
+        # Orgs: quantum_repositories_count y total_stars (calculados desde repos de la vista)
+        chart_orgs = []
+        for org in orgs:
+            org_login = org.get("login", "")
+            org_repos_list = [r for r in repos if
+                (r.get("owner", {}) or {}).get("login") == org_login or
+                (r.get("organization", {}) or {}).get("login") == org_login]
+            chart_orgs.append({
+                "login": org_login,
+                "name": org.get("name") or org_login,
+                "avatar_url": org.get("avatar_url"),
+                "description": org.get("description"),
+                "quantum_repositories_count": len(org_repos_list),
+                "total_stars": sum((r.get("stargazer_count") or 0) for r in org_repos_list),
+                "members_count": org.get("members_count", 0),
+                "quantum_focus_score": org.get("quantum_focus_score", 0),
+                "location": org.get("location"),
+                "is_verified": org.get("is_verified", False),
+                "created_at": org.get("created_at"),
+                "website_url": org.get("website_url"),
+                "twitter_username": org.get("twitter_username"),
+                "email": org.get("email"),
+                "quantum_contributors_count": org.get("quantum_contributors_count", 0),
+                "total_repositories_count": org.get("total_repositories_count") or org.get("public_repos", 0),
+                "total_members_count": org.get("total_members_count") or org.get("members_count", 0),
+                "total_unique_contributors": org.get("total_unique_contributors", 0),
+                "top_languages": org.get("top_languages", []),
+                "is_quantum_focused": org.get("is_quantum_focused", False),
+                "top_quantum_contributors": (org.get("top_quantum_contributors") or [])[:5],
+            })
+        chart_orgs.sort(key=lambda o: o["quantum_repositories_count"], reverse=True)
+
+        # Users: total_contributions y relevant_repos_count (desde collaborators de repos)
+        user_contrib_map = {}  # login -> {contributions, repo_set}
+        for r in repos:
+            for c in r.get("collaborators", []):
+                login = c.get("login", "")
+                if not login:
+                    continue
+                if login not in user_contrib_map:
+                    user_contrib_map[login] = {"contributions": 0, "repos": set()}
+                user_contrib_map[login]["contributions"] += (c.get("contributions") or 0)
+                user_contrib_map[login]["repos"].add(r.get("full_name", ""))
+
+        chart_users = []
+        for u in users:
+            login = u.get("login", "")
+            contrib_info = user_contrib_map.get(login, {"contributions": 0, "repos": set()})
+            chart_users.append({
+                "login": login,
+                "name": u.get("name") or login,
+                "avatar_url": u.get("avatar_url"),
+                "total_contributions": contrib_info["contributions"],
+                "relevant_repos_count": len(contrib_info["repos"]),
+                "followers_count": u.get("followers_count") or u.get("followers", 0),
+                "quantum_expertise_score": u.get("quantum_expertise_score") or 0,
+                "bio": u.get("bio"),
+                "company": u.get("company"),
+                "location": u.get("location"),
+                "created_at": u.get("created_at"),
+                "following_count": u.get("following_count", 0),
+                "public_repos_count": u.get("public_repos_count", 0),
+                "top_languages": u.get("top_languages", []),
+                "url": u.get("url"),
+                "website_url": u.get("website_url"),
+                "twitter_username": u.get("twitter_username"),
+                "is_hireable": u.get("is_hireable", False),
+                "organizations": u.get("organizations", []),
+                "total_commit_contributions": u.get("total_commit_contributions", 0),
+                "total_pr_contributions": u.get("total_pr_contributions", 0),
+                "total_pr_review_contributions": u.get("total_pr_review_contributions", 0),
+                "total_issue_contributions": u.get("total_issue_contributions", 0),
+            })
+        chart_users.sort(key=lambda u: u["total_contributions"], reverse=True)
+
+        response = {
+            "kpis": {
+                "totalRepos": total_repos,
+                "totalUsers": total_users,
+                "totalOrgs": total_orgs,
+                "avgStars": round(avg_stars),
+                "avgExpertise": round(avg_expertise, 2),
+                "topLanguage": top_language,
+            },
+            "charts": {
+                "organizations": chart_orgs,
+                "repositories": sorted(repos, key=lambda r: (r.get("stargazer_count") or 0), reverse=True),
+                "users": chart_users,
+                "languageDistribution": lang_distribution,
+            },
+            "tables": {
+                "repositories": sorted(repos, key=lambda r: (r.get("stargazer_count") or 0), reverse=True)[:20],
+                "users": sorted(chart_users, key=lambda u: u.get("quantum_expertise_score", 0), reverse=True)[:20],
+            },
+            "metadata": {
+                "viewId": view_id,
+                "entityCount": len(entity_ids),
+                "calculatedAt": datetime.now().isoformat(),
+            }
+        }
+        
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calculando datos de vista {view_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ENDPOINT DE JERARQUÍA DE FAVORITOS (org → repos → users)
+# ============================================================================
+
+@router.get("/favorites/{entity_id:path}/children")
+async def get_favorite_children(entity_id: str):
+    """
+    Devuelve los hijos jerárquicos de un favorito.
+    - org_<login> → sus repos (con colaboradores resumidos)
+    - repo_<full_name> → sus colaboradores (con flag bridge)
+    Herencia unidireccional: org → repo → user
+    """
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+
+        if entity_id.startswith("org_"):
+            org_login = entity_id[4:]
+            repos_col = db.get_collection("repositories")
+            org_repos = list(repos_col.find(
+                {"$or": [
+                    {"owner.login": org_login},
+                    {"organization.login": org_login},
+                ]},
+                {"full_name": 1, "name": 1, "stargazer_count": 1,
+                 "primary_language": 1, "collaborators": 1,
+                 "fork_count": 1, "description": 1}
+            ))
+
+            children = []
+            for r in org_repos:
+                lang = r.get("primary_language", {})
+                if isinstance(lang, dict):
+                    lang = lang.get("name", "")
+                lang = lang or ""
+                collabs = r.get("collaborators", [])
+
+                children.append({
+                    "id": f"repo_{r['full_name']}",
+                    "name": r["full_name"],
+                    "type": "repository",
+                    "subtitle": f"⭐ {r.get('stargazer_count', 0)}"
+                               + (f" · {lang}" if lang else ""),
+                    "collaborators_count": len(collabs),
+                    "has_children": len(collabs) > 0,
+                })
+
+            return {
+                "parent_id": entity_id,
+                "children": sorted(children,
+                    key=lambda x: int(x["subtitle"].split("⭐ ")[1].split(" ·")[0]) if "⭐" in x["subtitle"] else 0,
+                    reverse=True),
+            }
+
+        elif entity_id.startswith("repo_"):
+            repo_full_name = entity_id[5:]
+            repos_col = db.get_collection("repositories")
+            repo = repos_col.find_one(
+                {"full_name": repo_full_name},
+                {"collaborators": 1, "full_name": 1}
+            )
+            if not repo:
+                return {"parent_id": entity_id, "children": []}
+
+            collabs = repo.get("collaborators", [])
+            collab_logins = [c.get("login", "") for c in collabs if c.get("login")]
+
+            # Determinar bridge users (aparecen en 2+ repos)
+            user_repo_counts = {}
+            if collab_logins:
+                all_repos_with_collabs = repos_col.find(
+                    {"collaborators.login": {"$in": collab_logins}},
+                    {"collaborators.login": 1}
+                )
+                for r in all_repos_with_collabs:
+                    for c in r.get("collaborators", []):
+                        login = c.get("login", "")
+                        if login in collab_logins:
+                            user_repo_counts[login] = user_repo_counts.get(login, 0) + 1
+
+            # Obtener info básica de users
+            users_col = db.get_collection("users")
+            user_docs = {}
+            if collab_logins:
+                for u in users_col.find(
+                    {"login": {"$in": collab_logins}},
+                    {"login": 1, "name": 1, "avatar_url": 1}
+                ):
+                    user_docs[u["login"]] = u
+
+            children = []
+            for c in collabs:
+                login = c.get("login", "")
+                if not login:
+                    continue
+                is_bridge = user_repo_counts.get(login, 0) >= 2
+                user_info = user_docs.get(login, {})
+                children.append({
+                    "id": f"user_{login}",
+                    "name": user_info.get("name") or login,
+                    "login": login,
+                    "type": "user",
+                    "is_bridge": is_bridge,
+                    "contributions": c.get("contributions", 0),
+                    "subtitle": f"{c.get('contributions', 0)} contrib."
+                               + (" · Bridge" if is_bridge else ""),
+                })
+
+            # Bridge users primero, luego por contribuciones
+            children.sort(key=lambda x: (0 if x["is_bridge"] else 1, -x["contributions"]))
+
+            return {
+                "parent_id": entity_id,
+                "children": children,
+            }
+
+        else:
+            return {"parent_id": entity_id, "children": []}
+
+    except Exception as e:
+        logger.error(f"Error obteniendo hijos de {entity_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/search/entities")
+async def search_entities(
+    q: str = Query(..., min_length=2, max_length=100, description="Texto de búsqueda"),
+    limit: int = Query(default=15, ge=1, le=50, description="Máximo de resultados")
+):
+    """
+    Búsqueda unificada a través de usuarios, repositorios y organizaciones.
+    Busca por nombre/login con regex case-insensitive.
+    Devuelve resultados formateados para el panel de favoritos.
+    """
+    try:
+        from ..core.db import db
+        import re
+
+        # Escapar caracteres especiales de regex en el input del usuario
+        escaped_q = re.escape(q)
+        regex_filter = {"$regex": escaped_q, "$options": "i"}
+
+        results = []
+        per_type_limit = max(limit // 3, 5)
+
+        # --- Buscar usuarios ---
+        try:
+            user_col = db.get_collection("users")
+            user_cursor = user_col.find(
+                {"$or": [
+                    {"login": regex_filter},
+                    {"name": regex_filter},
+                ]},
+                {"login": 1, "name": 1, "avatar_url": 1, "bio": 1}
+            ).limit(per_type_limit)
+            for u in user_cursor:
+                results.append({
+                    "id": f"user_{u['login']}",
+                    "name": u.get("name") or u["login"],
+                    "login": u["login"],
+                    "type": "user",
+                    "avatar": u.get("avatar_url", ""),
+                    "subtitle": u.get("bio", "") or "",
+                })
+        except Exception as e:
+            logger.warning(f"Error buscando usuarios: {e}")
+
+        # --- Buscar repositorios ---
+        try:
+            repo_col = db.get_collection("repositories")
+            repo_cursor = repo_col.find(
+                {"$or": [
+                    {"full_name": regex_filter},
+                    {"name": regex_filter},
+                    {"description": regex_filter},
+                ]},
+                {"full_name": 1, "name": 1, "description": 1, "stargazer_count": 1, "primary_language": 1}
+            ).limit(per_type_limit)
+            for r in repo_cursor:
+                lang = r.get("primary_language", {})
+                if isinstance(lang, dict):
+                    lang = lang.get("name", "")
+                lang = lang or ""
+                results.append({
+                    "id": f"repo_{r['full_name']}",
+                    "name": r["full_name"],
+                    "login": r["full_name"],
+                    "type": "repository",
+                    "avatar": "",
+                    "subtitle": f"⭐ {r.get('stargazer_count', 0)}"
+                               + (f" · {lang}" if lang else ""),
+                })
+        except Exception as e:
+            logger.warning(f"Error buscando repositorios: {e}")
+
+        # --- Buscar organizaciones ---
+        try:
+            org_col = db.get_collection("organizations")
+            org_cursor = org_col.find(
+                {"$or": [
+                    {"login": regex_filter},
+                    {"name": regex_filter},
+                ]},
+                {"login": 1, "name": 1, "description": 1, "avatar_url": 1}
+            ).limit(per_type_limit)
+            for o in org_cursor:
+                results.append({
+                    "id": f"org_{o['login']}",
+                    "name": o.get("name") or o["login"],
+                    "login": o["login"],
+                    "type": "organization",
+                    "avatar": o.get("avatar_url", ""),
+                    "subtitle": (o.get("description", "") or "")[:80],
+                })
+        except Exception as e:
+            logger.warning(f"Error buscando organizaciones: {e}")
+
+        # Ordenar: coincidencias exactas primero
+        q_lower = q.lower()
+        results.sort(key=lambda x: (
+            0 if x["name"].lower() == q_lower or x.get("login", "").lower() == q_lower
+            else 1 if x["name"].lower().startswith(q_lower) or x.get("login", "").lower().startswith(q_lower)
+            else 2
+        ))
+
+        return {
+            "query": q,
+            "count": len(results),
+            "results": results[:limit],
+        }
+    except Exception as e:
+        logger.error(f"Error en búsqueda de entidades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
