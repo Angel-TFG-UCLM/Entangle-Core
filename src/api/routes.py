@@ -22,6 +22,7 @@ from ..github.graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
 from ..core.config import config, ingestion_config
 from ..core.mongo_repository import MongoRepository
+from ..analysis.network_metrics import CollaborationNetworkAnalyzer
 
 # Router principal
 router = APIRouter()
@@ -52,6 +53,9 @@ async def get_stats():
     Obtiene estadísticas generales del sistema (Simple counts).
     Retorna el conteo total de repositorios, usuarios y organizaciones.
     
+    Caché PERMANENTE en colección 'metrics'. Se invalida vía refresh-metrics
+    o al completarse ingestas/enriquecimientos.
+    
     NOTA: Para dashboard completo con caché, usar /dashboard/stats
     """
     try:
@@ -60,7 +64,15 @@ async def get_stats():
         # Asegurar conexión activa (reconecta automáticamente si está caída)
         db.ensure_connection()
         
-        # Obtener colecciones
+        metrics_collection = db.get_collection("metrics")
+        
+        # 1. Intentar servir desde caché permanente
+        cached = metrics_collection.find_one({"type": "simple_counts"})
+        if cached and "data" in cached:
+            logger.info("📊 /stats servido desde caché permanente")
+            return cached["data"]
+        
+        # 2. Calcular y guardar en caché
         repos_collection = db.get_collection("repositories")
         users_collection = db.get_collection("users")
         orgs_collection = db.get_collection("organizations")
@@ -70,12 +82,22 @@ async def get_stats():
         users_count = users_collection.count_documents({}, maxTimeMS=5000)
         orgs_count = orgs_collection.count_documents({}, maxTimeMS=5000)
         
-        return {
+        result = {
             "repositories": repos_count,
             "users": users_count,
             "organizations": orgs_count,
             "timestamp": datetime.now().isoformat()
         }
+        
+        # Guardar en caché permanente
+        metrics_collection.update_one(
+            {"type": "simple_counts"},
+            {"$set": {"type": "simple_counts", "data": result, "updated_at": datetime.now()}},
+            upsert=True
+        )
+        logger.info(f"📊 /stats calculado y cacheado: {repos_count} repos, {users_count} users, {orgs_count} orgs")
+        
+        return result
     except Exception as e:
         error_msg = f"Error al obtener estadísticas: {str(e)}"
         logger.error(error_msg, exc_info=True)
@@ -118,37 +140,29 @@ async def get_dashboard_stats(
         # Asegurar conexión activa
         db.ensure_connection()
         
-        # Configuración de caché (1 hora - más frecuente para datos dinámicos)
-        CACHE_TTL_HOURS = 1
         current_time = datetime.now()
         
         # Detectar si hay filtros activos
-        has_filters = bool(org or language or repo or collab_type or not include_bots)
+        # include_bots=False es el default, solo cuenta como filtro si es True
+        has_filters = bool(org or language or repo or collab_type or include_bots)
         
         # 1. INTENTAR OBTENER CACHÉ (solo si no hay filtros y no se fuerza refresh)
+        # Caché PERMANENTE: sin TTL, persiste hasta invalidación explícita
         metrics_collection = db.get_collection("metrics")
         
         if not force_refresh and not has_filters:
             cached_stats = metrics_collection.find_one({"type": "dashboard_stats"})
             
             if cached_stats:
-                updated_at = cached_stats.get("updated_at")
-                if updated_at and isinstance(updated_at, datetime):
-                    age_hours = (current_time - updated_at).total_seconds() / 3600
-                    
-                    # Si el caché es fresco (< 1h), retornarlo
-                    if age_hours < CACHE_TTL_HOURS:
-                        logger.info(f"📊 Cache HIT - Dashboard stats servido desde caché ({age_hours:.1f}h antiguo)")
-                        
-                        # Agregar metadatos de caché
-                        response_data = cached_stats.get("data", {})
-                        response_data["metadata"] = {
-                            "cached": True,
-                            "calculatedAt": updated_at.isoformat(),
-                            "expiresAt": (updated_at + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
-                            "ageHours": round(age_hours, 2)
-                        }
-                        return response_data
+                updated_at = cached_stats.get("updated_at", current_time)
+                logger.info(f"📊 Cache HIT - Dashboard stats servido desde caché permanente")
+                
+                response_data = cached_stats.get("data", {})
+                response_data["metadata"] = {
+                    "cached": True,
+                    "calculatedAt": updated_at.isoformat() if isinstance(updated_at, datetime) else str(updated_at),
+                }
+                return response_data
         
         # Log de filtros activos
         if has_filters:
@@ -277,9 +291,12 @@ async def get_dashboard_stats(
             "topLanguage": top_language
         }
         
-        # === CHART: TOP 10 ORGANIZACIONES (por repos) ===
-        # Si hay filtro de lenguaje, calcular dinámicamente desde repos
-        # Si no, usar datos pre-calculados de la colección organizations
+        # === CHART: TOP 10 ORGANIZACIONES (por métrica seleccionada) ===
+        # Se generan 4 rankings: byRepos, byStars, byQuantumFocus, byContributors
+        # Para quantum focus se exige un mínimo de 3 repos quantum para evitar
+        # que orgs triviales con 1 solo repo aparezcan con 100%
+        MIN_REPOS_FOR_FOCUS = 3
+        
         if language:
             # Calcular repos por org filtrando por lenguaje
             lang_filter_for_orgs = {"$or": [
@@ -287,7 +304,8 @@ async def get_dashboard_stats(
                 {"primary_language": language}
             ]}
             
-            top_orgs_pipeline = [
+            # Pipeline base: agrupar repos por org, hacer lookup, proyectar
+            lang_org_base = [
                 {"$match": lang_filter_for_orgs},
                 {"$group": {
                     "_id": {"$ifNull": ["$owner.login", "$organization.login"]},
@@ -295,8 +313,6 @@ async def get_dashboard_stats(
                     "total_stars": {"$sum": {"$ifNull": ["$stargazer_count", 0]}}
                 }},
                 {"$match": {"_id": {"$ne": None}}},
-                {"$sort": {"quantum_repositories_count": -1}},
-                {"$limit": 10},
                 {"$lookup": {
                     "from": "organizations",
                     "localField": "_id",
@@ -308,28 +324,87 @@ async def get_dashboard_stats(
                     "login": "$_id",
                     "name": {"$arrayElemAt": ["$org_info.name", 0]},
                     "avatar_url": {"$arrayElemAt": ["$org_info.avatar_url", 0]},
+                    "description": {"$arrayElemAt": ["$org_info.description", 0]},
+                    "members_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.members_count", 0]}, 0]},
                     "quantum_repositories_count": 1,
                     "total_stars": 1,
-                    "quantum_focus_score": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_focus_score", 0]}, 0]}
+                    "quantum_focus_score": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_focus_score", 0]}, 0]},
+                    "location": {"$arrayElemAt": ["$org_info.location", 0]},
+                    "is_verified": {"$ifNull": [{"$arrayElemAt": ["$org_info.is_verified", 0]}, False]},
+                    "created_at": {"$arrayElemAt": ["$org_info.created_at", 0]},
+                    "website_url": {"$arrayElemAt": ["$org_info.website_url", 0]},
+                    "twitter_username": {"$arrayElemAt": ["$org_info.twitter_username", 0]},
+                    "email": {"$arrayElemAt": ["$org_info.email", 0]},
+                    "quantum_contributors_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_contributors_count", 0]}, 0]},
+                    "total_repositories_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_repositories_count", 0]}, 0]},
+                    "total_members_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_members_count", 0]}, 0]},
+                    "total_unique_contributors": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_unique_contributors", 0]}, 0]},
+                    "top_languages": {"$ifNull": [{"$arrayElemAt": ["$org_info.top_languages", 0]}, []]},
+                    "is_quantum_focused": {"$ifNull": [{"$arrayElemAt": ["$org_info.is_quantum_focused", 0]}, False]},
+                    "top_quantum_contributors": {"$slice": [{"$ifNull": [{"$arrayElemAt": ["$org_info.top_quantum_contributors", 0]}, []]}, 5]}
                 }}
             ]
-            chart_orgs = list(repos_collection.aggregate(top_orgs_pipeline))
+            
+            chart_orgs = {
+                "byRepos": list(repos_collection.aggregate(lang_org_base + [
+                    {"$sort": {"quantum_repositories_count": -1}}, {"$limit": 10}
+                ])),
+                "byStars": list(repos_collection.aggregate(lang_org_base + [
+                    {"$sort": {"total_stars": -1}}, {"$limit": 10}
+                ])),
+                "byQuantumFocus": list(repos_collection.aggregate(lang_org_base + [
+                    {"$match": {"quantum_repositories_count": {"$gte": MIN_REPOS_FOR_FOCUS}}},
+                    {"$sort": {"quantum_focus_score": -1}}, {"$limit": 10}
+                ])),
+                "byContributors": list(repos_collection.aggregate(lang_org_base + [
+                    {"$sort": {"total_unique_contributors": -1}}, {"$limit": 10}
+                ]))
+            }
         else:
-            # Sin filtro de lenguaje: usar datos pre-calculados
-            top_orgs_pipeline = [
-                {"$project": {
-                    "_id": 0,
-                    "login": 1,
-                    "name": 1,
-                    "avatar_url": 1,
-                    "quantum_repositories_count": {"$ifNull": ["$quantum_repositories_count", 0]},
-                    "total_stars": {"$ifNull": ["$total_stars", 0]},
-                    "quantum_focus_score": {"$ifNull": ["$quantum_focus_score", 0]}
-                }},
-                {"$sort": {"quantum_repositories_count": -1}},
-                {"$limit": 10}
-            ]
-            chart_orgs = list(orgs_collection.aggregate(top_orgs_pipeline))
+            # Sin filtro de lenguaje: usar datos pre-calculados de la colección organizations
+            org_base_projection = {
+                "_id": 0,
+                "login": 1,
+                "name": 1,
+                "avatar_url": 1,
+                "description": 1,
+                "members_count": {"$ifNull": ["$members_count", 0]},
+                "quantum_repositories_count": {"$ifNull": ["$quantum_repositories_count", 0]},
+                "total_stars": {"$ifNull": ["$total_stars", 0]},
+                "quantum_focus_score": {"$ifNull": ["$quantum_focus_score", 0]},
+                "location": 1,
+                "is_verified": {"$ifNull": ["$is_verified", False]},
+                "created_at": 1,
+                "website_url": 1,
+                "twitter_username": 1,
+                "email": 1,
+                "quantum_contributors_count": {"$ifNull": ["$quantum_contributors_count", 0]},
+                "total_repositories_count": {"$ifNull": ["$total_repositories_count", 0]},
+                "total_members_count": {"$ifNull": ["$total_members_count", 0]},
+                "total_unique_contributors": {"$ifNull": ["$total_unique_contributors", 0]},
+                "top_languages": {"$ifNull": ["$top_languages", []]},
+                "is_quantum_focused": {"$ifNull": ["$is_quantum_focused", False]},
+                "top_quantum_contributors": {"$ifNull": [{"$slice": ["$top_quantum_contributors", 5]}, []]}
+            }
+            
+            def make_org_pipeline(sort_field, match_filter=None, limit=10):
+                pipeline = []
+                if match_filter:
+                    pipeline.append({"$match": match_filter})
+                pipeline.append({"$project": org_base_projection})
+                pipeline.append({"$sort": {sort_field: -1}})
+                pipeline.append({"$limit": limit})
+                return pipeline
+            
+            chart_orgs = {
+                "byRepos": list(orgs_collection.aggregate(make_org_pipeline("quantum_repositories_count"))),
+                "byStars": list(orgs_collection.aggregate(make_org_pipeline("total_stars"))),
+                "byQuantumFocus": list(orgs_collection.aggregate(make_org_pipeline(
+                    "quantum_focus_score",
+                    match_filter={"quantum_repositories_count": {"$gte": MIN_REPOS_FOR_FOCUS}}
+                ))),
+                "byContributors": list(orgs_collection.aggregate(make_org_pipeline("total_unique_contributors")))
+            }
         
         # === CHART: TOP 10 REPOSITORIOS POR DIFERENTES MÉTRICAS ===
         repo_base_projection = {
@@ -342,7 +417,27 @@ async def get_dashboard_stats(
             "fork_count": {"$ifNull": ["$fork_count", 0]},
             "collaborators_count": {"$ifNull": ["$collaborators_count", 0]},
             "primary_language": 1,
-            "owner": 1
+            "owner": 1,
+            "url": 1,
+            "homepage_url": 1,
+            "repository_topics": 1,
+            "created_at": 1,
+            "updated_at": 1,
+            "pushed_at": 1,
+            "commits_count": {"$ifNull": ["$commits_count", 0]},
+            "issues_count": {"$ifNull": ["$issues_count", 0]},
+            "open_issues_count": {"$ifNull": ["$open_issues_count", 0]},
+            "pull_requests_count": {"$ifNull": ["$pull_requests_count", 0]},
+            "merged_pull_requests_count": {"$ifNull": ["$merged_pull_requests_count", 0]},
+            "open_pull_requests_count": {"$ifNull": ["$open_pull_requests_count", 0]},
+            "releases_count": {"$ifNull": ["$releases_count", 0]},
+            "latest_release": 1,
+            "license_info": 1,
+            "is_fork": {"$ifNull": ["$is_fork", False]},
+            "is_archived": {"$ifNull": ["$is_archived", False]},
+            "watchers_count": {"$ifNull": ["$watchers_count", 0]},
+            "languages": {"$ifNull": [{"$slice": ["$languages", 6]}, []]},
+            "default_branch_ref_name": 1
         }
         
         # Crear pipeline base con filtro opcional
@@ -414,7 +509,20 @@ async def get_dashboard_stats(
                         "total_pr_contributions": user_info.get("total_pr_contributions", 0) if user_info else 0,
                         "total_pr_review_contributions": user_info.get("total_pr_review_contributions", 0) if user_info else 0,
                         "total_issue_contributions": user_info.get("total_issue_contributions", 0) if user_info else 0,
-                        "organizations": user_info.get("organizations", []) if user_info else []
+                        "organizations": user_info.get("organizations", []) if user_info else [],
+                        "bio": user_info.get("bio") if user_info else None,
+                        "company": user_info.get("company") if user_info else None,
+                        "location": user_info.get("location") if user_info else None,
+                        "created_at": user_info.get("created_at") if user_info else None,
+                        "followers_count": user_info.get("followers_count", 0) if user_info else 0,
+                        "following_count": user_info.get("following_count", 0) if user_info else 0,
+                        "public_repos_count": user_info.get("public_repos_count", 0) if user_info else 0,
+                        "top_languages": user_info.get("top_languages", []) if user_info else [],
+                        "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0,
+                        "url": user_info.get("url") if user_info else None,
+                        "website_url": user_info.get("website_url") if user_info else None,
+                        "twitter_username": user_info.get("twitter_username") if user_info else None,
+                        "is_hireable": user_info.get("is_hireable", False) if user_info else False,
                     })
             else:
                 chart_users = []
@@ -492,15 +600,28 @@ async def get_dashboard_stats(
                     "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
                     "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
                     "total_issue_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_issue_contributions", 0]}, 0]},
-                    "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]}
+                    "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]},
+                    "bio": {"$arrayElemAt": ["$user_info.bio", 0]},
+                    "company": {"$arrayElemAt": ["$user_info.company", 0]},
+                    "location": {"$arrayElemAt": ["$user_info.location", 0]},
+                    "created_at": {"$arrayElemAt": ["$user_info.created_at", 0]},
+                    "followers_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.followers_count", 0]}, 0]},
+                    "following_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.following_count", 0]}, 0]},
+                    "public_repos_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.public_repos_count", 0]}, 0]},
+                    "top_languages": {"$ifNull": [{"$arrayElemAt": ["$user_info.top_languages", 0]}, []]},
+                    "quantum_expertise_score": {"$ifNull": [{"$arrayElemAt": ["$user_info.quantum_expertise_score", 0]}, 0]},
+                    "url": {"$arrayElemAt": ["$user_info.url", 0]},
+                    "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
+                    "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
+                    "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
                 }}
             ])
             chart_users = list(repos_collection.aggregate(top_users_pipeline))
         else:
             # Sin filtro de lenguaje ni repo
-            # Si hay collab_type o filtro de bots, necesitamos agregar desde repos
-            if (collab_type and collab_type != "all") or not include_bots:
-                # Pipeline desde repos para filtrar por tipo de colaborador
+            # Si hay org, collab_type, o filtro de bots, agregar desde repos
+            if org or (collab_type and collab_type != "all") or not include_bots:
+                # Pipeline desde repos para extraer colaboradores reales
                 base_match = {"collaborators": {"$exists": True, "$ne": []}}
                 if org:
                     base_match["$or"] = [{"owner.login": org}, {"organization.login": org}]
@@ -560,7 +681,20 @@ async def get_dashboard_stats(
                         "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
                         "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
                         "total_issue_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_issue_contributions", 0]}, 0]},
-                        "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]}
+                        "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]},
+                        "bio": {"$arrayElemAt": ["$user_info.bio", 0]},
+                        "company": {"$arrayElemAt": ["$user_info.company", 0]},
+                        "location": {"$arrayElemAt": ["$user_info.location", 0]},
+                        "created_at": {"$arrayElemAt": ["$user_info.created_at", 0]},
+                        "followers_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.followers_count", 0]}, 0]},
+                        "following_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.following_count", 0]}, 0]},
+                        "public_repos_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.public_repos_count", 0]}, 0]},
+                        "top_languages": {"$ifNull": [{"$arrayElemAt": ["$user_info.top_languages", 0]}, []]},
+                        "quantum_expertise_score": {"$ifNull": [{"$arrayElemAt": ["$user_info.quantum_expertise_score", 0]}, 0]},
+                        "url": {"$arrayElemAt": ["$user_info.url", 0]},
+                        "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
+                        "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
+                        "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
                     }}
                 ])
                 chart_users = list(repos_collection.aggregate(top_users_pipeline))
@@ -591,7 +725,20 @@ async def get_dashboard_stats(
                                 {"$ifNull": ["$total_issue_contributions", 0]}
                             ]
                         },
-                        "organizations": 1
+                        "organizations": 1,
+                        "bio": 1,
+                        "company": 1,
+                        "location": 1,
+                        "created_at": 1,
+                        "followers_count": {"$ifNull": ["$followers_count", 0]},
+                        "following_count": {"$ifNull": ["$following_count", 0]},
+                        "public_repos_count": {"$ifNull": ["$public_repos_count", 0]},
+                        "top_languages": {"$ifNull": ["$top_languages", []]},
+                        "quantum_expertise_score": {"$ifNull": ["$quantum_expertise_score", 0]},
+                        "url": 1,
+                        "website_url": 1,
+                        "twitter_username": 1,
+                        "is_hireable": {"$ifNull": ["$is_hireable", False]}
                     }},
                     {"$sort": {"total_contributions": -1, "relevant_repos_count": -1}},
                     {"$limit": 10}
@@ -726,8 +873,6 @@ async def get_dashboard_stats(
             "metadata": {
                 "cached": False,
                 "calculatedAt": current_time.isoformat(),
-                "expiresAt": (current_time + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
-                "ageHours": 0,
                 "activeFilters": {
                     "org": org,
                     "language": language,
@@ -752,7 +897,7 @@ async def get_dashboard_stats(
                 upsert=True
             )
             
-            logger.info(f"✅ Dashboard stats COMPLETO calculado y guardado en caché (válido por {CACHE_TTL_HOURS}h)")
+            logger.info("✅ Dashboard stats COMPLETO calculado y guardado en caché permanente")
         else:
             logger.info(f"✅ Dashboard stats CON FILTROS calculado (no cacheado)")
         
@@ -764,18 +909,1169 @@ async def get_dashboard_stats(
         raise HTTPException(status_code=500, detail=error_msg)
 
 
+def invalidate_all_caches():
+    """
+    Invalida TODAS las cachés de la aplicación (MongoDB + memoria).
+    
+    Se llama desde:
+    - POST /dashboard/refresh-metrics (botón de actualizar)
+    - Al completarse cualquier tarea de ingesta o enriquecimiento
+    
+    Cachés invalidadas:
+    - collaboration_graph (chunked en metrics)
+    - network_metrics (chunked en metrics + in-memory)
+    - dashboard_stats (doc en metrics)
+    - simple_counts (doc en metrics)
+    - collab_analysis_* (docs de análisis por usuario/repos/orgs en metrics)
+    """
+    from ..core.db import db
+    from ..core.chunked_cache import delete_chunked
+    
+    db.ensure_connection()
+    metrics = db.get_collection("metrics")
+    
+    # Cachés chunked (documentos grandes >2MB)
+    graph_deleted = delete_chunked(metrics, "collaboration_graph")
+    nm_deleted = delete_chunked(metrics, "network_metrics")
+    
+    # Caché en memoria de network metrics
+    _network_metrics_cache["json_bytes"] = None
+    _network_metrics_cache["computed_at"] = None
+    _network_metrics_cache["analyzer"] = None
+    
+    # Cachés de documento simple
+    stats_deleted = metrics.delete_one({"type": "dashboard_stats"}).deleted_count
+    counts_deleted = metrics.delete_one({"type": "simple_counts"}).deleted_count
+    
+    # Cachés de análisis de colaboración (por usuario/repos/orgs)
+    analyze_deleted = metrics.delete_many(
+        {"_id": {"$regex": "^collab_analysis_"}}
+    ).deleted_count
+    
+    summary = {
+        "collaboration_graph_chunks": graph_deleted,
+        "network_metrics_chunks": nm_deleted,
+        "dashboard_stats": stats_deleted,
+        "simple_counts": counts_deleted,
+        "collaboration_analyses": analyze_deleted,
+    }
+    
+    logger.info(f"[INVALIDATE_ALL] Todas las cachés invalidadas: {summary}")
+    return summary
+
+
 @router.post("/dashboard/refresh-metrics")
 async def refresh_dashboard_metrics():
     """
-    Fuerza el recálculo de métricas del dashboard.
-    Útil después de ingestas/enriquecimientos.
+    Invalida TODAS las cachés de la aplicación.
+    El frontend se encarga de recargar datos frescos con force_refresh
+    después de llamar a este endpoint.
+    
+    Útil después de ingestas/enriquecimientos o al pulsar el botón de actualizar.
     """
     try:
-        # Llamar al endpoint de stats con force_refresh
-        return await get_dashboard_stats(force_refresh=True)
+        result = invalidate_all_caches()
+        return {"invalidated": True, "details": result}
     except Exception as e:
-        logger.error(f"Error al refrescar métricas: {e}")
+        logger.error(f"Error al invalidar cachés: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# COLLABORATION DISCOVERY - Auto-detección de colaboración real
+# ============================================================================
+
+@router.get("/collaboration/discover")
+async def discover_collaboration(force: bool = False):
+    """
+    Auto-descubre patrones de colaboración analizando TODA la base de datos.
+    Usa caché en MongoDB (colección 'metrics', doc 'collaboration_graph')
+    para servir resultados instantáneamente. Pasar ?force=true recalcula.
+    
+    Busca automáticamente:
+    1. Bridge Users: Usuarios que contribuyen a 2+ repositorios
+    2. Repos conectados: Repositorios que comparten colaboradores
+    3. Colaboración cross-org: Usuarios que participan en múltiples organizaciones
+    
+    Returns:
+        - available: bool - Si hay colaboración detectable
+        - summary: Resumen textual de lo descubierto
+        - graph: Grafo completo con nodos y enlaces reales
+        - metrics: Estadísticas de colaboración
+        - bridge_users: Top usuarios puente
+        - connected_pairs: Pares de repos/orgs más conectados
+    """
+    try:
+        import orjson
+        from fastapi.responses import Response
+        from ..core.db import db
+        from ..core.chunked_cache import load_chunked, save_chunked
+        
+        db.ensure_connection()
+        
+        # ── CACHÉ: intentar servir desde metrics (chunked para >2MB) ──
+        if not force:
+            metrics_collection = db.get_collection("metrics")
+            cached = load_chunked(metrics_collection, "collaboration_graph")
+            if cached:
+                logger.info(f"[DISCOVER] Sirviendo grafo desde caché chunked ({cached.get('metrics', {}).get('graph_nodes', '?')} nodos)")
+                return Response(content=orjson.dumps(cached), media_type="application/json")
+        
+        repos_collection = db.get_collection("repositories")
+        users_collection = db.get_collection("users")
+        orgs_collection = db.get_collection("organizations")
+        
+        # ============================================================
+        # PASO 1: Mapear todos los repos y sus colaboradores
+        # ============================================================
+        
+        # Helper para detectar bots por login
+        def _is_bot_login(login: str) -> bool:
+            if not login:
+                return False
+            ll = login.lower()
+            return (
+                "[bot]" in ll or
+                ll.endswith("-bot") or
+                ll.startswith("bot-") or
+                ll in ["dependabot", "renovate", "greenkeeper", "snyk-bot", "codecov", "sonarcloud"]
+            )
+        
+        all_repos = list(repos_collection.find(
+            {"collaborators": {"$exists": True, "$ne": []}},
+            {"_id": 0, "name": 1, "full_name": 1, "owner": 1, "stargazer_count": 1,
+             "primary_language": 1, "collaborators": 1, "organization": 1}
+        ))
+        
+        # Mapa: user_login → [repos donde contribuye]
+        user_to_repos = {}
+        # Mapa: repo_full_name → set(user_logins)
+        repo_to_users = {}
+        
+        for repo in all_repos:
+            full_name = repo.get("full_name")
+            if not full_name:
+                continue
+            
+            collabs = set()
+            for c in repo.get("collaborators", []):
+                login = c.get("login")
+                if login:
+                    collabs.add(login)
+                    if login not in user_to_repos:
+                        user_to_repos[login] = []
+                    user_to_repos[login].append({
+                        "full_name": full_name,
+                        "name": repo.get("name"),
+                        "stars": repo.get("stargazer_count", 0),
+                        "owner": repo.get("owner", {}).get("login", ""),
+                        "language": repo.get("primary_language", {}).get("name") if isinstance(repo.get("primary_language"), dict) else repo.get("primary_language")
+                    })
+            
+            repo_to_users[full_name] = collabs
+        
+        # ============================================================
+        # PASO 2: Identificar Bridge Users (usuarios en 2+ repos)
+        # ============================================================
+        bridge_users = {}
+        for login, repos_list in user_to_repos.items():
+            if len(repos_list) >= 2:
+                bridge_users[login] = repos_list
+        
+        # ============================================================
+        # PASO 3: Encontrar pares de repos conectados (via índice invertido)
+        # ============================================================
+        # En vez de O(N²) comparando todos los pares de repos,
+        # iteramos los bridge users y generamos pares desde sus repos
+        pair_shared = {}  # (repo_a, repo_b) → set(shared_users)
+        for login, repos_list in bridge_users.items():
+            repo_fns = [r["full_name"] for r in repos_list]
+            for i in range(len(repo_fns)):
+                for j in range(i + 1, len(repo_fns)):
+                    a, b = min(repo_fns[i], repo_fns[j]), max(repo_fns[i], repo_fns[j])
+                    key = (a, b)
+                    if key not in pair_shared:
+                        pair_shared[key] = set()
+                    pair_shared[key].add(login)
+        
+        connected_repo_pairs = [
+            {"repo_a": k[0], "repo_b": k[1], "shared_users": list(v), "shared_count": len(v)}
+            for k, v in pair_shared.items()
+        ]
+        connected_repo_pairs.sort(key=lambda x: x["shared_count"], reverse=True)
+        
+        # ============================================================
+        # PASO 4: Colaboración cross-org
+        # ============================================================
+        # Mapear usuarios a sus organizaciones
+        user_to_orgs = {}
+        all_org_logins = set()
+        
+        # Desde la colección de users
+        all_users_cursor = users_collection.find(
+            {"organizations": {"$exists": True, "$ne": []}},
+            {"_id": 0, "login": 1, "organizations": 1}
+        )
+        
+        for user_doc in all_users_cursor:
+            login = user_doc.get("login")
+            if not login:
+                continue
+            user_orgs = []
+            for org in (user_doc.get("organizations") or []):
+                org_login = org.get("login") if isinstance(org, dict) else org
+                if org_login:
+                    user_orgs.append(org_login)
+                    all_org_logins.add(org_login)
+            if len(user_orgs) >= 2:
+                user_to_orgs[login] = user_orgs
+        
+        # También desde repos: usuario contribuye a repos de distintas orgs
+        user_repo_orgs = {}
+        for login in bridge_users:
+            repo_orgs = set()
+            for r in bridge_users[login]:
+                owner = r.get("owner")
+                if owner:
+                    repo_orgs.add(owner)
+            if len(repo_orgs) >= 2:
+                user_repo_orgs[login] = list(repo_orgs)
+        
+        # Combinar cross-org users
+        cross_org_users = set(user_to_orgs.keys()) | set(user_repo_orgs.keys())
+        
+        # ============================================================
+        # PASO 5: Determinar si hay colaboración disponible
+        # ============================================================
+        has_collaboration = len(bridge_users) > 0 or len(connected_repo_pairs) > 0
+        
+        if not has_collaboration:
+            return {
+                "available": False,
+                "summary": "No se detectaron patrones de colaboración entre los datos actuales.",
+                "graph": {"nodes": [], "links": []},
+                "metrics": {
+                    "total_repos": len(all_repos),
+                    "total_users": len(user_to_repos),
+                    "bridge_users": 0,
+                    "connected_repo_pairs": 0,
+                    "cross_org_users": 0
+                },
+                "bridge_users": [],
+                "connected_pairs": []
+            }
+        
+        # ============================================================
+        # PASO 6: Construir grafo de colaboración
+        # ============================================================
+        nodes = []
+        links = []
+        added_nodes = set()
+        
+        # 6a) Filtrar bots ANTES de rankear bridge users
+        human_bridge_users = {
+            login: repos_list for login, repos_list in bridge_users.items()
+            if not _is_bot_login(login)
+        }
+        bot_bridge_users = {
+            login: repos_list for login, repos_list in bridge_users.items()
+            if _is_bot_login(login)
+        }
+        
+        # 6b) Ordenar bridge users humanos por número de repos (más conectados primero)
+        sorted_bridge = sorted(human_bridge_users.items(), key=lambda x: len(x[1]), reverse=True)
+        
+        # Tomar TODOS los bridge users humanos (sin límite artificial)
+        top_bridge_users = sorted_bridge
+        
+        # 6c) Recopilar repos conectados por bridge users
+        connected_repos = set()
+        for login, repos_list in top_bridge_users:
+            for r in repos_list:
+                connected_repos.add(r["full_name"])
+        
+        # 6d) Añadir nodos de repos
+        for repo in all_repos:
+            full_name = repo.get("full_name")
+            if full_name in connected_repos:
+                node_id = f"repo_{full_name}"
+                if node_id not in added_nodes:
+                    org_login = repo.get("owner", {}).get("login", "")
+                    nodes.append({
+                        "id": node_id,
+                        "type": "repo",
+                        "name": repo.get("name"),
+                        "full_name": full_name,
+                        "stars": repo.get("stargazer_count", 0),
+                        "language": repo.get("primary_language", {}).get("name") if isinstance(repo.get("primary_language"), dict) else repo.get("primary_language"),
+                        "org": org_login
+                    })
+                    added_nodes.add(node_id)
+        
+        # 6e) Bulk fetch de datos de usuarios bridge
+        all_user_logins_needed = set()
+        for login, _ in top_bridge_users:
+            all_user_logins_needed.add(login)
+        
+        user_info_cache = {}
+        if all_user_logins_needed:
+            cursor = users_collection.find(
+                {"login": {"$in": list(all_user_logins_needed)}},
+                {"_id": 0, "login": 1, "name": 1, "avatar_url": 1, "quantum_expertise_score": 1, "is_bot": 1}
+            )
+            for doc in cursor:
+                user_info_cache[doc["login"]] = doc
+        
+        def _make_user_node(login, repos_list, is_bridge):
+            user_info = user_info_cache.get(login)
+            user_is_bot = False
+            if user_info and "is_bot" in user_info:
+                user_is_bot = bool(user_info["is_bot"])
+            else:
+                user_is_bot = _is_bot_login(login)
+            return {
+                "id": f"user_{login}",
+                "type": "user",
+                "login": login,
+                "name": (user_info.get("name") if user_info else None) or login,
+                "avatar_url": user_info.get("avatar_url") if user_info else None,
+                "repos_count": len(repos_list) if repos_list else 1,
+                "isBridge": is_bridge,
+                "isBot": user_is_bot,
+                "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0
+            }
+        
+        # 6f) Añadir nodos de bridge users + links a sus repos
+        enriched_bridge_list = []
+        for login, repos_list in top_bridge_users:
+            user_id = f"user_{login}"
+            user_node = _make_user_node(login, repos_list, True)
+            
+            if user_id not in added_nodes:
+                nodes.append(user_node)
+                added_nodes.add(user_id)
+            
+            # Links usuario → repos
+            for r in repos_list:
+                repo_node_id = f"repo_{r['full_name']}"
+                if repo_node_id in added_nodes:
+                    links.append({
+                        "source": user_id,
+                        "target": repo_node_id,
+                        "type": "contributed_to"
+                    })
+            
+            enriched_bridge_list.append({
+                "login": login,
+                "name": user_node["name"],
+                "avatar_url": user_node.get("avatar_url"),
+                "quantum_expertise_score": user_node.get("quantum_expertise_score", 0),
+                "repos": [r["full_name"] for r in repos_list],
+                "repos_count": len(repos_list),
+                "cross_org": login in cross_org_users
+            })
+        
+        # 6g) Añadir nodos de usuarios normales (no bridge) vinculados a repos en el grafo
+        normal_user_count = 0
+        for login, repos_list in user_to_repos.items():
+            if login in bridge_users or _is_bot_login(login):
+                continue
+            user_id = f"user_{login}"
+            if user_id in added_nodes:
+                continue
+            # Solo añadir si al menos uno de sus repos ya está en el grafo
+            linked_repo_id = None
+            for r in repos_list:
+                repo_node_id = f"repo_{r['full_name']}"
+                if repo_node_id in added_nodes:
+                    linked_repo_id = repo_node_id
+                    break
+            if linked_repo_id:
+                user_node = _make_user_node(login, repos_list, False)
+                nodes.append(user_node)
+                added_nodes.add(user_id)
+                links.append({
+                    "source": user_id,
+                    "target": linked_repo_id,
+                    "type": "contributed_to"
+                })
+                normal_user_count += 1
+        
+        logger.info(f"[DISCOVER] Usuarios normales añadidos: {normal_user_count}")
+        
+        # 6h) Añadir nodos de organizaciones (las que contienen repos conectados)
+        org_logins_in_graph = set()
+        for repo in all_repos:
+            full_name = repo.get("full_name")
+            if full_name in connected_repos:
+                org_login = repo.get("owner", {}).get("login", "")
+                if org_login and org_login not in org_logins_in_graph:
+                    org_logins_in_graph.add(org_login)
+        
+        for org_login in org_logins_in_graph:
+            org_id = f"org_{org_login}"
+            if org_id not in added_nodes:
+                org_doc = orgs_collection.find_one(
+                    {"login": org_login},
+                    {"_id": 0, "name": 1, "avatar_url": 1}
+                )
+                nodes.append({
+                    "id": org_id,
+                    "type": "org",
+                    "login": org_login,
+                    "name": (org_doc.get("name") if org_doc else None) or org_login,
+                    "avatar_url": org_doc.get("avatar_url") if org_doc else None,
+                })
+                added_nodes.add(org_id)
+                
+                # Links org → sus repos
+                for repo in all_repos:
+                    if repo.get("owner", {}).get("login") == org_login:
+                        repo_id = f"repo_{repo.get('full_name')}"
+                        if repo_id in added_nodes:
+                            links.append({
+                                "source": org_id,
+                                "target": repo_id,
+                                "type": "owns"
+                            })
+        
+        # ============================================================
+        # PASO 7: Links de entrelazamiento org↔org (bridge users compartidos)
+        # ============================================================
+        # Para cada par de orgs, contar cuántos bridge users contribuyen a repos de ambas
+        org_pair_bridges = {}  # (org_a, org_b) → set(logins)
+        for login, repos_list in human_bridge_users.items():
+            user_org_set = set()
+            for r in repos_list:
+                owner = r.get("owner")
+                if owner and f"org_{owner}" in added_nodes:
+                    user_org_set.add(owner)
+            if len(user_org_set) >= 2:
+                org_list = sorted(user_org_set)
+                for i in range(len(org_list)):
+                    for j in range(i + 1, len(org_list)):
+                        key = (org_list[i], org_list[j])
+                        if key not in org_pair_bridges:
+                            org_pair_bridges[key] = set()
+                        org_pair_bridges[key].add(login)
+        
+        # Solo emitir links con ≥ 3 bridge users compartidos para evitar ruido
+        entanglement_count = 0
+        for (org_a, org_b), shared_logins in org_pair_bridges.items():
+            strength = len(shared_logins)
+            if strength >= 3:
+                links.append({
+                    "source": f"org_{org_a}",
+                    "target": f"org_{org_b}",
+                    "type": "entangled_with",
+                    "strength": strength
+                })
+                entanglement_count += 1
+        
+        logger.info(f"[DISCOVER] Entrelazamientos org↔org: {entanglement_count} (threshold ≥3 bridge users)")
+        
+        # ============================================================
+        # PASO 8: Construir resumen textual
+        # ============================================================
+        summary_parts = []
+        if len(bridge_users) > 0:
+            summary_parts.append(f"{len(bridge_users)} usuarios puente entre {len(connected_repos)} repositorios")
+        if len(connected_repo_pairs) > 0:
+            summary_parts.append(f"{len(connected_repo_pairs)} pares de repos conectados")
+        if len(cross_org_users) > 0:
+            summary_parts.append(f"{len(cross_org_users)} usuarios cross-org")
+        
+        summary = " · ".join(summary_parts)
+        
+        # Density: ratio of actual links to possible links
+        max_possible_links = len(nodes) * (len(nodes) - 1) / 2 if len(nodes) > 1 else 1
+        density = round(len(links) / max(max_possible_links, 1) * 100, 2)
+        
+        # Contar nodos por tipo para métricas
+        user_nodes_in_graph = [n for n in nodes if n["type"] == "user"]
+        bridge_nodes_in_graph = [n for n in user_nodes_in_graph if n.get("isBridge")]
+        
+        result = {
+            "available": True,
+            "summary": summary,
+            "graph": {"nodes": nodes, "links": links},
+            "metrics": {
+                "total_repos_analyzed": len(all_repos),
+                "total_users_mapped": len(user_to_repos),
+                "bridge_users_count": len(bridge_nodes_in_graph),
+                "normal_users_count": normal_user_count,
+                "total_bridge_users_found": len(human_bridge_users),
+                "connected_repo_pairs": len(connected_repo_pairs),
+                "cross_org_users": len(cross_org_users),
+                "graph_nodes": len(nodes),
+                "graph_links": len(links),
+                "collaboration_density": density
+            },
+            "bridge_users": enriched_bridge_list,
+            "connected_pairs": connected_repo_pairs[:20]
+        }
+        
+        # ── GUARDAR EN CACHÉ MongoDB (chunked para >2MB) ──
+        try:
+            metrics_collection = db.get_collection("metrics")
+            save_chunked(
+                metrics_collection,
+                "collaboration_graph",
+                result,
+                large_fields=["graph.nodes", "graph.links", "bridge_users"]
+            )
+            logger.info(f"[DISCOVER] Grafo guardado en caché chunked ({len(nodes)} nodos, {len(links)} links)")
+        except Exception as cache_err:
+            logger.warning(f"[DISCOVER] No se pudo cachear el grafo: {cache_err}")
+        
+        return Response(content=orjson.dumps(result), media_type="application/json")
+        
+    except Exception as e:
+        error_msg = f"Error en descubrimiento de colaboración: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.post("/collaboration/discover/invalidate")
+async def invalidate_collaboration_cache():
+    """Invalida la caché del grafo de colaboración. Útil tras una ingesta de datos."""
+    try:
+        from ..core.db import db
+        from ..core.chunked_cache import delete_chunked
+        db.ensure_connection()
+        metrics_collection = db.get_collection("metrics")
+        deleted_count = delete_chunked(metrics_collection, "collaboration_graph")
+        deleted = deleted_count > 0
+        logger.info(f"[DISCOVER] Caché invalidada: {'eliminada' if deleted else 'no existía'} ({deleted_count} docs)")
+        return {"invalidated": deleted, "message": f"Caché del grafo eliminada ({deleted_count} docs)" if deleted else "No había caché"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/collaboration/analyze")
+async def analyze_collaboration(
+    repos: Optional[list] = Query(default=None, description="Lista de repositorios (full_name) a analizar"),
+    orgs: Optional[list] = Query(default=None, description="Lista de organizaciones (login) a analizar"),
+    user: Optional[str] = Query(default=None, description="Usuario específico para ver sus colaboraciones")
+):
+    """
+    Análisis de colaboración entre repos/orgs/usuarios.
+    
+    Modos de operación:
+    1. repos=[repo1, repo2...]: Encuentra usuarios compartidos entre repos
+    2. orgs=[org1, org2...]: Encuentra usuarios compartidos entre orgs
+    3. user=login: Muestra con quién ha colaborado y en qué repos/orgs
+    
+    Returns:
+        - shared_users: Usuarios que aparecen en múltiples selecciones
+        - collaboration_graph: Nodos y enlaces para visualización
+        - metrics: Estadísticas de colaboración
+    """
+    try:
+        from ..core.db import db
+        
+        db.ensure_connection()
+        repos_collection = db.get_collection("repositories")
+        users_collection = db.get_collection("users")
+        orgs_collection = db.get_collection("organizations")
+        metrics_collection = db.get_collection("metrics")
+        
+        # ── CACHÉ PERMANENTE: construir clave única según parámetros ──
+        import hashlib
+        if user:
+            cache_key = f"collab_analysis_user_{user}"
+        elif repos and len(repos) >= 2:
+            sorted_repos = sorted(repos)
+            cache_key = f"collab_analysis_repos_{hashlib.md5('|'.join(sorted_repos).encode()).hexdigest()}"
+        elif orgs and len(orgs) >= 2:
+            sorted_orgs = sorted(orgs)
+            cache_key = f"collab_analysis_orgs_{hashlib.md5('|'.join(sorted_orgs).encode()).hexdigest()}"
+        else:
+            cache_key = None
+        
+        # Intentar servir desde caché permanente
+        if cache_key:
+            cached = metrics_collection.find_one({"_id": cache_key})
+            if cached:
+                cached.pop("_id", None)
+                cached.pop("_cached_at", None)
+                logger.info(f"[Analyze] Cache HIT: {cache_key}")
+                return cached
+        
+        result = {
+            "mode": None,
+            "selections": [],
+            "shared_users": [],
+            "collaboration_graph": {"nodes": [], "links": []},
+            "metrics": {}
+        }
+        
+        # ============================================================
+        # MODO 1: Análisis de colaboración de un USUARIO específico
+        # ============================================================
+        if user:
+            result["mode"] = "user_focus"
+            result["selections"] = [user]
+            
+            # Buscar el usuario
+            user_doc = users_collection.find_one({"login": user})
+            if not user_doc:
+                raise HTTPException(status_code=404, detail=f"Usuario {user} no encontrado")
+            
+            # Obtener todos los repos donde este usuario es colaborador
+            user_repos = list(repos_collection.find(
+                {"collaborators.login": user},
+                {"_id": 1, "name": 1, "full_name": 1, "owner": 1, "stargazer_count": 1, 
+                 "collaborators": 1, "primary_language": 1}
+            ))
+            
+            # Extraer co-colaboradores (personas con las que ha trabajado)
+            co_collaborators = {}
+            for repo in user_repos:
+                for collab in repo.get("collaborators", []):
+                    login = collab.get("login")
+                    if login and login != user:
+                        if login not in co_collaborators:
+                            co_collaborators[login] = {
+                                "login": login,
+                                "shared_repos": [],
+                                "total_shared_contributions": 0
+                            }
+                        co_collaborators[login]["shared_repos"].append({
+                            "name": repo.get("name"),
+                            "full_name": repo.get("full_name")
+                        })
+                        co_collaborators[login]["total_shared_contributions"] += collab.get("contributions", 0)
+            
+            # Ordenar por número de repos compartidos
+            sorted_collaborators = sorted(
+                co_collaborators.values(),
+                key=lambda x: len(x["shared_repos"]),
+                reverse=True
+            )[:50]
+            
+            # Enriquecer con datos de usuario
+            for collab in sorted_collaborators:
+                user_info = users_collection.find_one({"login": collab["login"]})
+                if user_info:
+                    collab["name"] = user_info.get("name")
+                    collab["avatar_url"] = user_info.get("avatar_url")
+                    collab["quantum_expertise_score"] = user_info.get("quantum_expertise_score", 0)
+            
+            # Construir grafo
+            nodes = [{
+                "id": f"user_{user}",
+                "type": "user",
+                "login": user,
+                "name": user_doc.get("name") or user,
+                "avatar_url": user_doc.get("avatar_url"),
+                "isCenter": True
+            }]
+            links = []
+            
+            # Añadir repos como nodos
+            for repo in user_repos[:15]:
+                repo_id = f"repo_{repo.get('full_name')}"
+                nodes.append({
+                    "id": repo_id,
+                    "type": "repo",
+                    "name": repo.get("name"),
+                    "full_name": repo.get("full_name"),
+                    "stars": repo.get("stargazer_count", 0)
+                })
+                links.append({
+                    "source": f"user_{user}",
+                    "target": repo_id,
+                    "type": "contributed_to"
+                })
+            
+            # Añadir co-colaboradores como nodos
+            for collab in sorted_collaborators[:10]:
+                collab_id = f"user_{collab['login']}"
+                nodes.append({
+                    "id": collab_id,
+                    "type": "user",
+                    "login": collab["login"],
+                    "name": collab.get("name") or collab["login"],
+                    "avatar_url": collab.get("avatar_url"),
+                    "shared_count": len(collab["shared_repos"])
+                })
+                links.append({
+                    "source": f"user_{user}",
+                    "target": collab_id,
+                    "type": "collaborated_with",
+                    "weight": len(collab["shared_repos"])
+                })
+            
+            # Obtener organizaciones del usuario
+            user_orgs = user_doc.get("organizations", [])
+            for org in user_orgs[:5]:
+                org_login = org.get("login") if isinstance(org, dict) else org
+                if org_login:
+                    nodes.append({
+                        "id": f"org_{org_login}",
+                        "type": "org",
+                        "login": org_login,
+                        "name": org.get("name") if isinstance(org, dict) else org_login
+                    })
+                    links.append({
+                        "source": f"user_{user}",
+                        "target": f"org_{org_login}",
+                        "type": "member_of"
+                    })
+            
+            result["shared_users"] = sorted_collaborators
+            result["collaboration_graph"] = {"nodes": nodes, "links": links}
+            result["metrics"] = {
+                "total_repos": len(user_repos),
+                "total_co_collaborators": len(co_collaborators),
+                "total_organizations": len(user_orgs)
+            }
+            
+            # Guardar en caché permanente
+            if cache_key:
+                try:
+                    metrics_collection.update_one(
+                        {"_id": cache_key},
+                        {"$set": {**result, "_cached_at": datetime.now().isoformat()}},
+                        upsert=True
+                    )
+                    logger.info(f"[Analyze] Cacheado: {cache_key}")
+                except Exception as ce:
+                    logger.warning(f"[Analyze] Error cacheando: {ce}")
+            
+            return result
+        
+        # ============================================================
+        # MODO 2: Análisis de REPOS seleccionados
+        # ============================================================
+        if repos and len(repos) >= 2:
+            result["mode"] = "repos_comparison"
+            result["selections"] = repos
+            
+            # Obtener colaboradores de cada repo
+            repo_collaborators = {}
+            all_users = set()
+            
+            for repo_name in repos:
+                repo_doc = repos_collection.find_one(
+                    {"full_name": repo_name},
+                    {"_id": 1, "name": 1, "full_name": 1, "collaborators": 1, 
+                     "stargazer_count": 1, "primary_language": 1, "owner": 1}
+                )
+                if repo_doc and repo_doc.get("collaborators"):
+                    collabs = {c.get("login") for c in repo_doc.get("collaborators", []) if c.get("login")}
+                    repo_collaborators[repo_name] = {
+                        "doc": repo_doc,
+                        "collaborators": collabs
+                    }
+                    all_users.update(collabs)
+            
+            # Encontrar usuarios compartidos (aparecen en 2+ repos)
+            user_appearances = {}
+            for user_login in all_users:
+                repos_with_user = [
+                    repo_name for repo_name, data in repo_collaborators.items()
+                    if user_login in data["collaborators"]
+                ]
+                if len(repos_with_user) >= 2:
+                    user_appearances[user_login] = repos_with_user
+            
+            # Enriquecer usuarios compartidos
+            shared_users = []
+            for login, repos_list in sorted(user_appearances.items(), key=lambda x: len(x[1]), reverse=True)[:20]:
+                user_info = users_collection.find_one({"login": login})
+                shared_users.append({
+                    "login": login,
+                    "name": user_info.get("name") if user_info else None,
+                    "avatar_url": user_info.get("avatar_url") if user_info else None,
+                    "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0,
+                    "shared_repos": repos_list,
+                    "shared_count": len(repos_list)
+                })
+            
+            # Construir grafo
+            nodes = []
+            links = []
+            
+            # Añadir repos como nodos
+            for repo_name, data in repo_collaborators.items():
+                nodes.append({
+                    "id": f"repo_{repo_name}",
+                    "type": "repo",
+                    "name": data["doc"].get("name"),
+                    "full_name": repo_name,
+                    "stars": data["doc"].get("stargazer_count", 0)
+                })
+            
+            # Añadir usuarios compartidos
+            for user in shared_users[:15]:
+                user_id = f"user_{user['login']}"
+                nodes.append({
+                    "id": user_id,
+                    "type": "user",
+                    "login": user["login"],
+                    "name": user.get("name") or user["login"],
+                    "avatar_url": user.get("avatar_url"),
+                    "shared_count": user["shared_count"]
+                })
+                # Enlaces a repos
+                for repo_name in user["shared_repos"]:
+                    links.append({
+                        "source": user_id,
+                        "target": f"repo_{repo_name}",
+                        "type": "contributed_to"
+                    })
+            
+            result["shared_users"] = shared_users
+            result["collaboration_graph"] = {"nodes": nodes, "links": links}
+            result["metrics"] = {
+                "total_repos_analyzed": len(repo_collaborators),
+                "total_unique_users": len(all_users),
+                "shared_users_count": len(user_appearances),
+                "collaboration_density": round(len(user_appearances) / max(len(all_users), 1) * 100, 2)
+            }
+            
+            # Guardar en caché permanente
+            if cache_key:
+                try:
+                    metrics_collection.update_one(
+                        {"_id": cache_key},
+                        {"$set": {**result, "_cached_at": datetime.now().isoformat()}},
+                        upsert=True
+                    )
+                    logger.info(f"[Analyze] Cacheado: {cache_key}")
+                except Exception as ce:
+                    logger.warning(f"[Analyze] Error cacheando: {ce}")
+            
+            return result
+        
+        # ============================================================
+        # MODO 3: Análisis de ORGS seleccionadas
+        # ============================================================
+        if orgs and len(orgs) >= 2:
+            result["mode"] = "orgs_comparison"
+            result["selections"] = orgs
+            
+            # Obtener usuarios de cada org
+            org_users = {}
+            all_users = set()
+            
+            for org_login in orgs:
+                # Buscar repos de la org
+                org_repos = list(repos_collection.find(
+                    {"$or": [{"owner.login": org_login}, {"organization.login": org_login}]},
+                    {"collaborators": 1, "full_name": 1}
+                ))
+                
+                # Extraer usuarios únicos
+                users_in_org = set()
+                for repo in org_repos:
+                    for collab in repo.get("collaborators", []):
+                        if collab.get("login"):
+                            users_in_org.add(collab.get("login"))
+                
+                # También buscar usuarios que declaren pertenecer a la org
+                users_declaring_org = users_collection.find(
+                    {"$or": [
+                        {"organizations": org_login},
+                        {"organizations.login": org_login}
+                    ]},
+                    {"login": 1}
+                )
+                for u in users_declaring_org:
+                    users_in_org.add(u.get("login"))
+                
+                org_users[org_login] = users_in_org
+                all_users.update(users_in_org)
+            
+            # Encontrar usuarios compartidos
+            user_appearances = {}
+            for user_login in all_users:
+                orgs_with_user = [
+                    org_login for org_login, users in org_users.items()
+                    if user_login in users
+                ]
+                if len(orgs_with_user) >= 2:
+                    user_appearances[user_login] = orgs_with_user
+            
+            # Enriquecer usuarios compartidos
+            shared_users = []
+            for login, orgs_list in sorted(user_appearances.items(), key=lambda x: len(x[1]), reverse=True)[:20]:
+                user_info = users_collection.find_one({"login": login})
+                shared_users.append({
+                    "login": login,
+                    "name": user_info.get("name") if user_info else None,
+                    "avatar_url": user_info.get("avatar_url") if user_info else None,
+                    "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0,
+                    "shared_orgs": orgs_list,
+                    "shared_count": len(orgs_list)
+                })
+            
+            # Construir grafo
+            nodes = []
+            links = []
+            
+            # Añadir orgs como nodos
+            for org_login in orgs:
+                org_doc = orgs_collection.find_one({"login": org_login})
+                nodes.append({
+                    "id": f"org_{org_login}",
+                    "type": "org",
+                    "login": org_login,
+                    "name": org_doc.get("name") if org_doc else org_login,
+                    "avatar_url": org_doc.get("avatar_url") if org_doc else None
+                })
+            
+            # Añadir usuarios compartidos
+            for user in shared_users[:15]:
+                user_id = f"user_{user['login']}"
+                nodes.append({
+                    "id": user_id,
+                    "type": "user",
+                    "login": user["login"],
+                    "name": user.get("name") or user["login"],
+                    "avatar_url": user.get("avatar_url"),
+                    "shared_count": user["shared_count"]
+                })
+                # Enlaces a orgs
+                for org_login in user["shared_orgs"]:
+                    links.append({
+                        "source": user_id,
+                        "target": f"org_{org_login}",
+                        "type": "member_of"
+                    })
+            
+            result["shared_users"] = shared_users
+            result["collaboration_graph"] = {"nodes": nodes, "links": links}
+            result["metrics"] = {
+                "total_orgs_analyzed": len(org_users),
+                "total_unique_users": len(all_users),
+                "shared_users_count": len(user_appearances),
+                "collaboration_density": round(len(user_appearances) / max(len(all_users), 1) * 100, 2)
+            }
+            
+            # Guardar en caché permanente
+            if cache_key:
+                try:
+                    metrics_collection.update_one(
+                        {"_id": cache_key},
+                        {"$set": {**result, "_cached_at": datetime.now().isoformat()}},
+                        upsert=True
+                    )
+                    logger.info(f"[Analyze] Cacheado: {cache_key}")
+                except Exception as ce:
+                    logger.warning(f"[Analyze] Error cacheando: {ce}")
+            
+            return result
+        
+        # Si no hay parámetros válidos
+        raise HTTPException(
+            status_code=400,
+            detail="Se requiere: user=login, repos=[repo1,repo2,...] (mínimo 2), o orgs=[org1,org2,...] (mínimo 2)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Error en análisis de colaboración: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.get("/collaboration/user/{user_login}")
+async def get_user_collaboration_network(user_login: str):
+    """
+    Obtiene la red de colaboración de un usuario específico.
+    Endpoint simplificado para llamadas GET directas.
+    """
+    return await analyze_collaboration(user=user_login)
+
+
+# ==========================================
+# ENDPOINTS DE ANÁLISIS DE RED (NetworkX)
+# ==========================================
+
+# Caché en memoria del resultado de análisis (evita recalcular en cada request)
+# Almacena tanto el dict como los bytes JSON serializados con orjson
+# Fallback: si la caché en memoria está vacía, intenta cargar desde MongoDB (chunked)
+_network_metrics_cache = {"json_bytes": None, "computed_at": None, "analyzer": None}
+
+@router.get("/collaboration/network-metrics")
+async def get_network_metrics(force_refresh: bool = Query(default=False)):
+    """
+    Computa métricas de red de colaboración optimizadas para el frontend.
+    Devuelve solo: node_metrics (compacto), communities, global_metrics.
+    Omite edge_metrics, searchable_nodes, bus_factors (no usados por UI).
+    Caché PERMANENTE: memoria + MongoDB chunked. Sin TTL. Usa orjson.
+    Invalidación solo vía POST /dashboard/refresh-metrics o tras ingesta/enriquecimiento.
+    """
+    try:
+        import orjson
+        from fastapi.responses import Response
+        from ..core.db import db
+        from ..core.chunked_cache import load_chunked, save_chunked
+        
+        # ── 1. Caché en memoria (más rápido, sin TTL) ──
+        cache = _network_metrics_cache
+        if not force_refresh and cache["json_bytes"] and cache["computed_at"]:
+            logger.info("[NetworkMetrics] Devolviendo desde caché en memoria (permanente)")
+            return Response(
+                content=cache["json_bytes"],
+                media_type="application/json"
+            )
+        
+        db.ensure_connection()
+        metrics_collection = db.get_collection("metrics")
+        
+        # ── 2. Caché en MongoDB chunked (sobrevive restarts, sin TTL) ──
+        if not force_refresh:
+            cached_result = load_chunked(metrics_collection, "network_metrics")
+            if cached_result:
+                json_bytes = orjson.dumps(cached_result)
+                # Poblar caché en memoria
+                _network_metrics_cache["json_bytes"] = json_bytes
+                _network_metrics_cache["computed_at"] = datetime.utcnow()
+                logger.info(f"[NetworkMetrics] Restaurado desde caché MongoDB chunked permanente ({len(json_bytes) / 1024:.0f} KB)")
+                return Response(content=json_bytes, media_type="application/json")
+        
+        # ── 3. Computar desde cero ──
+        logger.info("[NetworkMetrics] Construyendo grafo y computando métricas...")
+        repos_col = db.get_collection("repositories")
+        users_col = db.get_collection("users")
+        orgs_col = db.get_collection("organizations")
+        
+        analyzer = CollaborationNetworkAnalyzer()
+        analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
+        full = analyzer.get_full_analysis()
+        
+        # Construir respuesta compacta - solo lo que el frontend necesita
+        compact_node_metrics = {}
+        for node_id, m in full.get("node_metrics", {}).items():
+            entry = {
+                "betweenness": m.get("betweenness", 0),
+                "degree": m.get("degree", 0),
+                "collab_centrality": m.get("collab_centrality", 0),
+                "collab_connectivity": m.get("collab_connectivity", 0),
+                "collab_centrality_raw": m.get("collab_centrality_raw", 0),
+                "collab_connectivity_raw": m.get("collab_connectivity_raw", 0),
+            }
+            if "community_id" in m:
+                entry["community_id"] = m["community_id"]
+                entry["community_color"] = m.get("community_color", "#888888")
+            if "bus_factor_risk" in m:
+                entry["bus_factor"] = m.get("bus_factor", 0)
+                entry["bus_factor_risk"] = m["bus_factor_risk"]
+                tc = m.get("top_contributors", [])
+                if tc:
+                    entry["top_contributors"] = [
+                        {"login": c["login"], "percentage": c.get("percentage", 0)}
+                        for c in tc[:3]
+                    ]
+            compact_node_metrics[node_id] = entry
+        
+        # Comunidades compactas
+        compact_communities = [
+            {
+                "id": c["id"],
+                "color": c["color"],
+                "size": c["size"],
+                "label": c["label"],
+            }
+            for c in full.get("communities", [])
+        ]
+        
+        result = {
+            "node_metrics": compact_node_metrics,
+            "communities": compact_communities,
+            "global_metrics": full.get("global_metrics", {}),
+        }
+        
+        # Serializar con orjson (~10x más rápido que json.dumps)
+        json_bytes = orjson.dumps(result)
+        
+        # Guardar en caché en memoria
+        _network_metrics_cache["json_bytes"] = json_bytes
+        _network_metrics_cache["computed_at"] = datetime.utcnow()
+        _network_metrics_cache["analyzer"] = analyzer
+        
+        # Guardar en MongoDB chunked (persistente, sobrevive restarts)
+        try:
+            save_chunked(
+                metrics_collection,
+                "network_metrics",
+                result,
+                large_fields=["node_metrics"]
+            )
+        except Exception as mongo_err:
+            logger.warning(f"[NetworkMetrics] No se pudo persistir a MongoDB: {mongo_err}")
+        
+        logger.info(
+            f"[NetworkMetrics] Respuesta: {len(compact_node_metrics)} nodos, "
+            f"{len(compact_communities)} comunidades, "
+            f"{len(json_bytes) / 1024:.0f} KB (cacheado en memoria + MongoDB)"
+        )
+        return Response(content=json_bytes, media_type="application/json")
+        
+    except Exception as e:
+        error_msg = f"Error computing network metrics: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.get("/collaboration/quantum-tunneling")
+async def quantum_tunneling(
+    source: str = Query(..., description="ID del nodo origen (ej: user_octocat)"),
+    target: str = Query(..., description="ID del nodo destino (ej: repo_qiskit/qiskit)")
+):
+    """
+    Encuentra el camino más corto entre dos entidades de la red (Quantum Tunneling).
+    Retorna: nodos del camino, aristas, descripción, longitud.
+    Reutiliza el grafo cacheado de network-metrics si está disponible.
+    """
+    try:
+        from ..core.db import db
+        
+        # Reutilizar analyzer del caché si existe
+        analyzer = _network_metrics_cache.get("analyzer")
+        if not analyzer:
+            # Intentar restaurar desde caché MongoDB chunked (persistente)
+            from ..core.chunked_cache import load_chunked
+            db.ensure_connection()
+            metrics_collection = db.get_collection("metrics")
+            cached_nm = load_chunked(metrics_collection, "network_metrics")
+            
+            if cached_nm:
+                # Reconstruir grafo NetworkX desde los node_metrics cacheados
+                logger.info("[QuantumTunneling] Reconstruyendo analyzer desde caché MongoDB...")
+                repos_col = db.get_collection("repositories")
+                users_col = db.get_collection("users")
+                orgs_col = db.get_collection("organizations")
+                
+                analyzer = CollaborationNetworkAnalyzer()
+                analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
+                _network_metrics_cache["analyzer"] = analyzer
+                logger.info("[QuantumTunneling] Analyzer reconstruido y cacheado en memoria")
+            else:
+                logger.info("[QuantumTunneling] Sin caché, construyendo grafo completo...")
+                db.ensure_connection()
+                repos_col = db.get_collection("repositories")
+                users_col = db.get_collection("users")
+                orgs_col = db.get_collection("organizations")
+                
+                analyzer = CollaborationNetworkAnalyzer()
+                analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
+                _network_metrics_cache["analyzer"] = analyzer
+        else:
+            logger.info("[QuantumTunneling] Usando grafo cacheado en memoria")
+        
+        result = analyzer.find_path(source, target)
+        return result
+        
+    except Exception as e:
+        error_msg = f"Error in quantum tunneling: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @router.get("/rate-limit")
@@ -1440,7 +2736,12 @@ def _run_repository_ingestion(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -1478,7 +2779,12 @@ def _run_user_ingestion(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -1518,7 +2824,12 @@ def _run_repository_enrichment(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -1560,7 +2871,12 @@ def _run_user_enrichment(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -1598,7 +2914,12 @@ def _run_organization_ingestion(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -1642,7 +2963,12 @@ def _run_organization_enrichment(
         background_tasks_status[task_id]["stats"] = stats
         background_tasks_status[task_id]["completed_at"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Tarea {task_id} completada exitosamente")
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info(f"✅ Tarea {task_id} completada + cachés invalidadas")
+        except Exception as cache_err:
+            logger.warning(f"✅ Tarea {task_id} completada (error al invalidar cachés: {cache_err})")
         
     except Exception as e:
         logger.error(f"❌ Error en tarea {task_id}: {e}")
@@ -1891,6 +3217,13 @@ def _run_full_pipeline_direct(task_id: str):
         background_tasks_status[task_id]["total_records"] = total_records
         background_tasks_status[task_id]["duration_seconds"] = total_duration
         
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info("🧹 Cachés invalidadas tras pipeline completo")
+        except Exception as cache_err:
+            logger.warning(f"⚠️ Error al invalidar cachés tras pipeline: {cache_err}")
+        
     except Exception as e:
         logger.error(f"❌ Error crítico en pipeline {task_id}: {e}")
         logger.error(traceback.format_exc())
@@ -1944,9 +3277,799 @@ def _run_full_pipeline_script(task_id: str):
         
         logger.info(f"Pipeline completado - Task ID: {task_id}, Exit Code: {result.returncode}")
         
+        # Invalidar cachés para que se recalculen con datos frescos
+        try:
+            invalidate_all_caches()
+            logger.info("🧹 Cachés invalidadas tras pipeline script")
+        except Exception as cache_err:
+            logger.warning(f"⚠️ Error al invalidar cachés tras pipeline script: {cache_err}")
+        
     except Exception as e:
         logger.error(f"Error ejecutando pipeline {task_id}: {e}")
         background_tasks_status[task_id]["status"] = "failed"
         background_tasks_status[task_id]["progress"] = f"Error: {str(e)}"
         background_tasks_status[task_id]["error"] = str(e)
         background_tasks_status[task_id]["failed_at"] = datetime.now().isoformat()
+
+
+# ============================================================================
+# FAVORITOS Y VISTAS PERSONALIZADAS
+# ============================================================================
+
+@router.get("/favorites")
+async def get_favorites():
+    """Obtiene todos los favoritos guardados."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        prefs = db.get_collection("user_preferences")
+        doc = prefs.find_one({"type": "favorites"})
+        
+        return {"favorites": doc.get("items", []) if doc else []}
+    except Exception as e:
+        logger.error(f"Error obteniendo favoritos: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/favorites")
+async def add_favorite(favorite: Dict[str, Any]):
+    """
+    Añade una entidad a favoritos.
+    Body: { id, type, name, avatar_url? }
+    """
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        required = ["id", "type", "name"]
+        for field in required:
+            if field not in favorite:
+                raise HTTPException(status_code=400, detail=f"Campo requerido: {field}")
+        
+        prefs = db.get_collection("user_preferences")
+        
+        item = {
+            "id": favorite["id"],
+            "type": favorite["type"],
+            "name": favorite["name"],
+            "avatar_url": favorite.get("avatar_url"),
+            "added_at": datetime.now().isoformat()
+        }
+        
+        # Upsert: crear doc si no existe, añadir al array evitando duplicados
+        prefs.update_one(
+            {"type": "favorites"},
+            {"$pull": {"items": {"id": favorite["id"]}}},
+            upsert=True
+        )
+        prefs.update_one(
+            {"type": "favorites"},
+            {
+                "$push": {"items": item},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        logger.info(f"Favorito añadido: {favorite['name']} ({favorite['type']})")
+        return {"success": True, "favorite": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error añadiendo favorito: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/favorites/{entity_id:path}")
+async def remove_favorite(entity_id: str):
+    """Elimina una entidad de favoritos por su ID."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        prefs = db.get_collection("user_preferences")
+        result = prefs.update_one(
+            {"type": "favorites"},
+            {
+                "$pull": {"items": {"id": entity_id}},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Favorito no encontrado")
+        
+        logger.info(f"Favorito eliminado: {entity_id}")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error eliminando favorito: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/views")
+async def get_views():
+    """Obtiene todas las vistas personalizadas."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        prefs = db.get_collection("user_preferences")
+        doc = prefs.find_one({"type": "custom_views"})
+        
+        return {"views": doc.get("items", []) if doc else []}
+    except Exception as e:
+        logger.error(f"Error obteniendo vistas: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/views")
+async def save_view(view: Dict[str, Any]):
+    """
+    Crea o actualiza una vista personalizada.
+    Body: { id?, name, entity_ids[], color? }
+    """
+    try:
+        from ..core.db import db
+        import uuid
+        db.ensure_connection()
+        
+        if "name" not in view or "entity_ids" not in view:
+            raise HTTPException(status_code=400, detail="Campos requeridos: name, entity_ids")
+        
+        if not isinstance(view["entity_ids"], list) or len(view["entity_ids"]) == 0:
+            raise HTTPException(status_code=400, detail="entity_ids debe ser un array no vacío")
+        
+        prefs = db.get_collection("user_preferences")
+        
+        view_id = view.get("id", str(uuid.uuid4())[:8])
+        
+        item = {
+            "id": view_id,
+            "name": view["name"],
+            "entity_ids": view["entity_ids"],
+            "color": view.get("color", "#00ffaa"),
+            "created_at": view.get("created_at", datetime.now().isoformat()),
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        prefs.update_one(
+            {"type": "custom_views"},
+            {"$pull": {"items": {"id": view_id}}},
+            upsert=True
+        )
+        prefs.update_one(
+            {"type": "custom_views"},
+            {
+                "$push": {"items": item},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        logger.info(f"Vista guardada: '{view['name']}' con {len(view['entity_ids'])} entidades")
+        return {"success": True, "view": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error guardando vista: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/views/{view_id}")
+async def delete_view(view_id: str):
+    """Elimina una vista personalizada."""
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        prefs = db.get_collection("user_preferences")
+        result = prefs.update_one(
+            {"type": "custom_views"},
+            {
+                "$pull": {"items": {"id": view_id}},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Vista no encontrada")
+        
+        logger.info(f"Vista eliminada: {view_id}")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error eliminando vista: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/views/{view_id}/data")
+async def get_view_data(view_id: str, body: Dict[str, Any] = None):
+    """
+    Obtiene datos del dashboard filtrados para una vista personalizada.
+    Calcula KPIs, charts y tables solo para las entidades de la vista.
+    """
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+        
+        # Obtener entity_ids del body o de la vista guardada
+        entity_ids = None
+        if body and "entity_ids" in body:
+            entity_ids = body["entity_ids"]
+        else:
+            prefs = db.get_collection("user_preferences")
+            doc = prefs.find_one({"type": "custom_views"})
+            if doc:
+                view_item = next((v for v in doc.get("items", []) if v["id"] == view_id), None)
+                if view_item:
+                    entity_ids = view_item.get("entity_ids", [])
+        
+        if not entity_ids:
+            raise HTTPException(status_code=404, detail="Vista no encontrada o sin entidades")
+        
+        # Separar IDs por tipo (prefijo: user_, repo_, org_)
+        user_ids = []
+        repo_ids = []
+        org_ids = []
+        for eid in entity_ids:
+            if eid.startswith("user_"):
+                user_ids.append(eid[5:])
+            elif eid.startswith("repo_"):
+                repo_ids.append(eid[5:])
+            elif eid.startswith("org_"):
+                org_ids.append(eid[4:])
+        
+        repos_col = db.get_collection("repositories")
+        users_col = db.get_collection("users")
+        orgs_col = db.get_collection("organizations")
+
+        # ── Expansión jerárquica: org → repos → users ──
+        # Si hay orgs, añadir automáticamente sus repos
+        if org_ids:
+            org_repos = list(repos_col.find(
+                {"$or": [
+                    {"owner.login": {"$in": org_ids}},
+                    {"organization.login": {"$in": org_ids}},
+                ]},
+                {"full_name": 1, "collaborators": 1}
+            ))
+            for r in org_repos:
+                fn = r.get("full_name", "")
+                if fn and fn not in repo_ids:
+                    repo_ids.append(fn)
+
+        # Si hay repos (originales + derivados de orgs), añadir sus colaboradores
+        if repo_ids:
+            collab_repos = list(repos_col.find(
+                {"full_name": {"$in": repo_ids}},
+                {"collaborators": 1}
+            ))
+            for r in collab_repos:
+                for c in r.get("collaborators", []):
+                    login = c.get("login", "")
+                    if login and login not in user_ids:
+                        user_ids.append(login)
+        
+        # === Repos ===
+        repos = []
+        if repo_ids:
+            repos = list(repos_col.find(
+                {"full_name": {"$in": repo_ids}},
+                {"_id": 0, "full_name": 1, "name": 1, "description": 1,
+                 "stargazer_count": 1, "fork_count": 1, "primary_language": 1,
+                 "owner": 1, "organization": 1, "watchers_count": 1,
+                 "open_issues_count": 1, "created_at": 1, "updated_at": 1,
+                 "collaborators": 1, "collaborators_count": 1, "topics": 1,
+                 "language": 1, "size": 1, "license": 1, "is_fork": 1}
+            ))
+        
+        # === Users ===
+        users = []
+        if user_ids:
+            users = list(users_col.find(
+                {"login": {"$in": user_ids}},
+                {"_id": 0, "login": 1, "name": 1, "avatar_url": 1,
+                 "bio": 1, "company": 1, "location": 1,
+                 "public_repos": 1, "public_repos_count": 1,
+                 "followers": 1, "followers_count": 1,
+                 "following": 1, "following_count": 1,
+                 "contributions_last_year": 1, "quantum_expertise_score": 1,
+                 "organizations": 1, "created_at": 1,
+                 "top_languages": 1, "url": 1, "website_url": 1,
+                 "twitter_username": 1, "is_hireable": 1,
+                 "total_commit_contributions": 1, "total_pr_contributions": 1,
+                 "total_pr_review_contributions": 1, "total_issue_contributions": 1}
+            ))
+        
+        # === Orgs ===
+        orgs = []
+        if org_ids:
+            orgs = list(orgs_col.find(
+                {"login": {"$in": org_ids}},
+                {"_id": 0, "login": 1, "name": 1, "avatar_url": 1,
+                 "description": 1, "public_repos": 1, "followers": 1,
+                 "members_count": 1, "created_at": 1, "location": 1,
+                 "quantum_focus_score": 1, "is_verified": 1,
+                 "website_url": 1, "twitter_username": 1, "email": 1,
+                 "quantum_contributors_count": 1, "total_repositories_count": 1,
+                 "total_members_count": 1, "total_unique_contributors": 1, "top_languages": 1,
+                 "is_quantum_focused": 1, "top_quantum_contributors": 1}
+            ))
+        
+        # === Calcular KPIs ===
+        total_repos = len(repos)
+        total_users = len(users)
+        total_orgs = len(orgs)
+        
+        avg_stars = sum((r.get("stargazer_count") or 0) for r in repos) / max(total_repos, 1)
+        avg_expertise = sum((u.get("quantum_expertise_score") or 0) for u in users) / max(total_users, 1)
+        
+        lang_counts = {}
+        for r in repos:
+            lang = r.get("primary_language", {})
+            if isinstance(lang, dict):
+                lang = lang.get("name", "")
+            lang = lang or r.get("language", "")
+            if lang:
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
+        
+        top_language = max(lang_counts, key=lang_counts.get) if lang_counts else "N/A"
+        lang_distribution = [{"name": k, "value": v} for k, v in
+                            sorted(lang_counts.items(), key=lambda x: -x[1])[:10]]
+        
+        # === Calcular datos de charts compatibles con el dashboard global ===
+        # Orgs: quantum_repositories_count y total_stars (calculados desde repos de la vista)
+        chart_orgs_list = []
+        for org in orgs:
+            org_login = org.get("login", "")
+            org_repos_list = [r for r in repos if
+                (r.get("owner", {}) or {}).get("login") == org_login or
+                (r.get("organization", {}) or {}).get("login") == org_login]
+            chart_orgs_list.append({
+                "login": org_login,
+                "name": org.get("name") or org_login,
+                "avatar_url": org.get("avatar_url"),
+                "description": org.get("description"),
+                "quantum_repositories_count": len(org_repos_list),
+                "total_stars": sum((r.get("stargazer_count") or 0) for r in org_repos_list),
+                "members_count": org.get("members_count", 0),
+                "quantum_focus_score": org.get("quantum_focus_score", 0),
+                "location": org.get("location"),
+                "is_verified": org.get("is_verified", False),
+                "created_at": org.get("created_at"),
+                "website_url": org.get("website_url"),
+                "twitter_username": org.get("twitter_username"),
+                "email": org.get("email"),
+                "quantum_contributors_count": org.get("quantum_contributors_count", 0),
+                "total_repositories_count": org.get("total_repositories_count") or org.get("public_repos", 0),
+                "total_members_count": org.get("total_members_count") or org.get("members_count", 0),
+                "total_unique_contributors": org.get("total_unique_contributors", 0),
+                "top_languages": org.get("top_languages", []),
+                "is_quantum_focused": org.get("is_quantum_focused", False),
+                "top_quantum_contributors": (org.get("top_quantum_contributors") or [])[:5],
+            })
+        chart_orgs_list.sort(key=lambda o: o["quantum_repositories_count"], reverse=True)
+        
+        # Construir objeto por métrica (misma estructura que el endpoint principal)
+        MIN_REPOS_FOCUS = 3
+        chart_orgs = {
+            "byRepos": sorted(chart_orgs_list, key=lambda o: o["quantum_repositories_count"], reverse=True)[:10],
+            "byStars": sorted(chart_orgs_list, key=lambda o: o["total_stars"], reverse=True)[:10],
+            "byQuantumFocus": sorted(
+                [o for o in chart_orgs_list if o["quantum_repositories_count"] >= MIN_REPOS_FOCUS],
+                key=lambda o: o.get("quantum_focus_score", 0), reverse=True
+            )[:10],
+            "byContributors": sorted(chart_orgs_list, key=lambda o: o.get("total_unique_contributors", 0), reverse=True)[:10]
+        }
+
+        # Users: total_contributions y relevant_repos_count (desde collaborators de repos)
+        user_contrib_map = {}  # login -> {contributions, repo_set}
+        for r in repos:
+            for c in r.get("collaborators", []):
+                login = c.get("login", "")
+                if not login:
+                    continue
+                if login not in user_contrib_map:
+                    user_contrib_map[login] = {"contributions": 0, "repos": set()}
+                user_contrib_map[login]["contributions"] += (c.get("contributions") or 0)
+                user_contrib_map[login]["repos"].add(r.get("full_name", ""))
+
+        chart_users = []
+        for u in users:
+            login = u.get("login", "")
+            contrib_info = user_contrib_map.get(login, {"contributions": 0, "repos": set()})
+            chart_users.append({
+                "login": login,
+                "name": u.get("name") or login,
+                "avatar_url": u.get("avatar_url"),
+                "total_contributions": contrib_info["contributions"],
+                "relevant_repos_count": len(contrib_info["repos"]),
+                "followers_count": u.get("followers_count") or u.get("followers", 0),
+                "quantum_expertise_score": u.get("quantum_expertise_score") or 0,
+                "bio": u.get("bio"),
+                "company": u.get("company"),
+                "location": u.get("location"),
+                "created_at": u.get("created_at"),
+                "following_count": u.get("following_count", 0),
+                "public_repos_count": u.get("public_repos_count", 0),
+                "top_languages": u.get("top_languages", []),
+                "url": u.get("url"),
+                "website_url": u.get("website_url"),
+                "twitter_username": u.get("twitter_username"),
+                "is_hireable": u.get("is_hireable", False),
+                "organizations": u.get("organizations", []),
+                "total_commit_contributions": u.get("total_commit_contributions", 0),
+                "total_pr_contributions": u.get("total_pr_contributions", 0),
+                "total_pr_review_contributions": u.get("total_pr_review_contributions", 0),
+                "total_issue_contributions": u.get("total_issue_contributions", 0),
+            })
+        chart_users.sort(key=lambda u: u["total_contributions"], reverse=True)
+
+        response = {
+            "kpis": {
+                "totalRepos": total_repos,
+                "totalUsers": total_users,
+                "totalOrgs": total_orgs,
+                "avgStars": round(avg_stars),
+                "avgExpertise": round(avg_expertise, 2),
+                "topLanguage": top_language,
+            },
+            "charts": {
+                "organizations": chart_orgs,
+                "repositories": sorted(repos, key=lambda r: (r.get("stargazer_count") or 0), reverse=True),
+                "users": chart_users,
+                "languageDistribution": lang_distribution,
+            },
+            "tables": {
+                "repositories": sorted(repos, key=lambda r: (r.get("stargazer_count") or 0), reverse=True)[:20],
+                "users": sorted(chart_users, key=lambda u: u.get("quantum_expertise_score", 0), reverse=True)[:20],
+            },
+            "metadata": {
+                "viewId": view_id,
+                "entityCount": len(entity_ids),
+                "calculatedAt": datetime.now().isoformat(),
+            }
+        }
+        
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calculando datos de vista {view_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ENDPOINT DE JERARQUÍA DE FAVORITOS (org → repos → users)
+# ============================================================================
+
+@router.get("/favorites/{entity_id:path}/children")
+async def get_favorite_children(entity_id: str):
+    """
+    Devuelve los hijos jerárquicos de un favorito.
+    - org_<login> → sus repos (con colaboradores resumidos)
+    - repo_<full_name> → sus colaboradores (con flag bridge)
+    Herencia unidireccional: org → repo → user
+    """
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+
+        if entity_id.startswith("org_"):
+            org_login = entity_id[4:]
+            repos_col = db.get_collection("repositories")
+            org_repos = list(repos_col.find(
+                {"$or": [
+                    {"owner.login": org_login},
+                    {"organization.login": org_login},
+                ]},
+                {"full_name": 1, "name": 1, "stargazer_count": 1,
+                 "primary_language": 1, "collaborators": 1,
+                 "fork_count": 1, "description": 1}
+            ))
+
+            children = []
+            for r in org_repos:
+                lang = r.get("primary_language", {})
+                if isinstance(lang, dict):
+                    lang = lang.get("name", "")
+                lang = lang or ""
+                collabs = r.get("collaborators", [])
+
+                children.append({
+                    "id": f"repo_{r['full_name']}",
+                    "name": r["full_name"],
+                    "type": "repository",
+                    "subtitle": f"⭐ {r.get('stargazer_count', 0)}"
+                               + (f" · {lang}" if lang else ""),
+                    "collaborators_count": len(collabs),
+                    "has_children": len(collabs) > 0,
+                })
+
+            return {
+                "parent_id": entity_id,
+                "children": sorted(children,
+                    key=lambda x: int(x["subtitle"].split("⭐ ")[1].split(" ·")[0]) if "⭐" in x["subtitle"] else 0,
+                    reverse=True),
+            }
+
+        elif entity_id.startswith("repo_"):
+            repo_full_name = entity_id[5:]
+            repos_col = db.get_collection("repositories")
+            repo = repos_col.find_one(
+                {"full_name": repo_full_name},
+                {"collaborators": 1, "full_name": 1}
+            )
+            if not repo:
+                return {"parent_id": entity_id, "children": []}
+
+            collabs = repo.get("collaborators", [])
+            collab_logins = [c.get("login", "") for c in collabs if c.get("login")]
+
+            # Determinar bridge users (aparecen en 2+ repos)
+            user_repo_counts = {}
+            if collab_logins:
+                all_repos_with_collabs = repos_col.find(
+                    {"collaborators.login": {"$in": collab_logins}},
+                    {"collaborators.login": 1}
+                )
+                for r in all_repos_with_collabs:
+                    for c in r.get("collaborators", []):
+                        login = c.get("login", "")
+                        if login in collab_logins:
+                            user_repo_counts[login] = user_repo_counts.get(login, 0) + 1
+
+            # Obtener info básica de users
+            users_col = db.get_collection("users")
+            user_docs = {}
+            if collab_logins:
+                for u in users_col.find(
+                    {"login": {"$in": collab_logins}},
+                    {"login": 1, "name": 1, "avatar_url": 1}
+                ):
+                    user_docs[u["login"]] = u
+
+            children = []
+            for c in collabs:
+                login = c.get("login", "")
+                if not login:
+                    continue
+                is_bridge = user_repo_counts.get(login, 0) >= 2
+                user_info = user_docs.get(login, {})
+                children.append({
+                    "id": f"user_{login}",
+                    "name": user_info.get("name") or login,
+                    "login": login,
+                    "type": "user",
+                    "is_bridge": is_bridge,
+                    "contributions": c.get("contributions", 0),
+                    "subtitle": f"{c.get('contributions', 0)} contrib."
+                               + (" · Bridge" if is_bridge else ""),
+                })
+
+            # Bridge users primero, luego por contribuciones
+            children.sort(key=lambda x: (0 if x["is_bridge"] else 1, -x["contributions"]))
+
+            return {
+                "parent_id": entity_id,
+                "children": children,
+            }
+
+        else:
+            return {"parent_id": entity_id, "children": []}
+
+    except Exception as e:
+        logger.error(f"Error obteniendo hijos de {entity_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/search/entity/{entity_id:path}")
+async def get_entity_detail(entity_id: str):
+    """
+    Obtiene los detalles completos de una entidad a partir de su ID con prefijo.
+    IDs esperados: user_<login>, repo_<owner/name>, org_<login>
+    Devuelve datos ricos desde la BBDD local.
+    """
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+
+        if entity_id.startswith("user_"):
+            login = entity_id[5:]
+            col = db.get_collection("users")
+            doc = col.find_one({"login": login})
+            if not doc:
+                raise HTTPException(status_code=404, detail=f"Usuario {login} no encontrado")
+            doc["_id"] = str(doc["_id"])
+
+            # ── Calcular métricas consistentes con el dashboard ──
+            repo_col = db.get_collection("repositories")
+
+            # 1) Total de contribuciones quantum: sumar contrib del usuario en cada repo de la BD
+            pipeline = [
+                {"$match": {"collaborators.login": login}},
+                {"$project": {
+                    "full_name": 1,
+                    "stargazer_count": {"$ifNull": ["$stargazer_count", 0]},
+                    "contrib": {
+                        "$filter": {
+                            "input": {"$ifNull": ["$collaborators", []]},
+                            "as": "c",
+                            "cond": {"$eq": ["$$c.login", login]}
+                        }
+                    }
+                }},
+                {"$addFields": {
+                    "user_contributions": {
+                        "$sum": "$contrib.contributions"
+                    }
+                }}
+            ]
+            repo_results = list(repo_col.aggregate(pipeline))
+
+            total_quantum_contributions = 0
+            relevant_repos_count = 0
+            is_owner_count = 0
+            for r in repo_results:
+                contribs = r.get("user_contributions", 0) or 0
+                total_quantum_contributions += contribs
+                # Relevante si owner o >5 contribuciones (misma lógica que enrichment)
+                if contribs > 5:
+                    relevant_repos_count += 1
+
+            # Contar repos donde es owner
+            owner_count = repo_col.count_documents({"owner.login": login})
+            relevant_repos_count += owner_count
+
+            # Collab score: misma fórmula que ChartsSection
+            import math
+            collab_score = round(math.sqrt(total_quantum_contributions * (relevant_repos_count * 100)))
+
+            doc["_entity_type"] = "user"
+            doc["_repos_contributed"] = len(repo_results)
+            doc["_total_quantum_contributions"] = total_quantum_contributions
+            doc["_relevant_repos_count"] = relevant_repos_count
+            doc["_collab_score"] = collab_score
+            return doc
+
+        elif entity_id.startswith("repo_"):
+            full_name = entity_id[5:]
+            col = db.get_collection("repositories")
+            doc = col.find_one({"full_name": full_name})
+            if not doc:
+                raise HTTPException(status_code=404, detail=f"Repositorio {full_name} no encontrado")
+            doc["_id"] = str(doc["_id"])
+            doc["_entity_type"] = "repository"
+            return doc
+
+        elif entity_id.startswith("org_"):
+            login = entity_id[4:]
+            col = db.get_collection("organizations")
+            doc = col.find_one({"login": login})
+            if not doc:
+                raise HTTPException(status_code=404, detail=f"Organización {login} no encontrada")
+            doc["_id"] = str(doc["_id"])
+            doc["_entity_type"] = "organization"
+            return doc
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Formato de ID no válido: {entity_id}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error obteniendo detalle de entidad {entity_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/search/entities")
+async def search_entities(
+    q: str = Query(..., min_length=2, max_length=100, description="Texto de búsqueda"),
+    limit: int = Query(default=15, ge=1, le=50, description="Máximo de resultados")
+):
+    """
+    Búsqueda unificada a través de usuarios, repositorios y organizaciones.
+    Busca por nombre/login con regex case-insensitive.
+    Devuelve resultados formateados para el panel de favoritos.
+    """
+    try:
+        from ..core.db import db
+        import re
+
+        # Escapar caracteres especiales de regex en el input del usuario
+        escaped_q = re.escape(q)
+        regex_filter = {"$regex": escaped_q, "$options": "i"}
+
+        results = []
+        per_type_limit = max(limit // 3, 5)
+
+        # --- Buscar usuarios ---
+        try:
+            user_col = db.get_collection("users")
+            user_cursor = user_col.find(
+                {"$or": [
+                    {"login": regex_filter},
+                    {"name": regex_filter},
+                ]},
+                {"login": 1, "name": 1, "avatar_url": 1, "bio": 1}
+            ).limit(per_type_limit)
+            for u in user_cursor:
+                results.append({
+                    "id": f"user_{u['login']}",
+                    "name": u.get("name") or u["login"],
+                    "login": u["login"],
+                    "type": "user",
+                    "avatar": u.get("avatar_url", ""),
+                    "subtitle": u.get("bio", "") or "",
+                })
+        except Exception as e:
+            logger.warning(f"Error buscando usuarios: {e}")
+
+        # --- Buscar repositorios ---
+        try:
+            repo_col = db.get_collection("repositories")
+            repo_cursor = repo_col.find(
+                {"$or": [
+                    {"full_name": regex_filter},
+                    {"name": regex_filter},
+                    {"description": regex_filter},
+                ]},
+                {"full_name": 1, "name": 1, "description": 1, "stargazer_count": 1, "primary_language": 1}
+            ).limit(per_type_limit)
+            for r in repo_cursor:
+                lang = r.get("primary_language", {})
+                if isinstance(lang, dict):
+                    lang = lang.get("name", "")
+                lang = lang or ""
+                results.append({
+                    "id": f"repo_{r['full_name']}",
+                    "name": r["full_name"],
+                    "login": r["full_name"],
+                    "type": "repository",
+                    "avatar": "",
+                    "subtitle": f"⭐ {r.get('stargazer_count', 0)}"
+                               + (f" · {lang}" if lang else ""),
+                })
+        except Exception as e:
+            logger.warning(f"Error buscando repositorios: {e}")
+
+        # --- Buscar organizaciones ---
+        try:
+            org_col = db.get_collection("organizations")
+            org_cursor = org_col.find(
+                {"$or": [
+                    {"login": regex_filter},
+                    {"name": regex_filter},
+                ]},
+                {"login": 1, "name": 1, "description": 1, "avatar_url": 1}
+            ).limit(per_type_limit)
+            for o in org_cursor:
+                results.append({
+                    "id": f"org_{o['login']}",
+                    "name": o.get("name") or o["login"],
+                    "login": o["login"],
+                    "type": "organization",
+                    "avatar": o.get("avatar_url", ""),
+                    "subtitle": (o.get("description", "") or "")[:80],
+                })
+        except Exception as e:
+            logger.warning(f"Error buscando organizaciones: {e}")
+
+        # Ordenar: coincidencias exactas primero
+        q_lower = q.lower()
+        results.sort(key=lambda x: (
+            0 if x["name"].lower() == q_lower or x.get("login", "").lower() == q_lower
+            else 1 if x["name"].lower().startswith(q_lower) or x.get("login", "").lower().startswith(q_lower)
+            else 2
+        ))
+
+        return {
+            "query": q,
+            "count": len(results),
+            "results": results[:limit],
+        }
+    except Exception as e:
+        logger.error(f"Error en búsqueda de entidades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
