@@ -4,6 +4,7 @@ Aplicación principal de FastAPI.
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from .routes import router
 from ..core.config import config
@@ -75,6 +76,9 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# GZip: comprimir respuestas grandes (>1KB). Reduce ~22MB de JSON del grafo a ~2-3MB.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Incluir rutas
 app.include_router(router, prefix="/api/v1", tags=["api"])

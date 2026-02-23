@@ -11,6 +11,12 @@ pymongo==4.10.1
 # Cliente HTTP
 requests==2.32.3
 
+# Análisis de redes de colaboración
+networkx>=3.0
+
+# Serialización JSON rápida
+orjson>=3.9
+
 # Utilidades
 python-dotenv==1.0.1
 
