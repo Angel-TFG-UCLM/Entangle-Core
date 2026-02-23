@@ -291,9 +291,12 @@ async def get_dashboard_stats(
             "topLanguage": top_language
         }
         
-        # === CHART: TOP 10 ORGANIZACIONES (por repos) ===
-        # Si hay filtro de lenguaje, calcular dinámicamente desde repos
-        # Si no, usar datos pre-calculados de la colección organizations
+        # === CHART: TOP 10 ORGANIZACIONES (por métrica seleccionada) ===
+        # Se generan 4 rankings: byRepos, byStars, byQuantumFocus, byContributors
+        # Para quantum focus se exige un mínimo de 3 repos quantum para evitar
+        # que orgs triviales con 1 solo repo aparezcan con 100%
+        MIN_REPOS_FOR_FOCUS = 3
+        
         if language:
             # Calcular repos por org filtrando por lenguaje
             lang_filter_for_orgs = {"$or": [
@@ -301,7 +304,8 @@ async def get_dashboard_stats(
                 {"primary_language": language}
             ]}
             
-            top_orgs_pipeline = [
+            # Pipeline base: agrupar repos por org, hacer lookup, proyectar
+            lang_org_base = [
                 {"$match": lang_filter_for_orgs},
                 {"$group": {
                     "_id": {"$ifNull": ["$owner.login", "$organization.login"]},
@@ -309,8 +313,6 @@ async def get_dashboard_stats(
                     "total_stars": {"$sum": {"$ifNull": ["$stargazer_count", 0]}}
                 }},
                 {"$match": {"_id": {"$ne": None}}},
-                {"$sort": {"quantum_repositories_count": -1}},
-                {"$limit": 10},
                 {"$lookup": {
                     "from": "organizations",
                     "localField": "_id",
@@ -342,38 +344,67 @@ async def get_dashboard_stats(
                     "top_quantum_contributors": {"$slice": [{"$ifNull": [{"$arrayElemAt": ["$org_info.top_quantum_contributors", 0]}, []]}, 5]}
                 }}
             ]
-            chart_orgs = list(repos_collection.aggregate(top_orgs_pipeline))
+            
+            chart_orgs = {
+                "byRepos": list(repos_collection.aggregate(lang_org_base + [
+                    {"$sort": {"quantum_repositories_count": -1}}, {"$limit": 10}
+                ])),
+                "byStars": list(repos_collection.aggregate(lang_org_base + [
+                    {"$sort": {"total_stars": -1}}, {"$limit": 10}
+                ])),
+                "byQuantumFocus": list(repos_collection.aggregate(lang_org_base + [
+                    {"$match": {"quantum_repositories_count": {"$gte": MIN_REPOS_FOR_FOCUS}}},
+                    {"$sort": {"quantum_focus_score": -1}}, {"$limit": 10}
+                ])),
+                "byContributors": list(repos_collection.aggregate(lang_org_base + [
+                    {"$sort": {"total_unique_contributors": -1}}, {"$limit": 10}
+                ]))
+            }
         else:
-            # Sin filtro de lenguaje: usar datos pre-calculados
-            top_orgs_pipeline = [
-                {"$project": {
-                    "_id": 0,
-                    "login": 1,
-                    "name": 1,
-                    "avatar_url": 1,
-                    "description": 1,
-                    "members_count": {"$ifNull": ["$members_count", 0]},
-                    "quantum_repositories_count": {"$ifNull": ["$quantum_repositories_count", 0]},
-                    "total_stars": {"$ifNull": ["$total_stars", 0]},
-                    "quantum_focus_score": {"$ifNull": ["$quantum_focus_score", 0]},
-                    "location": 1,
-                    "is_verified": {"$ifNull": ["$is_verified", False]},
-                    "created_at": 1,
-                    "website_url": 1,
-                    "twitter_username": 1,
-                    "email": 1,
-                    "quantum_contributors_count": {"$ifNull": ["$quantum_contributors_count", 0]},
-                    "total_repositories_count": {"$ifNull": ["$total_repositories_count", 0]},
-                    "total_members_count": {"$ifNull": ["$total_members_count", 0]},
-                    "total_unique_contributors": {"$ifNull": ["$total_unique_contributors", 0]},
-                    "top_languages": {"$ifNull": ["$top_languages", []]},
-                    "is_quantum_focused": {"$ifNull": ["$is_quantum_focused", False]},
-                    "top_quantum_contributors": {"$ifNull": [{"$slice": ["$top_quantum_contributors", 5]}, []]}
-                }},
-                {"$sort": {"quantum_repositories_count": -1}},
-                {"$limit": 10}
-            ]
-            chart_orgs = list(orgs_collection.aggregate(top_orgs_pipeline))
+            # Sin filtro de lenguaje: usar datos pre-calculados de la colección organizations
+            org_base_projection = {
+                "_id": 0,
+                "login": 1,
+                "name": 1,
+                "avatar_url": 1,
+                "description": 1,
+                "members_count": {"$ifNull": ["$members_count", 0]},
+                "quantum_repositories_count": {"$ifNull": ["$quantum_repositories_count", 0]},
+                "total_stars": {"$ifNull": ["$total_stars", 0]},
+                "quantum_focus_score": {"$ifNull": ["$quantum_focus_score", 0]},
+                "location": 1,
+                "is_verified": {"$ifNull": ["$is_verified", False]},
+                "created_at": 1,
+                "website_url": 1,
+                "twitter_username": 1,
+                "email": 1,
+                "quantum_contributors_count": {"$ifNull": ["$quantum_contributors_count", 0]},
+                "total_repositories_count": {"$ifNull": ["$total_repositories_count", 0]},
+                "total_members_count": {"$ifNull": ["$total_members_count", 0]},
+                "total_unique_contributors": {"$ifNull": ["$total_unique_contributors", 0]},
+                "top_languages": {"$ifNull": ["$top_languages", []]},
+                "is_quantum_focused": {"$ifNull": ["$is_quantum_focused", False]},
+                "top_quantum_contributors": {"$ifNull": [{"$slice": ["$top_quantum_contributors", 5]}, []]}
+            }
+            
+            def make_org_pipeline(sort_field, match_filter=None, limit=10):
+                pipeline = []
+                if match_filter:
+                    pipeline.append({"$match": match_filter})
+                pipeline.append({"$project": org_base_projection})
+                pipeline.append({"$sort": {sort_field: -1}})
+                pipeline.append({"$limit": limit})
+                return pipeline
+            
+            chart_orgs = {
+                "byRepos": list(orgs_collection.aggregate(make_org_pipeline("quantum_repositories_count"))),
+                "byStars": list(orgs_collection.aggregate(make_org_pipeline("total_stars"))),
+                "byQuantumFocus": list(orgs_collection.aggregate(make_org_pipeline(
+                    "quantum_focus_score",
+                    match_filter={"quantum_repositories_count": {"$gte": MIN_REPOS_FOR_FOCUS}}
+                ))),
+                "byContributors": list(orgs_collection.aggregate(make_org_pipeline("total_unique_contributors")))
+            }
         
         # === CHART: TOP 10 REPOSITORIOS POR DIFERENTES MÉTRICAS ===
         repo_base_projection = {
@@ -1517,7 +1548,7 @@ async def analyze_collaboration(
                 co_collaborators.values(),
                 key=lambda x: len(x["shared_repos"]),
                 reverse=True
-            )[:20]
+            )[:50]
             
             # Enriquecer con datos de usuario
             for collab in sorted_collaborators:
@@ -3590,13 +3621,13 @@ async def get_view_data(view_id: str, body: Dict[str, Any] = None):
         
         # === Calcular datos de charts compatibles con el dashboard global ===
         # Orgs: quantum_repositories_count y total_stars (calculados desde repos de la vista)
-        chart_orgs = []
+        chart_orgs_list = []
         for org in orgs:
             org_login = org.get("login", "")
             org_repos_list = [r for r in repos if
                 (r.get("owner", {}) or {}).get("login") == org_login or
                 (r.get("organization", {}) or {}).get("login") == org_login]
-            chart_orgs.append({
+            chart_orgs_list.append({
                 "login": org_login,
                 "name": org.get("name") or org_login,
                 "avatar_url": org.get("avatar_url"),
@@ -3619,7 +3650,19 @@ async def get_view_data(view_id: str, body: Dict[str, Any] = None):
                 "is_quantum_focused": org.get("is_quantum_focused", False),
                 "top_quantum_contributors": (org.get("top_quantum_contributors") or [])[:5],
             })
-        chart_orgs.sort(key=lambda o: o["quantum_repositories_count"], reverse=True)
+        chart_orgs_list.sort(key=lambda o: o["quantum_repositories_count"], reverse=True)
+        
+        # Construir objeto por métrica (misma estructura que el endpoint principal)
+        MIN_REPOS_FOCUS = 3
+        chart_orgs = {
+            "byRepos": sorted(chart_orgs_list, key=lambda o: o["quantum_repositories_count"], reverse=True)[:10],
+            "byStars": sorted(chart_orgs_list, key=lambda o: o["total_stars"], reverse=True)[:10],
+            "byQuantumFocus": sorted(
+                [o for o in chart_orgs_list if o["quantum_repositories_count"] >= MIN_REPOS_FOCUS],
+                key=lambda o: o.get("quantum_focus_score", 0), reverse=True
+            )[:10],
+            "byContributors": sorted(chart_orgs_list, key=lambda o: o.get("total_unique_contributors", 0), reverse=True)[:10]
+        }
 
         # Users: total_contributions y relevant_repos_count (desde collaborators de repos)
         user_contrib_map = {}  # login -> {contributions, repo_set}
@@ -3820,6 +3863,106 @@ async def get_favorite_children(entity_id: str):
     except Exception as e:
         logger.error(f"Error obteniendo hijos de {entity_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/search/entity/{entity_id:path}")
+async def get_entity_detail(entity_id: str):
+    """
+    Obtiene los detalles completos de una entidad a partir de su ID con prefijo.
+    IDs esperados: user_<login>, repo_<owner/name>, org_<login>
+    Devuelve datos ricos desde la BBDD local.
+    """
+    try:
+        from ..core.db import db
+        db.ensure_connection()
+
+        if entity_id.startswith("user_"):
+            login = entity_id[5:]
+            col = db.get_collection("users")
+            doc = col.find_one({"login": login})
+            if not doc:
+                raise HTTPException(status_code=404, detail=f"Usuario {login} no encontrado")
+            doc["_id"] = str(doc["_id"])
+
+            # ── Calcular métricas consistentes con el dashboard ──
+            repo_col = db.get_collection("repositories")
+
+            # 1) Total de contribuciones quantum: sumar contrib del usuario en cada repo de la BD
+            pipeline = [
+                {"$match": {"collaborators.login": login}},
+                {"$project": {
+                    "full_name": 1,
+                    "stargazer_count": {"$ifNull": ["$stargazer_count", 0]},
+                    "contrib": {
+                        "$filter": {
+                            "input": {"$ifNull": ["$collaborators", []]},
+                            "as": "c",
+                            "cond": {"$eq": ["$$c.login", login]}
+                        }
+                    }
+                }},
+                {"$addFields": {
+                    "user_contributions": {
+                        "$sum": "$contrib.contributions"
+                    }
+                }}
+            ]
+            repo_results = list(repo_col.aggregate(pipeline))
+
+            total_quantum_contributions = 0
+            relevant_repos_count = 0
+            is_owner_count = 0
+            for r in repo_results:
+                contribs = r.get("user_contributions", 0) or 0
+                total_quantum_contributions += contribs
+                # Relevante si owner o >5 contribuciones (misma lógica que enrichment)
+                if contribs > 5:
+                    relevant_repos_count += 1
+
+            # Contar repos donde es owner
+            owner_count = repo_col.count_documents({"owner.login": login})
+            relevant_repos_count += owner_count
+
+            # Collab score: misma fórmula que ChartsSection
+            import math
+            collab_score = round(math.sqrt(total_quantum_contributions * (relevant_repos_count * 100)))
+
+            doc["_entity_type"] = "user"
+            doc["_repos_contributed"] = len(repo_results)
+            doc["_total_quantum_contributions"] = total_quantum_contributions
+            doc["_relevant_repos_count"] = relevant_repos_count
+            doc["_collab_score"] = collab_score
+            return doc
+
+        elif entity_id.startswith("repo_"):
+            full_name = entity_id[5:]
+            col = db.get_collection("repositories")
+            doc = col.find_one({"full_name": full_name})
+            if not doc:
+                raise HTTPException(status_code=404, detail=f"Repositorio {full_name} no encontrado")
+            doc["_id"] = str(doc["_id"])
+            doc["_entity_type"] = "repository"
+            return doc
+
+        elif entity_id.startswith("org_"):
+            login = entity_id[4:]
+            col = db.get_collection("organizations")
+            doc = col.find_one({"login": login})
+            if not doc:
+                raise HTTPException(status_code=404, detail=f"Organización {login} no encontrada")
+            doc["_id"] = str(doc["_id"])
+            doc["_entity_type"] = "organization"
+            return doc
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Formato de ID no válido: {entity_id}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error obteniendo detalle de entidad {entity_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/search/entities")
 async def search_entities(
