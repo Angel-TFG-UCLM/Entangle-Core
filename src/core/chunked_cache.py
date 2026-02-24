@@ -62,6 +62,7 @@ def save_chunked(collection, cache_id, data, large_fields):
     meta["_cached_at"] = datetime.now(timezone.utc).isoformat()
 
     chunk_ids_written = []
+    all_docs_to_insert = []
 
     for field_path in large_fields:
         # Extraer el array del path anidado
@@ -94,7 +95,7 @@ def save_chunked(collection, cache_id, data, large_fields):
         # Remover el array grande del meta para que quepa en 2 MB
         _remove_nested(meta, field_path)
 
-        # Escribir chunks
+        # Preparar chunks para escritura batch
         for i in range(num_chunks):
             chunk_data = items_list[i * items_per_chunk : (i + 1) * items_per_chunk]
             chunk_id = f"{cache_id}##{field_path.replace('.', '_')}##{i}"
@@ -105,11 +106,13 @@ def save_chunked(collection, cache_id, data, large_fields):
             else:
                 chunk_doc = {"_id": chunk_id, "items": chunk_data}
 
-            collection.insert_one(chunk_doc)
+            all_docs_to_insert.append(chunk_doc)
             chunk_ids_written.append(chunk_id)
 
-    # 3. Escribir meta
-    collection.insert_one(meta)
+    # 3. Escribir meta + todos los chunks en batch (reduce round-trips)
+    all_docs_to_insert.append(meta)
+    if all_docs_to_insert:
+        collection.insert_many(all_docs_to_insert, ordered=False)
 
     total_docs = 1 + len(chunk_ids_written)
     field_summary = ", ".join(
@@ -124,6 +127,9 @@ def load_chunked(collection, cache_id):
     """
     Carga y reensambla un documento con chunks. Retorna None si no existe.
     Compatible con documentos legacy (sin chunks).
+
+    Optimización: usa una sola query con $in para cargar todos los chunks
+    en batch, evitando N round-trips secuenciales (crítico en Azure/cloud).
     """
     meta = collection.find_one({"_id": cache_id})
     if not meta:
@@ -139,6 +145,20 @@ def load_chunked(collection, cache_id):
 
     chunk_map = meta.pop("_chunk_map", {})
 
+    # ── Batch: recopilar TODOS los chunk IDs de todos los campos ──
+    all_chunk_ids = []
+    for field_path, info in chunk_map.items():
+        num_chunks = info["count"]
+        for i in range(num_chunks):
+            all_chunk_ids.append(f"{cache_id}##{field_path.replace('.', '_')}##{i}")
+
+    # Una sola query para todos los chunks (en vez de N find_one secuenciales)
+    chunk_docs_map = {}
+    if all_chunk_ids:
+        for doc in collection.find({"_id": {"$in": all_chunk_ids}}):
+            chunk_docs_map[doc["_id"]] = doc
+
+    # ── Reensamblar cada campo desde los chunks cargados ──
     for field_path, info in chunk_map.items():
         num_chunks = info["count"]
         kind = info.get("kind", "list")
@@ -146,7 +166,7 @@ def load_chunked(collection, cache_id):
 
         for i in range(num_chunks):
             chunk_id = f"{cache_id}##{field_path.replace('.', '_')}##{i}"
-            chunk_doc = collection.find_one({"_id": chunk_id})
+            chunk_doc = chunk_docs_map.get(chunk_id)
             if chunk_doc and "items" in chunk_doc:
                 assembled.extend(chunk_doc["items"])
 

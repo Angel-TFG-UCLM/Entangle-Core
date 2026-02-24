@@ -948,12 +948,21 @@ def invalidate_all_caches():
         {"_id": {"$regex": "^collab_analysis_"}}
     ).deleted_count
     
+    # Cachés de datos de vistas personalizadas
+    views_deleted = metrics.delete_many(
+        {"_id": {"$regex": "^view_data_"}}
+    ).deleted_count
+    
+    # Caché in-memory de hijos de favoritos
+    _children_cache.clear()
+    
     summary = {
         "collaboration_graph_chunks": graph_deleted,
         "network_metrics_chunks": nm_deleted,
         "dashboard_stats": stats_deleted,
         "simple_counts": counts_deleted,
         "collaboration_analyses": analyze_deleted,
+        "view_data_caches": views_deleted,
     }
     
     logger.info(f"[INVALIDATE_ALL] Todas las cachés invalidadas: {summary}")
@@ -1896,6 +1905,10 @@ async def get_user_collaboration_network(user_login: str):
 # Almacena tanto el dict como los bytes JSON serializados con orjson
 # Fallback: si la caché en memoria está vacía, intenta cargar desde MongoDB (chunked)
 _network_metrics_cache = {"json_bytes": None, "computed_at": None, "analyzer": None}
+
+# Caché in-memory de hijos de favoritos (entity_id → response dict)
+# Evita queries repetidas al expandir/colapsar nodos en el panel de favoritos
+_children_cache = {}
 
 @router.get("/collaboration/network-metrics")
 async def get_network_metrics(force_refresh: bool = Query(default=False)):
@@ -3489,6 +3502,9 @@ async def get_view_data(view_id: str, body: Dict[str, Any] = None):
     """
     Obtiene datos del dashboard filtrados para una vista personalizada.
     Calcula KPIs, charts y tables solo para las entidades de la vista.
+    
+    Caché PERMANENTE en colección 'metrics' (clave: view_data_{view_id}).
+    Se invalida junto con el resto de cachés vía refresh-metrics.
     """
     try:
         from ..core.db import db
@@ -3508,6 +3524,16 @@ async def get_view_data(view_id: str, body: Dict[str, Any] = None):
         
         if not entity_ids:
             raise HTTPException(status_code=404, detail="Vista no encontrada o sin entidades")
+        
+        # ── CACHÉ: intentar servir desde metrics ──
+        metrics_collection = db.get_collection("metrics")
+        cache_key = f"view_data_{view_id}"
+        cached = metrics_collection.find_one({"_id": cache_key})
+        if cached:
+            cached.pop("_id", None)
+            cached.pop("_cached_at", None)
+            logger.info(f"[VIEW] Cache HIT para vista '{view_id}'")
+            return cached
         
         # Separar IDs por tipo (prefijo: user_, repo_, org_)
         user_ids = []
@@ -3733,6 +3759,18 @@ async def get_view_data(view_id: str, body: Dict[str, Any] = None):
             }
         }
         
+        # ── Guardar en caché permanente ──
+        try:
+            cache_doc = {**response, "_id": cache_key, "_cached_at": datetime.now().isoformat()}
+            metrics_collection.update_one(
+                {"_id": cache_key},
+                {"$set": cache_doc},
+                upsert=True
+            )
+            logger.info(f"[VIEW] Datos de vista '{view_id}' cacheados en metrics")
+        except Exception as cache_err:
+            logger.warning(f"[VIEW] No se pudo cachear vista '{view_id}': {cache_err}")
+        
         return response
     except HTTPException:
         raise
@@ -3752,7 +3790,14 @@ async def get_favorite_children(entity_id: str):
     - org_<login> → sus repos (con colaboradores resumidos)
     - repo_<full_name> → sus colaboradores (con flag bridge)
     Herencia unidireccional: org → repo → user
+    
+    Caché in-memory: los resultados se guardan hasta invalidación global.
     """
+    # ── Caché in-memory ──
+    if entity_id in _children_cache:
+        logger.info(f"[CHILDREN] Cache HIT in-memory para '{entity_id}'")
+        return _children_cache[entity_id]
+    
     try:
         from ..core.db import db
         db.ensure_connection()
@@ -3788,12 +3833,14 @@ async def get_favorite_children(entity_id: str):
                     "has_children": len(collabs) > 0,
                 })
 
-            return {
+            result = {
                 "parent_id": entity_id,
                 "children": sorted(children,
                     key=lambda x: int(x["subtitle"].split("⭐ ")[1].split(" ·")[0]) if "⭐" in x["subtitle"] else 0,
                     reverse=True),
             }
+            _children_cache[entity_id] = result
+            return result
 
         elif entity_id.startswith("repo_"):
             repo_full_name = entity_id[5:]
@@ -3852,13 +3899,17 @@ async def get_favorite_children(entity_id: str):
             # Bridge users primero, luego por contribuciones
             children.sort(key=lambda x: (0 if x["is_bridge"] else 1, -x["contributions"]))
 
-            return {
+            result = {
                 "parent_id": entity_id,
                 "children": children,
             }
+            _children_cache[entity_id] = result
+            return result
 
         else:
-            return {"parent_id": entity_id, "children": []}
+            result = {"parent_id": entity_id, "children": []}
+            _children_cache[entity_id] = result
+            return result
 
     except Exception as e:
         logger.error(f"Error obteniendo hijos de {entity_id}: {e}")
