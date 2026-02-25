@@ -358,7 +358,8 @@ async def get_dashboard_stats(
                 ])),
                 "byContributors": list(repos_collection.aggregate(lang_org_base + [
                     {"$sort": {"total_unique_contributors": -1}}, {"$limit": 10}
-                ]))
+                ])),
+                "bySharedUsers": []  # Se calcula después del bloque unificado
             }
         else:
             # Sin filtro de lenguaje: usar datos pre-calculados de la colección organizations
@@ -405,6 +406,85 @@ async def get_dashboard_stats(
                 ))),
                 "byContributors": list(orgs_collection.aggregate(make_org_pipeline("total_unique_contributors")))
             }
+        
+        # === CHART ORGS: Top 10 por usuarios compartidos (cross-org) ===
+        # Pipeline: repos → unwind collaborators → group by user + collect orgs →
+        # keep users in ≥2 orgs → unwind orgs → count per org
+        # NOTA: No aplicamos filtro de org aquí — el análisis cross-org necesita
+        # TODOS los repos para encontrar usuarios en ≥2 orgs (igual que byRepos/byStars
+        # que tampoco filtran por org). Sí aplicamos filtro de lenguaje si existe.
+        shared_users_repo_match = {"collaborators": {"$exists": True, "$ne": []}}
+        if language and repo_filter:
+            # Solo incluir filtro de lenguaje, no de org
+            lang_part = None
+            if "$and" in repo_filter:
+                # Formato: {"$and": [{"$or": org_filter}, {"$or": lang_filter}]}
+                for clause in repo_filter["$and"]:
+                    if "$or" in clause and any("primary_language" in str(cond) for cond in clause["$or"]):
+                        lang_part = clause
+                        break
+            elif "$or" in repo_filter and any("primary_language" in str(cond) for cond in repo_filter["$or"]):
+                lang_part = {"$or": repo_filter["$or"]}
+            if lang_part:
+                shared_users_repo_match.update(lang_part)
+        elif not org and repo_filter:
+            # Sin org (ej: solo repo filter), aplicar tal cual
+            shared_users_repo_match.update(repo_filter)
+        
+        shared_users_org_pipeline = [
+            {"$match": shared_users_repo_match},
+            {"$unwind": "$collaborators"},
+            {"$group": {
+                "_id": "$collaborators.login",
+                "orgs": {"$addToSet": {"$ifNull": ["$owner.login", "$organization.login"]}}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$project": {
+                "orgs": 1,
+                "orgs_count": {"$size": "$orgs"}
+            }},
+            {"$match": {"orgs_count": {"$gte": 2}}},
+            {"$unwind": "$orgs"},
+            {"$group": {
+                "_id": "$orgs",
+                "shared_users_count": {"$sum": 1}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$sort": {"shared_users_count": -1}},
+            {"$limit": 10},
+            {"$lookup": {
+                "from": "organizations",
+                "localField": "_id",
+                "foreignField": "login",
+                "as": "org_info"
+            }},
+            {"$project": {
+                "_id": 0,
+                "login": "$_id",
+                "name": {"$arrayElemAt": ["$org_info.name", 0]},
+                "avatar_url": {"$arrayElemAt": ["$org_info.avatar_url", 0]},
+                "description": {"$arrayElemAt": ["$org_info.description", 0]},
+                "members_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.members_count", 0]}, 0]},
+                "quantum_repositories_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_repositories_count", 0]}, 0]},
+                "total_stars": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_stars", 0]}, 0]},
+                "quantum_focus_score": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_focus_score", 0]}, 0]},
+                "location": {"$arrayElemAt": ["$org_info.location", 0]},
+                "is_verified": {"$ifNull": [{"$arrayElemAt": ["$org_info.is_verified", 0]}, False]},
+                "created_at": {"$arrayElemAt": ["$org_info.created_at", 0]},
+                "website_url": {"$arrayElemAt": ["$org_info.website_url", 0]},
+                "twitter_username": {"$arrayElemAt": ["$org_info.twitter_username", 0]},
+                "email": {"$arrayElemAt": ["$org_info.email", 0]},
+                "quantum_contributors_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.quantum_contributors_count", 0]}, 0]},
+                "total_repositories_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_repositories_count", 0]}, 0]},
+                "total_members_count": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_members_count", 0]}, 0]},
+                "total_unique_contributors": {"$ifNull": [{"$arrayElemAt": ["$org_info.total_unique_contributors", 0]}, 0]},
+                "top_languages": {"$ifNull": [{"$arrayElemAt": ["$org_info.top_languages", 0]}, []]},
+                "is_quantum_focused": {"$ifNull": [{"$arrayElemAt": ["$org_info.is_quantum_focused", 0]}, False]},
+                "top_quantum_contributors": {"$slice": [{"$ifNull": [{"$arrayElemAt": ["$org_info.top_quantum_contributors", 0]}, []]}, 5]},
+                "shared_users_count": 1
+            }}
+        ]
+        chart_orgs["bySharedUsers"] = list(repos_collection.aggregate(shared_users_org_pipeline))
         
         # === CHART: TOP 10 REPOSITORIOS POR DIFERENTES MÉTRICAS ===
         repo_base_projection = {
@@ -458,6 +538,76 @@ async def get_dashboard_stats(
         
         # Top 10 por colaboradores
         chart_repos_collabs = list(repos_collection.aggregate(make_repo_pipeline("collaborators_count")))
+        
+        # === CHART REPOS: Top 10 por colaboradores compartidos (cross-repo) ===
+        # Pipeline: repos → unwind collaborators → group by user + collect repos →
+        # keep users in ≥2 repos → unwind repos → count per repo → lookup details
+        shared_collabs_repo_match = {"collaborators": {"$exists": True, "$ne": []}}
+        if repo_filter:
+            shared_collabs_repo_match.update(repo_filter)
+        
+        shared_collabs_repo_pipeline = [
+            {"$match": shared_collabs_repo_match},
+            {"$unwind": "$collaborators"},
+            {"$group": {
+                "_id": "$collaborators.login",
+                "repos": {"$addToSet": "$full_name"}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$project": {
+                "repos": 1,
+                "repos_count": {"$size": "$repos"}
+            }},
+            {"$match": {"repos_count": {"$gte": 2}}},
+            {"$unwind": "$repos"},
+            {"$group": {
+                "_id": "$repos",
+                "shared_collaborators_count": {"$sum": 1}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$sort": {"shared_collaborators_count": -1}},
+            {"$limit": 10},
+            {"$lookup": {
+                "from": "repositories",
+                "localField": "_id",
+                "foreignField": "full_name",
+                "as": "repo_info"
+            }},
+            {"$project": {
+                "_id": 0,
+                "id": {"$arrayElemAt": ["$repo_info.id", 0]},
+                "name": {"$arrayElemAt": ["$repo_info.name", 0]},
+                "full_name": "$_id",
+                "description": {"$arrayElemAt": ["$repo_info.description", 0]},
+                "stargazer_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.stargazer_count", 0]}, 0]},
+                "fork_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.fork_count", 0]}, 0]},
+                "collaborators_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.collaborators_count", 0]}, 0]},
+                "primary_language": {"$arrayElemAt": ["$repo_info.primary_language", 0]},
+                "owner": {"$arrayElemAt": ["$repo_info.owner", 0]},
+                "url": {"$arrayElemAt": ["$repo_info.url", 0]},
+                "homepage_url": {"$arrayElemAt": ["$repo_info.homepage_url", 0]},
+                "repository_topics": {"$ifNull": [{"$arrayElemAt": ["$repo_info.repository_topics", 0]}, []]},
+                "created_at": {"$arrayElemAt": ["$repo_info.created_at", 0]},
+                "updated_at": {"$arrayElemAt": ["$repo_info.updated_at", 0]},
+                "pushed_at": {"$arrayElemAt": ["$repo_info.pushed_at", 0]},
+                "commits_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.commits_count", 0]}, 0]},
+                "issues_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.issues_count", 0]}, 0]},
+                "open_issues_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.open_issues_count", 0]}, 0]},
+                "pull_requests_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.pull_requests_count", 0]}, 0]},
+                "merged_pull_requests_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.merged_pull_requests_count", 0]}, 0]},
+                "open_pull_requests_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.open_pull_requests_count", 0]}, 0]},
+                "releases_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.releases_count", 0]}, 0]},
+                "latest_release": {"$arrayElemAt": ["$repo_info.latest_release", 0]},
+                "license_info": {"$arrayElemAt": ["$repo_info.license_info", 0]},
+                "is_fork": {"$ifNull": [{"$arrayElemAt": ["$repo_info.is_fork", 0]}, False]},
+                "is_archived": {"$ifNull": [{"$arrayElemAt": ["$repo_info.is_archived", 0]}, False]},
+                "watchers_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.watchers_count", 0]}, 0]},
+                "languages": {"$ifNull": [{"$slice": [{"$ifNull": [{"$arrayElemAt": ["$repo_info.languages", 0]}, []]}, 6]}, []]},
+                "default_branch_ref_name": {"$arrayElemAt": ["$repo_info.default_branch_ref_name", 0]},
+                "shared_collaborators_count": 1
+            }}
+        ]
+        chart_repos_shared = list(repos_collection.aggregate(shared_collabs_repo_pipeline))
         
         # Helper para detectar si un login es un bot
         def is_bot(login: str) -> bool:
@@ -745,6 +895,66 @@ async def get_dashboard_stats(
                 ]
                 chart_users = list(users_collection.aggregate(top_users_pipeline))
         
+        # === CHART USERS: Top 10 usuarios que colaboran en más repos (byRepos) ===
+        # Pipeline independiente: repos → unwind collaborators → group by user counting repos → top 10
+        multi_repo_user_match = {"collaborators": {"$exists": True, "$ne": []}}
+        if repo_filter:
+            multi_repo_user_match.update(repo_filter)
+        
+        multi_repo_user_pipeline = [
+            {"$match": multi_repo_user_match},
+            {"$unwind": "$collaborators"},
+            {"$group": {
+                "_id": "$collaborators.login",
+                "repos_count": {"$sum": 1},
+                "total_contributions": {"$sum": {"$ifNull": ["$collaborators.contributions", 0]}},
+                "has_commits": {"$max": {"$ifNull": ["$collaborators.has_commits", False]}},
+                "is_mentionable": {"$max": {"$ifNull": ["$collaborators.is_mentionable", False]}}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$sort": {"repos_count": -1, "total_contributions": -1}},
+            {"$limit": 30},
+            {"$lookup": {
+                "from": "users",
+                "localField": "_id",
+                "foreignField": "login",
+                "as": "user_info"
+            }},
+            {"$project": {
+                "_id": 0,
+                "login": "$_id",
+                "name": {"$arrayElemAt": ["$user_info.name", 0]},
+                "avatar_url": {"$arrayElemAt": ["$user_info.avatar_url", 0]},
+                "relevant_repos_count": "$repos_count",
+                "total_contributions": 1,
+                "has_commits": 1,
+                "is_mentionable": 1,
+                "total_commit_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_commit_contributions", 0]}, 0]},
+                "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
+                "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
+                "total_issue_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_issue_contributions", 0]}, 0]},
+                "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]},
+                "bio": {"$arrayElemAt": ["$user_info.bio", 0]},
+                "company": {"$arrayElemAt": ["$user_info.company", 0]},
+                "location": {"$arrayElemAt": ["$user_info.location", 0]},
+                "created_at": {"$arrayElemAt": ["$user_info.created_at", 0]},
+                "followers_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.followers_count", 0]}, 0]},
+                "following_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.following_count", 0]}, 0]},
+                "public_repos_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.public_repos_count", 0]}, 0]},
+                "top_languages": {"$ifNull": [{"$arrayElemAt": ["$user_info.top_languages", 0]}, []]},
+                "quantum_expertise_score": {"$ifNull": [{"$arrayElemAt": ["$user_info.quantum_expertise_score", 0]}, 0]},
+                "url": {"$arrayElemAt": ["$user_info.url", 0]},
+                "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
+                "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
+                "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
+            }}
+        ]
+        # Filtrar bots si no se incluyen
+        chart_users_by_repos_raw = list(repos_collection.aggregate(multi_repo_user_pipeline))
+        if not include_bots:
+            chart_users_by_repos_raw = [u for u in chart_users_by_repos_raw if not is_bot(u.get("login", ""))]
+        chart_users_by_repos = chart_users_by_repos_raw[:10]
+        
         # === GRAFO: Nodos y enlaces pre-calculados ===
         # Top 15 orgs para el grafo
         graph_orgs_pipeline = [
@@ -852,9 +1062,13 @@ async def get_dashboard_stats(
                 "repositories": {
                     "byStars": chart_repos_stars,
                     "byForks": chart_repos_forks,
-                    "byCollaborators": chart_repos_collabs
+                    "byCollaborators": chart_repos_collabs,
+                    "bySharedCollaborators": chart_repos_shared
                 },
-                "users": chart_users,
+                "users": {
+                    "byContributions": chart_users,
+                    "byRepos": chart_users_by_repos
+                },
                 "languageDistribution": language_distribution
             },
             "graph": {
