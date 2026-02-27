@@ -5,11 +5,16 @@ Este script ejecuta la ingesta completa con segmentación automática,
 superando el límite de 1000 resultados de GitHub Search API.
 
 Uso:
-    python scripts/run_repositories_ingestion.py
+    python scripts/run_repositories_ingestion.py [--mode incremental|from_scratch] [--workers N]
+    
+    O mediante variable de entorno:
+    INGESTION_MODE=from_scratch python scripts/run_repositories_ingestion.py
+    MAX_WORKERS=4 python scripts/run_repositories_ingestion.py
 """
 
 import sys
 import os
+import argparse
 
 # Agregar el directorio raíz al path para poder importar módulos
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,12 +26,26 @@ from src.github.repositories_ingestion import IngestionEngine
 
 def main():
     """Ejecuta la ingesta con segmentación dinámica."""
+    # CLI arguments
+    parser = argparse.ArgumentParser(description='Ingesta de repositorios quantum')
+    parser.add_argument('--mode', choices=['incremental', 'from_scratch'], 
+                       default=None, help='Modo de ingesta')
+    parser.add_argument('--workers', type=int, default=None,
+                       help='Número de workers paralelos (1-8)')
+    args = parser.parse_args()
+    
+    # Prioridad: CLI > env var > default
+    mode = args.mode or os.getenv('INGESTION_MODE', 'incremental')
+    max_workers = args.workers or int(os.getenv('MAX_WORKERS', '4'))
+    from_scratch = mode == 'from_scratch'
+    
     try:
         # Validar configuración
         Config.validate()
         
         logger.info("=" * 80)
         logger.info("INICIANDO INGESTA CON SEGMENTACIÓN DINÁMICA")
+        logger.info(f"MODO: {mode.upper()} | WORKERS: {max_workers}")
         logger.info("=" * 80)
         
         # Verificar que la segmentación esté habilitada
@@ -72,7 +91,9 @@ def main():
         
         # Crear motor de ingesta
         engine = IngestionEngine(
-            incremental=False,
+            incremental=not from_scratch,
+            from_scratch=from_scratch,
+            max_workers=max_workers,
             batch_size=500  # ✅ OPTIMIZADO para vCore
         )
         

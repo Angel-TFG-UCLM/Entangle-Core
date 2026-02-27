@@ -135,6 +135,25 @@ class GitHubGraphQLClient:
                     if is_rate_limit_error and attempt < max_retries - 1:
                         continue
                     
+                    # Clasificar errores: FORBIDDEN/SAML son parciales (no fatales si hay data)
+                    non_fatal_types = {'FORBIDDEN', 'NOT_FOUND'}
+                    all_non_fatal = all(
+                        error.get('type') in non_fatal_types or 
+                        'saml' in str(error).lower() or
+                        'forbids access' in str(error).lower()
+                        for error in errors
+                    )
+                    
+                    if all_non_fatal and "data" in data:
+                        # Errores parciales (SAML, FORBIDDEN): retornar datos válidos
+                        forbidden_count = len(errors)
+                        logger.warning(
+                            f"⚠️ {forbidden_count} nodos inaccesibles (SAML/FORBIDDEN) - "
+                            f"retornando datos parciales válidos"
+                        )
+                        logger.debug("Query ejecutada con datos parciales")
+                        return data
+                    
                     # Si no es rate limit o se agotaron reintentos, lanzar error
                     logger.error(f"Errores en la respuesta de GraphQL: {errors}")
                     raise Exception(f"GraphQL errors: {errors}")
@@ -155,8 +174,28 @@ class GitHubGraphQLClient:
                     
             except requests.exceptions.HTTPError as http_err:
                 # Reintentar en errores de servidor temporal (408, 502, 503, 504)
+                # y en 403 (secondary rate limit de GitHub)
                 if hasattr(http_err, 'response') and http_err.response is not None:
                     status_code = http_err.response.status_code
+                    
+                    # 403 = Secondary Rate Limit de GitHub
+                    if status_code == 403 and attempt < max_retries - 1:
+                        # GitHub envía Retry-After header en secondary rate limits
+                        retry_after = http_err.response.headers.get('Retry-After')
+                        if retry_after:
+                            wait_time = int(retry_after) + 2  # +2s margen
+                        else:
+                            # Backoff exponencial: 60s, 120s, 240s...
+                            wait_time = 60 * (2 ** attempt)
+                        
+                        logger.warning(
+                            f"⚠️ Secondary rate limit (403) detectado. "
+                            f"Esperando {wait_time}s antes de reintentar "
+                            f"(intento {attempt + 1}/{max_retries})..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+                    
                     if status_code in [408, 502, 503, 504] and attempt < max_retries - 1:
                         logger.warning(f"⚠️ Error {status_code}, reintentando en {retry_delay}s (intento {attempt + 1}/{max_retries})...")
                         time.sleep(retry_delay)
@@ -549,7 +588,8 @@ class GitHubGraphQLClient:
         min_stars: int = 0,
         max_stars: int = 999999,
         created_year: int = 2020,
-        max_results: Optional[int] = 1000
+        max_results: Optional[int] = 1000,
+        pushed_after: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Busca repositorios en un segmento específico (estrellas + año de creación).
@@ -563,6 +603,8 @@ class GitHubGraphQLClient:
             max_stars: Número máximo de estrellas del segmento
             created_year: Año de creación de los repositorios
             max_results: Máximo de resultados para este segmento (default 1000)
+            pushed_after: Fecha ISO (YYYY-MM-DD) para filtrar repos actualizados después de esta fecha.
+                          Usado en modo incremental para reducir consultas API.
             
         Returns:
             Lista de repositorios del segmento especificado
@@ -585,6 +627,10 @@ class GitHubGraphQLClient:
         
         # Segmentación por año de creación
         query_parts.append(f"created:{created_year}-01-01..{created_year}-12-31")
+        
+        # Filtro incremental: solo repos actualizados después de una fecha
+        if pushed_after:
+            query_parts.append(f"pushed:>{pushed_after}")
         
         # Excluir forks si está configurado
         if config.exclude_forks:
@@ -697,6 +743,8 @@ class GitHubGraphQLClient:
         all_repositories = []
         after_cursor = None
         has_next_page = True
+        page_retries = 0
+        max_page_retries = 3
         
         while has_next_page and len(all_repositories) < max_results:
             try:
@@ -717,7 +765,15 @@ class GitHubGraphQLClient:
                 search_data = response.get("data", {}).get("search", {})
                 repositories = search_data.get("nodes", [])
                 
-                all_repositories.extend(repositories)
+                # Filtrar nodos null (repos inaccesibles por SAML/FORBIDDEN)
+                valid_repositories = [r for r in repositories if r is not None]
+                if len(valid_repositories) < len(repositories):
+                    logger.debug(
+                        f"  Filtrados {len(repositories) - len(valid_repositories)} "
+                        f"nodos null (SAML/FORBIDDEN)"
+                    )
+                
+                all_repositories.extend(valid_repositories)
                 
                 # Verificar paginación
                 page_info = search_data.get("pageInfo", {})
@@ -726,13 +782,30 @@ class GitHubGraphQLClient:
                 
                 logger.debug(f"  Página obtenida: {len(repositories)} repos (total: {len(all_repositories)})")
                 
+                # Reset retry counter on success
+                page_retries = 0
+                
                 # Pausa breve entre páginas
                 if has_next_page:
                     time.sleep(0.5)
                 
             except Exception as e:
-                logger.warning(f"Error en paginación del segmento: {e}")
-                break
+                page_retries += 1
+                if page_retries <= max_page_retries:
+                    wait_time = 60 * page_retries  # 60s, 120s, 180s
+                    logger.warning(
+                        f"⚠️ Error en paginación del segmento (intento {page_retries}/{max_page_retries}): {e}. "
+                        f"Reintentando en {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    # No cambiar after_cursor: reintentar la misma página
+                    continue
+                else:
+                    logger.error(
+                        f"❌ Error persistente en paginación tras {max_page_retries} reintentos: {e}. "
+                        f"Retornando {len(all_repositories)} repos parciales del segmento."
+                    )
+                    break
         
         # Limitar resultados
         if max_results:

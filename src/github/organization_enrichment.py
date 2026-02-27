@@ -1,17 +1,22 @@
 """
-Motor de Enriquecimiento de Organizaciones de GitHub - v1.0
+Motor de Enriquecimiento de Organizaciones de GitHub - v2.0
 
-ESTRATEGIA:
-- Una super-query GraphQL por organización (optimizado)
+ESTRATEGIA v2.0:
+- Queries GraphQL batched (5 orgs/query) para reducir llamadas API
+- Smart rate limit (solo pausa cuando remaining < 200)
+- Bulk MongoDB updates (bulk_write en vez de update_one individual)
+- Fallback individual automático si el batch falla
 - Calcula quantum_focus_score basado en repos quantum de la BD
 - Identifica top contributors a repos quantum
 - Determina is_quantum_focused (threshold: 30%)
-- Batch processing con rate limiting
 """
 
 import time
+import threading
+import concurrent.futures
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pymongo import UpdateOne
 from pymongo.errors import OperationFailure
 
 from .graphql_client import GitHubGraphQLClient
@@ -25,9 +30,38 @@ class OrganizationEnrichmentEngine:
     Calcula scores basándose en repos quantum de la BD local.
     """
     
-    ENRICHMENT_VERSION = "1.0.0"
+    ENRICHMENT_VERSION = "2.0.0"
+    GRAPHQL_BATCH_SIZE = 5  # Organizaciones por query GraphQL batched
     
-    # Query GraphQL para obtener repos y miembros de la organización
+    # Fragment para consultas batched
+    ORG_ENRICHMENT_FRAGMENT = """
+    fragment OrgEnrichmentFields on Organization {
+        id
+        login
+        repositories(first: 100, orderBy: {field: STARGAZERS, direction: DESC}, privacy: PUBLIC) {
+            totalCount
+            nodes {
+                id
+                name
+                nameWithOwner
+                primaryLanguage {
+                    name
+                }
+                stargazerCount
+            }
+        }
+        membersWithRole(first: 100) {
+            totalCount
+            nodes {
+                login
+                name
+                avatarUrl
+            }
+        }
+    }
+    """
+    
+    # Query GraphQL individual (para fallback)
     ENRICHMENT_QUERY = """
     query GetOrganizationEnrichment($login: String!) {
       organization(login: $login) {
@@ -92,6 +126,13 @@ class OrganizationEnrichmentEngine:
         self.config = config or {}
         self.graphql_client = GitHubGraphQLClient(github_token)
         
+        # Lock para estadísticas thread-safe
+        self._stats_lock = threading.Lock()
+        
+        # Coordinación de rate limit entre hilos
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until = 0  # timestamp epoch hasta el que esperar
+        
         # Estadísticas
         self.stats = {
             "total_processed": 0,
@@ -102,7 +143,7 @@ class OrganizationEnrichmentEngine:
             "end_time": None
         }
         
-        logger.info(f"OrganizationEnrichmentEngine v1.0 inicializado (batch_size={batch_size}, sleep_time={sleep_time}s)")
+        logger.info(f"OrganizationEnrichmentEngine v2.0 inicializado (graphql_batch={self.GRAPHQL_BATCH_SIZE}, sleep_time={sleep_time}s)")
     
     # DEPRECATED: Ya no necesario con Azure Cosmos DB for MongoDB (vCore)
     def _retry_on_cosmos_throttle(self, operation, max_retries: int = 5):
@@ -140,7 +181,7 @@ class OrganizationEnrichmentEngine:
             Estadísticas del proceso
         """
         logger.info("=" * 80)
-        logger.info("INICIANDO ENRIQUECIMIENTO DE ORGANIZACIONES v1.0")
+        logger.info("INICIANDO ENRIQUECIMIENTO DE ORGANIZACIONES v2.0")
         logger.info("=" * 80)
         
         self.stats["start_time"] = datetime.now()
@@ -184,27 +225,56 @@ class OrganizationEnrichmentEngine:
             logger.info("✅ No hay organizaciones para enriquecer")
             return self._finalize_stats()
         
-        # Procesar en lotes
-        for i in range(0, total_orgs, self.batch_size):
-            batch = orgs[i:i + self.batch_size]
-            batch_num = i // self.batch_size + 1
-            total_batches = (total_orgs + self.batch_size - 1) // self.batch_size
+        # Procesar en lotes con queries GraphQL batched + ThreadPoolExecutor
+        total_batches = (total_orgs + self.GRAPHQL_BATCH_SIZE - 1) // self.GRAPHQL_BATCH_SIZE
+        max_concurrent = self.config.get("enrichment", {}).get("max_concurrent_batches", 3)
+        logger.info(f"🚀 Procesando {total_orgs} organizaciones con {max_concurrent} workers paralelos (batches de {self.GRAPHQL_BATCH_SIZE})")
+        
+        batches = []
+        for i in range(0, total_orgs, self.GRAPHQL_BATCH_SIZE):
+            batch = orgs[i:i + self.GRAPHQL_BATCH_SIZE]
+            batch_num = i // self.GRAPHQL_BATCH_SIZE + 1
+            batches.append((batch_num, batch))
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            futures = {}
+            for batch_num, batch in batches:
+                future = executor.submit(self._enrich_batch_with_retry, batch, batch_num, total_batches)
+                futures[future] = batch_num
             
-            logger.info(f"\n📦 Procesando lote {batch_num}/{total_batches} ({len(batch)} organizaciones)")
-            
-            for org in batch:
-                self._enrich_single_organization(org)
-                
-                # Sleep para evitar rate limits
-                time.sleep(self.sleep_time)
-            
-            logger.info(f"✅ Lote {batch_num}/{total_batches} completado")
+            for future in concurrent.futures.as_completed(futures):
+                batch_num = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"❌ Error en lote {batch_num}/{total_batches}: {e}")
         
         return self._finalize_stats()
     
+    def _enrich_batch_with_retry(self, batch: List[Dict[str, Any]], batch_num: int, total_batches: int) -> None:
+        """
+        Procesa un batch con reintentos y coordinación de rate limit.
+        Diseñado para ejecución en ThreadPoolExecutor.
+        """
+        # Esperar si hay rate limit activo de otro hilo
+        now = time.time()
+        wait_remaining = self._rate_limit_until - now
+        if wait_remaining > 0:
+            logger.debug(f"⏳ Lote {batch_num}: esperando rate limit activo ({wait_remaining:.0f}s)...")
+            time.sleep(wait_remaining)
+        
+        logger.info(f"\n📦 Lote {batch_num}/{total_batches} ({len(batch)} orgs) - GraphQL batched")
+        
+        self._enrich_batch(batch)
+        
+        # Smart rate limit check
+        self._check_rate_limit()
+        
+        logger.info(f"✅ Lote {batch_num}/{total_batches} completado")
+    
     def _enrich_single_organization(self, org: Dict[str, Any]) -> bool:
         """
-        Enriquece una sola organización.
+        Enriquece una sola organización (método fallback individual).
         
         Args:
             org: Documento de organización de MongoDB
@@ -215,44 +285,216 @@ class OrganizationEnrichmentEngine:
         login = org.get("login")
         
         try:
-            logger.info(f"\nEnriqueciendo organización: {login}")
+            logger.info(f"\nEnriqueciendo organización (individual): {login}")
             
-            # ==================== SUPER-QUERY: UNA SOLA LLAMADA ====================
+            # Fetch GraphQL data individualmente
             graphql_data = self._fetch_organization_data(login)
             
             if not graphql_data:
                 logger.warning(f"⚠️  No se pudo obtener datos de {login}")
-                self.stats["total_errors"] += 1
+                with self._stats_lock:
+                    self.stats["total_errors"] += 1
                 return False
             
-            # ==================== PROCESAR DATOS ====================
+            # Calcular updates usando método compartido
+            updates = self._calculate_enrichment_updates(org, graphql_data)
+            
+            if not updates:
+                with self._stats_lock:
+                    self.stats["total_errors"] += 1
+                return False
+            
+            # Guardar en BD individualmente
+            self._retry_on_cosmos_throttle(
+                lambda: self.orgs_repository.collection.update_one(
+                    {"_id": org.get("_id")},
+                    {"$set": updates}
+                )
+            )
+            
+            with self._stats_lock:
+                self.stats["total_enriched"] += 1
+            self._log_enrichment_result(org, updates)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error enriqueciendo organización {login}: {e}")
+            with self._stats_lock:
+                self.stats["total_errors"] += 1
+            return False
+        
+        finally:
+            with self._stats_lock:
+                self.stats["total_processed"] += 1
+    
+    # ==================== MÉTODOS DE PROCESAMIENTO BATCHED ====================
+    
+    def _enrich_batch(self, orgs_batch: List[Dict[str, Any]]) -> None:
+        """
+        Enriquece un lote de organizaciones con query GraphQL batched.
+        
+        1. Ejecuta una sola query GraphQL para todas las orgs del lote
+        2. Procesa cálculos locales (quantum repos, contributors, etc.) por org
+        3. Aplica updates con bulk_write
+        
+        Args:
+            orgs_batch: Lista de documentos de organización
+        """
+        logins = [org.get("login") for org in orgs_batch if org.get("login")]
+        
+        if not logins:
+            return
+        
+        try:
+            # Construir y ejecutar query batched
+            query, variables = self._build_enrichment_batch_query(logins)
+            response = self.graphql_client.execute_query(query, variables)
+            
+            if "errors" in response and "data" not in response:
+                logger.warning(f"⚠️ Error total en batch query, procesando individualmente")
+                self._enrich_batch_individual_fallback(orgs_batch)
+                return
+            
+            data = response.get("data", {})
+            
+            # Mapear datos GraphQL por login
+            graphql_map = {}
+            for i, login in enumerate(logins):
+                alias = f"org{i}"
+                org_data = data.get(alias)
+                if org_data:
+                    graphql_map[login] = org_data
+            
+            logger.info(f"📡 Batch GraphQL: {len(graphql_map)}/{len(logins)} orgs con datos")
+            
+            # Procesar cada org y recopilar updates
+            bulk_updates = []
+            
+            for org in orgs_batch:
+                login = org.get("login")
+                graphql_data = graphql_map.get(login)
+                
+                if not graphql_data:
+                    logger.warning(f"⚠️ Sin datos GraphQL para {login}, procesando individualmente")
+                    self._enrich_single_organization(org)
+                    continue
+                
+                try:
+                    updates = self._calculate_enrichment_updates(org, graphql_data)
+                    
+                    if updates:
+                        bulk_updates.append(UpdateOne(
+                            {"_id": org.get("_id")},
+                            {"$set": updates}
+                        ))
+                        with self._stats_lock:
+                            self.stats["total_enriched"] += 1
+                        self._log_enrichment_result(org, updates)
+                    else:
+                        with self._stats_lock:
+                            self.stats["total_errors"] += 1
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error procesando {login}: {e}")
+                    with self._stats_lock:
+                        self.stats["total_errors"] += 1
+                
+                with self._stats_lock:
+                    self.stats["total_processed"] += 1
+            
+            # Bulk write de todas las actualizaciones
+            if bulk_updates:
+                try:
+                    result = self.orgs_repository.collection.bulk_write(bulk_updates, ordered=False)
+                    logger.info(f"📝 Bulk update: {result.modified_count} modificadas")
+                except Exception as e:
+                    logger.error(f"❌ Error en bulk_write, actualizando individualmente: {e}")
+                    for update_op in bulk_updates:
+                        try:
+                            self.orgs_repository.collection.update_one(
+                                update_op._filter, update_op._doc
+                            )
+                        except Exception as inner_e:
+                            logger.error(f"❌ Error individual update: {inner_e}")
+            
+        except Exception as e:
+            error_str = str(e)
+            if "RATE_LIMIT" in error_str or "rate limit" in error_str.lower() or "403" in error_str or "forbidden" in error_str.lower():
+                # Esperar al reset del rate limit y reintentar
+                logger.warning("⏸️  Rate limit/403 en batch enrichment - Esperando reset...")
+                self._wait_for_rate_limit_reset()
+                # Reintentar con fallback individual (más conservador tras rate limit)
+                logger.info("🔄 Reintentando batch tras esperar reset...")
+                self._enrich_batch_individual_fallback(orgs_batch)
+                return
+            logger.error(f"❌ Error en batch enrichment: {e}")
+            self._enrich_batch_individual_fallback(orgs_batch)
+    
+    def _build_enrichment_batch_query(self, logins: List[str]) -> tuple:
+        """
+        Construye una query GraphQL batched para múltiples organizaciones.
+        
+        Args:
+            logins: Lista de logins de organizaciones
+            
+        Returns:
+            Tupla (query_string, variables_dict)
+        """
+        variables = {}
+        query_parts = []
+        
+        for i, login in enumerate(logins):
+            variables[f"login{i}"] = login
+            query_parts.append(f"    org{i}: organization(login: $login{i}) {{ ...OrgEnrichmentFields }}")
+        
+        var_defs = ", ".join([f"$login{i}: String!" for i in range(len(logins))])
+        
+        query = f"""{self.ORG_ENRICHMENT_FRAGMENT}
+query GetOrgEnrichmentBatch({var_defs}) {{
+{chr(10).join(query_parts)}
+}}"""
+        
+        return query, variables
+    
+    def _calculate_enrichment_updates(self, org: Dict[str, Any], graphql_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Calcula los campos de enriquecimiento para una organización.
+        Método compartido por batch e individual processing.
+        
+        Args:
+            org: Documento de organización de MongoDB
+            graphql_data: Datos de la API GraphQL
+            
+        Returns:
+            Dict con updates o None si hay error
+        """
+        login = org.get("login")
+        
+        try:
             updates = {}
             
             # Obtener totales de la API
             updates["total_repositories_count"] = graphql_data.get("repositories", {}).get("totalCount", 0)
             updates["total_members_count"] = graphql_data.get("membersWithRole", {}).get("totalCount", 0)
             
-            # ==================== IDENTIFICAR REPOS QUANTUM ====================
+            # Identificar repos quantum en BD local
             quantum_repos_data = self._find_quantum_repositories(login, org)
             
             if quantum_repos_data:
                 updates["quantum_repositories"] = quantum_repos_data["repo_ids"]
                 updates["quantum_repositories_count"] = len(quantum_repos_data["repo_ids"])
                 
-                # Top contributors a repos quantum
                 top_contributors = self._find_top_quantum_contributors(quantum_repos_data["repo_ids"])
                 updates["top_quantum_contributors"] = top_contributors
                 updates["quantum_contributors_count"] = len(top_contributors)
                 
-                # Total de contributors únicos (de collaborators en los repos)
                 total_unique = self._count_unique_contributors(quantum_repos_data["repos"])
                 updates["total_unique_contributors"] = total_unique
                 
-                # Stack tecnológico (top lenguajes)
                 top_languages = self._calculate_top_languages(quantum_repos_data["repo_ids"])
                 updates["top_languages"] = top_languages
                 
-                # Prestigio acumulado (suma de estrellas)
                 total_stars = self._calculate_total_stars(quantum_repos_data["repo_ids"])
                 updates["total_stars"] = total_stars
             else:
@@ -264,7 +506,7 @@ class OrganizationEnrichmentEngine:
                 updates["top_languages"] = []
                 updates["total_stars"] = 0
             
-            # ==================== CALCULAR QUANTUM FOCUS SCORE ====================
+            # Calcular quantum focus score
             quantum_score = self._calculate_quantum_focus_score(
                 quantum_count=updates["quantum_repositories_count"],
                 total_count=updates["total_repositories_count"],
@@ -275,12 +517,12 @@ class OrganizationEnrichmentEngine:
             
             if quantum_score is not None:
                 updates["quantum_focus_score"] = quantum_score
-                updates["is_quantum_focused"] = quantum_score >= 30.0  # Threshold: 30%
+                updates["is_quantum_focused"] = quantum_score >= 30.0
             
             # Timestamp de enriquecimiento
             updates["enriched_at"] = datetime.now()
             
-            # ==================== ENRICHMENT STATUS ====================
+            # Enrichment status
             updates["enrichment_status"] = {
                 "is_complete": True,
                 "version": self.ENRICHMENT_VERSION,
@@ -288,49 +530,117 @@ class OrganizationEnrichmentEngine:
                 "fields_missing": []
             }
             
-            # ==================== GUARDAR EN BD ====================
-            self._retry_on_cosmos_throttle(
-                lambda: self.orgs_repository.collection.update_one(
-                    {"_id": org.get("_id")},
-                    {"$set": updates}
-                )
-            )
+            return updates
             
-            # NOTA: Sleep removido - vCore no necesita throttling
+        except Exception as e:
+            logger.error(f"❌ Error calculando enrichment para {login}: {e}")
+            return None
+    
+    def _log_enrichment_result(self, org: Dict[str, Any], updates: Dict[str, Any]) -> None:
+        """Registra los resultados de enriquecimiento de una organización."""
+        login = org.get("login")
+        logger.info(f"✅ Organización {login} enriquecida correctamente")
+        logger.info(f"   📊 Repos quantum: {updates['quantum_repositories_count']}/{updates['total_repositories_count']}")
+        logger.info(f"   🎯 Quantum score: {updates.get('quantum_focus_score', 0):.2f}%")
+        logger.info(f"   ⭐ Total estrellas: {updates.get('total_stars', 0)}")
+        
+        if updates.get('top_languages'):
+            top_3_langs = updates['top_languages'][:3]
+            langs_str = ", ".join([f"{lang['name']} ({lang['percentage']:.1f}%)" for lang in top_3_langs])
+            logger.info(f"   💻 Top lenguajes: {langs_str}")
+        
+        if org.get("is_relevant"):
+            discovered_repos = org.get("discovered_from_repos", [])
+            if discovered_repos:
+                repo_names = [repo.get("name", "") for repo in discovered_repos if isinstance(repo, dict)]
+                if repo_names:
+                    logger.info(f"   ✅ Relevante - Descubierta desde: {', '.join(repo_names[:3])}")
+                    if len(repo_names) > 3:
+                        logger.info(f"      ... y {len(repo_names) - 3} repos más")
+        else:
+            logger.info(f"   ⚠️  No relevante - Sin repos quantum ingestados")
+    
+    def _enrich_batch_individual_fallback(self, orgs_batch: List[Dict[str, Any]]) -> None:
+        """Fallback: enriquece cada organización individualmente."""
+        logger.info("🔄 Fallback: procesando organizaciones individualmente")
+        for org in orgs_batch:
+            try:
+                self._enrich_single_organization(org)
+            except Exception as e:
+                logger.error(f"❌ Error en fallback para {org.get('login')}: {e}")
+            self._check_rate_limit()
+    
+    def _check_rate_limit(self) -> bool:
+        """
+        Smart rate limit: solo pausa cuando queda poco.
+        Thread-safe: coordina con _rate_limit_until entre hilos.
+        
+        Returns:
+            True si se puede continuar, False si se debe abortar
+        """
+        # Primero comprobar si hay rate limit activo de otro hilo
+        now = time.time()
+        wait_remaining = self._rate_limit_until - now
+        if wait_remaining > 0:
+            logger.debug(f"⏳ Rate limit activo, esperando {wait_remaining:.0f}s...")
+            time.sleep(wait_remaining)
+            return True
+        
+        try:
+            rate_limit = self.graphql_client.get_rate_limit()
+            remaining = rate_limit.get("remaining", 5000)
             
-            self.stats["total_enriched"] += 1
-            logger.info(f"✅ Organización {login} enriquecida correctamente")
-            logger.info(f"   📊 Repos quantum: {updates['quantum_repositories_count']}/{updates['total_repositories_count']}")
-            logger.info(f"   🎯 Quantum score: {updates.get('quantum_focus_score', 0):.2f}%")
-            logger.info(f"   ⭐ Total estrellas: {updates.get('total_stars', 0)}")
-            
-            # Mostrar top lenguajes
-            if updates.get('top_languages'):
-                top_3_langs = updates['top_languages'][:3]
-                langs_str = ", ".join([f"{lang['name']} ({lang['percentage']:.1f}%)" for lang in top_3_langs])
-                logger.info(f"   💻 Top lenguajes: {langs_str}")
-            
-            # Mostrar info de relevancia
-            if org.get("is_relevant"):
-                discovered_repos = org.get("discovered_from_repos", [])
-                if discovered_repos:
-                    repo_names = [repo.get("name", "") for repo in discovered_repos if isinstance(repo, dict)]
-                    if repo_names:
-                        logger.info(f"   ✅ Relevante - Descubierta desde: {', '.join(repo_names[:3])}")
-                        if len(repo_names) > 3:
-                            logger.info(f"      ... y {len(repo_names) - 3} repos más")
+            if remaining < 50:
+                self._wait_for_rate_limit_reset()
+                return True
+            elif remaining < 200:
+                logger.info(f"⏳ Rate limit: {remaining} restantes, breve pausa (2s)")
+                time.sleep(2)
             else:
-                logger.info(f"   ⚠️  No relevante - Sin repos quantum ingestados")
+                logger.debug(f"✅ Rate limit OK: {remaining} restantes")
             
             return True
             
         except Exception as e:
-            logger.error(f"❌ Error enriqueciendo organización {login}: {e}")
-            self.stats["total_errors"] += 1
-            return False
+            logger.warning(f"⚠️ Error checking rate limit: {e}")
+            time.sleep(1)
+            return True
+    
+    def _wait_for_rate_limit_reset(self) -> None:
+        """
+        Espera hasta que el rate limit de GitHub se resetee.
+        Thread-safe: coordina entre hilos con _rate_limit_lock.
+        El primer hilo que detecta el rate limit loguea; los demás esperan silenciosamente.
+        """
+        wait_seconds = 60  # Fallback
+        try:
+            rate_limit = self.graphql_client.get_rate_limit()
+            remaining = rate_limit.get("remaining", 5000)
+            reset_at = rate_limit.get("resetAt", "")
+            
+            if reset_at:
+                reset_time = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                now = datetime.now(reset_time.tzinfo)
+                wait = (reset_time - now).total_seconds() + 5
+                if 0 < wait < 3600:
+                    wait_seconds = wait
+        except Exception:
+            pass
         
-        finally:
-            self.stats["total_processed"] += 1
+        # Coordinación: primer hilo marca timestamp y loguea, otros esperan silenciosamente
+        with self._rate_limit_lock:
+            new_until = time.time() + wait_seconds
+            if new_until > self._rate_limit_until:
+                self._rate_limit_until = new_until
+                logger.warning(f"⏳ Rate limit detectado. Todos los hilos esperarán {wait_seconds:.0f}s hasta reset...")
+        
+        # Dormir hasta el timestamp coordinado
+        sleep_until = self._rate_limit_until - time.time()
+        if sleep_until > 0:
+            time.sleep(sleep_until)
+            logger.info("✅ Rate limit reseteado, continuando")
+    
+    # ==================== MÉTODOS DE DATOS ====================
     
     def _fetch_organization_data(self, login: str) -> Optional[Dict[str, Any]]:
         """

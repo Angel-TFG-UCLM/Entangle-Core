@@ -1,11 +1,23 @@
 """
-Motor de enriquecimiento de datos de repositorios.
-Realiza una segunda pasada para completar información faltante usando GraphQL y REST API.
+Motor de enriquecimiento de datos de repositorios - v3.0
+
+ESTRATEGIA v3.0:
+- Super-query GraphQL combinada: 4 queries→1 por repo (ahorra 3 llamadas API)
+- Llamadas REST paralelas: 6-7 tasks simultáneas por repo con ThreadPoolExecutor
+- Consolidación strategies 13+14+15 → 1 sola llamada REST (ahorra 2 calls/repo)
+- Strategy 17 eliminada (redundante con super-query GraphQL)
+- Procesamiento paralelo de repos dentro de cada lote (3 workers)
+- requests.Session para reutilización de conexiones TCP
+- Colaboradores sin límite (paginación completa)
+- Fallback automático a queries individuales si la combinada falla
 """
 import time
+import concurrent.futures
+import threading
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import requests
+from requests.adapters import HTTPAdapter
 from functools import wraps
 from src.core.logger import logger
 from src.core.mongo_repository import MongoRepository
@@ -16,6 +28,75 @@ class EnrichmentEngine:
     """
     Motor para enriquecer datos de repositorios ya ingestados.
     Completa campos faltantes usando múltiples fuentes (GraphQL, REST API).
+    
+    v2.0: Super-query GraphQL combinada (4→1) para reducir llamadas API.
+    """
+    
+    # Super-query GraphQL combinada: commits + issues + PRs + campos adicionales
+    # Ahorra 3 llamadas API por repositorio (4→1)
+    REPO_ENRICHMENT_SUPER_QUERY = """
+    query GetRepoEnrichmentAll($owner: String!, $name: String!) {
+        repository(owner: $owner, name: $name) {
+            defaultBranchRef {
+                target {
+                    ... on Commit {
+                        history(first: 10) {
+                            nodes {
+                                oid
+                                message
+                                committedDate
+                                author {
+                                    user {
+                                        login
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            issues(first: 10, orderBy: {field: CREATED_AT, direction: DESC}) {
+                nodes {
+                    id
+                    number
+                    title
+                    state
+                    createdAt
+                    closedAt
+                }
+            }
+            pullRequests(first: 10, orderBy: {field: CREATED_AT, direction: DESC}) {
+                nodes {
+                    id
+                    number
+                    title
+                    state
+                    createdAt
+                    closedAt
+                    mergedAt
+                }
+            }
+            codeOfConduct {
+                name
+                url
+            }
+            fundingLinks {
+                platform
+                url
+            }
+            discussionCategories(first: 1) {
+                totalCount
+            }
+            hasProjectsEnabled
+            vulnerabilityAlerts(first: 1) {
+                totalCount
+            }
+            isSecurityPolicyEnabled
+            mergedPullRequests: pullRequests(states: MERGED) {
+                totalCount
+            }
+        }
+    }
     """
     
     def __init__(
@@ -46,6 +127,21 @@ class EnrichmentEngine:
             "Accept": "application/vnd.github.v3+json",
             "X-GitHub-Api-Version": "2022-11-28"
         }
+        
+        # HTTP Session para reutilización de conexiones TCP (evita handshake TLS repetido)
+        self.session = requests.Session()
+        self.session.headers.update(self.rest_headers)
+        # Pool de conexiones ampliado para soportar llamadas paralelas
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=30)
+        self.session.mount("https://", adapter)
+        
+        # Lock para estadísticas thread-safe
+        self._stats_lock = threading.Lock()
+        
+        # ═══ Coordinación de rate limit entre hilos ═══
+        # Cuando un hilo detecta 403, los demás esperan sin gastar reintentos
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until = 0  # timestamp epoch hasta el que esperar
         
         # Configuración de reintentos (desde config o defaults)
         enrichment_config = self.config.get("enrichment", {})
@@ -164,6 +260,12 @@ class EnrichmentEngine:
         """
         Ejecuta una función con reintentos y backoff exponencial.
         
+        COORDINACIÓN ENTRE HILOS para rate limit 403:
+        - Cuando un hilo recibe 403, marca _rate_limit_until con Retry-After + margen.
+        - Todos los hilos comprueban ese timestamp ANTES de cada intento.
+        - Solo el primer hilo que detecta el 403 loguea el aviso.
+        - Los demás esperan silenciosamente hasta que pase el periodo.
+        
         Args:
             func: Función a ejecutar
             *args: Argumentos posicionales
@@ -179,9 +281,13 @@ class EnrichmentEngine:
         
         for attempt in range(self.max_retries + 1):
             try:
-                # Verificar rate limit antes de cada intento
-                if attempt > 0:
-                    self._check_and_display_rate_limit()
+                # ═══ COORDINACIÓN: Esperar si hay rate limit activo ═══
+                now = time.time()
+                wait_remaining = self._rate_limit_until - now
+                if wait_remaining > 0:
+                    # No gastar intento — otro hilo ya detectó el 403
+                    logger.debug(f"⏳ Rate limit activo, esperando {wait_remaining:.0f}s...")
+                    time.sleep(wait_remaining)
                 
                 # Ejecutar función
                 result = func(*args, **kwargs)
@@ -189,14 +295,15 @@ class EnrichmentEngine:
                 # Si tuvimos reintentos, registrar éxito
                 if attempt > 0:
                     logger.info(f"✅ Éxito después de {attempt} reintento(s)")
-                    self.stats["total_retries"] += attempt
+                    with self._stats_lock:
+                        self.stats["total_retries"] += attempt
                 
                 return result
                 
             except requests.exceptions.Timeout as e:
                 last_exception = e
                 if attempt < self.max_retries:
-                    wait_time = self.base_backoff ** attempt  # Backoff exponencial: 2, 4, 8 segundos
+                    wait_time = self.base_backoff ** attempt
                     logger.warning(f"Timeout en intento {attempt + 1}/{self.max_retries + 1}. Reintentando en {wait_time}s...")
                     time.sleep(wait_time)
                 else:
@@ -206,17 +313,40 @@ class EnrichmentEngine:
                 last_exception = e
                 error_msg = str(e).lower()
                 
-                # Si es rate limit, manejar especialmente
+                # Si es rate limit (403) o secondary rate limit
                 if "rate limit" in error_msg or "403" in error_msg:
-                    logger.warning(f"Rate limit detectado: {e}")
-                    self._check_and_display_rate_limit(force_display=True)
                     if attempt < self.max_retries:
-                        logger.info(f"🔄 Reintentando después de verificar rate limit...")
-                        continue
+                        # Extraer Retry-After del response
+                        retry_after = None
+                        if hasattr(e, 'response') and e.response is not None:
+                            ra_header = e.response.headers.get('Retry-After')
+                            if ra_header:
+                                try:
+                                    retry_after = int(ra_header)
+                                except (ValueError, TypeError):
+                                    pass
+                        
+                        # Tiempo de espera: Retry-After + 5s margen, o backoff exponencial
+                        wait_time = (retry_after + 5) if retry_after else min(60 * (2 ** attempt), 300)
+                        
+                        # ═══ COORDINACIÓN: Solo el PRIMER hilo loguea y marca ═══
+                        with self._rate_limit_lock:
+                            new_until = time.time() + wait_time
+                            if new_until > self._rate_limit_until:
+                                self._rate_limit_until = new_until
+                                logger.warning(
+                                    f"⏸️  REST rate limit 403 detectado. "
+                                    f"{'Retry-After: ' + str(retry_after) + 's (+5s margen)' if retry_after else 'Backoff: ' + str(wait_time) + 's'}. "
+                                    f"Todos los hilos esperarán {wait_time}s."
+                                )
+                        
+                        # Dormir hasta el timestamp coordinado (puede ser mayor si otro hilo lo subió)
+                        sleep_until = self._rate_limit_until - time.time()
+                        if sleep_until > 0:
+                            time.sleep(sleep_until)
                     else:
                         logger.error(f"❌ Rate limit persistente después de {self.max_retries + 1} intentos")
                 elif "502" in error_msg or "503" in error_msg or "504" in error_msg:
-                    # Errores de servidor de GitHub
                     if attempt < self.max_retries:
                         wait_time = self.base_backoff ** attempt
                         logger.warning(f"Error de servidor GitHub ({e}). Reintentando en {wait_time}s...")
@@ -224,7 +354,6 @@ class EnrichmentEngine:
                     else:
                         logger.error(f"❌ Error de servidor persistente después de {self.max_retries + 1} intentos")
                 else:
-                    # Otros errores de requests
                     if attempt < self.max_retries:
                         wait_time = self.base_backoff ** attempt
                         logger.warning(f"⚠️  Error de red ({e}). Reintentando en {wait_time}s...")
@@ -234,7 +363,6 @@ class EnrichmentEngine:
                         
             except Exception as e:
                 last_exception = e
-                # Otros errores no se reintentan
                 logger.error(f"❌ Error no recuperable: {type(e).__name__}: {e}")
                 break
         
@@ -269,9 +397,12 @@ class EnrichmentEngine:
         logger.info("\n📂 Consultando repositorios en MongoDB...")
         
         # Si force_reenrich, procesar todos; si no, solo los no enriquecidos o incompletos
+        total_in_db = self.repos_repository.collection.count_documents({})
+        
         if force_reenrich:
             query = {}
-            logger.info("📌 Modo force_reenrich: procesando todos los repositorios")
+            logger.info(f"\n📌 Modo: FORCE RE-ENRICH")
+            logger.info(f"  • Procesando TODOS los {total_in_db} repositorios en BD")
         else:
             # Solo repositorios que:
             # 1. No tienen enrichment_status (nunca enriquecidos)
@@ -288,7 +419,32 @@ class EnrichmentEngine:
                     {"enrichment_status.last_enriched": {"$lt": seven_days_ago.isoformat()}}
                 ]
             }
-            logger.info("📌 Modo incremental: repos sin enriquecer, incompletos o desactualizados (>7 días)")
+            
+            # Desglose de criterios para el log
+            never_enriched = self.repos_repository.collection.count_documents(
+                {"enrichment_status": {"$exists": False}}
+            )
+            incomplete = self.repos_repository.collection.count_documents(
+                {"$or": [{"enrichment_status.is_complete": False}, {"enrichment_status.is_complete": {"$exists": False}}],
+                 "enrichment_status": {"$exists": True}}
+            )
+            already_complete = self.repos_repository.collection.count_documents(
+                {"enrichment_status.is_complete": True}
+            )
+            outdated = self.repos_repository.collection.count_documents(
+                {"enrichment_status.last_enriched": {"$lt": seven_days_ago.isoformat()},
+                 "enrichment_status.is_complete": True}
+            )
+            
+            logger.info(f"\n📌 Modo: INCREMENTAL (criterios de selección)")
+            logger.info(f"  🗄️  Total repositorios en BD: {total_in_db}")
+            logger.info(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            logger.info(f"  • Nunca enriquecidos:           {never_enriched}")
+            logger.info(f"  • Incompletos (campos faltantes): {incomplete}")
+            logger.info(f"  • Desactualizados (>7 días):      {outdated}")
+            logger.info(f"  • Ya completos y al día:         {already_complete - outdated}")
+            logger.info(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            logger.info(f"  ➡️  Se omiten: {max(0, already_complete - outdated)} repos (completos y actualizados)")
         
         repos = list(self.repos_repository.collection.find(query).limit(max_repos or 0))
         total_repos = len(repos)
@@ -296,7 +452,9 @@ class EnrichmentEngine:
         logger.info(f"✅ Encontrados {total_repos} repositorios para procesar")
         
         if total_repos == 0:
-            logger.warning("⚠️  No hay repositorios para enriquecer")
+            logger.warning("\n✅ No hay repositorios pendientes de enriquecimiento")
+            logger.info(f"  • Todos los {total_in_db} repositorios están completos y actualizados")
+            logger.info(f"  • El re-enriquecimiento automático se activa tras 7 días")
             return self.stats
         
         # Procesar en lotes
@@ -313,21 +471,31 @@ class EnrichmentEngine:
             # Verificar rate limit al inicio de cada lote
             self._check_and_display_rate_limit()
             
-            for idx, repo in enumerate(batch, 1):
-                repo_name = repo.get('name_with_owner', 'unknown')
-                logger.info(f"\n🔄 [{batch_num}.{idx}] Procesando: {repo_name}")
+            # Procesamiento paralelo de repos dentro del lote
+            max_concurrent = self.config.get("enrichment", {}).get("max_concurrent_repos", 3)
+            logger.info(f"🚀 Procesando {len(batch)} repos con {max_concurrent} workers paralelos...")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+                futures = {}
+                for idx, repo in enumerate(batch, 1):
+                    repo_name = repo.get('name_with_owner', 'unknown')
+                    logger.info(f"  🔄 [{batch_num}.{idx}] Enviando: {repo_name}")
+                    future = executor.submit(self._enrich_repository, repo)
+                    futures[future] = (idx, repo_name)
                 
-                # NOTA: Retry simplificado - vCore no tiene throttling code 16500
-                # Solo manejar errores inesperados
-                try:
-                    self._enrich_repository(repo)
-                    self.stats["total_enriched"] += 1
-                    logger.info(f"✅ [{batch_num}.{idx}] Completado: {repo_name}")
-                except Exception as e:
-                    logger.error(f"❌ [{batch_num}.{idx}] Error en {repo_name}: {type(e).__name__}: {e}")
-                    self.stats["total_errors"] += 1
-                
-                self.stats["total_processed"] += 1
+                for future in concurrent.futures.as_completed(futures):
+                    idx, repo_name = futures[future]
+                    try:
+                        future.result()
+                        with self._stats_lock:
+                            self.stats["total_enriched"] += 1
+                            self.stats["total_processed"] += 1
+                        logger.info(f"  ✅ [{batch_num}.{idx}] Completado: {repo_name}")
+                    except Exception as e:
+                        logger.error(f"  ❌ [{batch_num}.{idx}] Error en {repo_name}: {type(e).__name__}: {e}")
+                        with self._stats_lock:
+                            self.stats["total_errors"] += 1
+                            self.stats["total_processed"] += 1
             
             # Mostrar resumen del lote
             logger.info(f"\n📊 Lote {batch_num} completado:")
@@ -357,6 +525,9 @@ class EnrichmentEngine:
         logger.info("\n🔍 Rate limit final:")
         self._check_and_display_rate_limit(force_display=True)
         
+        # Recalcular totales después del proceso
+        total_in_db_final = self.repos_repository.collection.count_documents({})
+        
         logger.info(f"\n📊 Estadísticas del Proceso:")
         logger.info(f"  • Repositorios procesados: {self.stats['total_processed']}")
         logger.info(f"  • Repositorios enriquecidos: {self.stats['total_enriched']}")
@@ -371,13 +542,14 @@ class EnrichmentEngine:
             logger.info(f"  • Tiempo promedio por repo: {avg_time:.2f}s")
             logger.info(f"  • Tasa de éxito: {success_rate:.1f}%")
         
-        logger.info(f"\n📊 Estado del Dataset:")
+        logger.info(f"\n🗄️  Estado Final del Dataset:")
+        logger.info(f"  • Total repositorios en BD: {total_in_db_final}")
         logger.info(f"  • Completamente enriquecidos: {complete_count}")
         logger.info(f"  • Con campos faltantes: {incomplete_count}")
         
-        if complete_count + incomplete_count > 0:
-            complete_percentage = (complete_count / (complete_count + incomplete_count)) * 100
-            logger.info(f"  • Porcentaje completo: {complete_percentage:.1f}%")
+        if total_in_db_final > 0:
+            complete_percentage = (complete_count / total_in_db_final) * 100
+            logger.info(f"  • Cobertura de enriquecimiento: {complete_percentage:.1f}% ({complete_count}/{total_in_db_final})")
         
         logger.info(f"\n📝 Campos Enriquecidos:")
         for field, count in sorted(self.stats['fields_enriched'].items(), key=lambda x: x[1], reverse=True):
@@ -387,7 +559,13 @@ class EnrichmentEngine:
     
     def _enrich_repository(self, repo: Dict[str, Any]) -> None:
         """
-        Enriquece un único repositorio.
+        Enriquece un único repositorio con llamadas API paralelas.
+        
+        v3.0 Optimizado:
+        - Llamadas REST paralelas con ThreadPoolExecutor (7 tasks simultáneas)
+        - Estrategias 13+14+15 consolidadas en 1 sola llamada REST
+        - Estrategia 17 eliminada (redundante con super-query GraphQL)
+        - Colaboradores sin límite (paginación completa)
         
         Args:
             repo: Documento del repositorio de MongoDB
@@ -408,22 +586,25 @@ class EnrichmentEngine:
                 last_enriched_dt = datetime.fromisoformat(last_enriched)
                 days_since = (datetime.now() - last_enriched_dt).days
                 
-                # Si fue enriquecido hace menos de 7 días y está completo, saltar
                 if days_since < 7 and enrichment_status.get("is_complete"):
                     logger.info(f"  ⏭️  SALTADO: Enriquecido hace {days_since} días y completo")
                     return
                 elif enrichment_status.get("is_complete") == False:
                     logger.info(f"  🔄 RE-ENRIQUECIENDO: Campos incompletos detectados")
             except (ValueError, TypeError):
-                pass  # Si hay error parseando fecha, continuar con enriquecimiento
+                pass
         
-        logger.info(f"  🔧 Iniciando enriquecimiento de 18 estrategias...")
+        logger.debug(f"  🔧 Enriquecimiento v3.0 (paralelo + consolidado)...")
         
         updates = {}
         fields_enriched = []
         fields_missing = []
         
-        # 1. Campos calculables (no requieren API)
+        # ═══════════════════════════════════════════════════════════
+        # FASE 1: Campos calculados (sin API, instantáneo)
+        # ═══════════════════════════════════════════════════════════
+        
+        # 1. Campos calculables
         calculated = self._calculate_fields(repo)
         updates.update(calculated)
         fields_enriched.extend(calculated.keys())
@@ -433,177 +614,260 @@ class EnrichmentEngine:
         updates.update(urls)
         fields_enriched.extend(urls.keys())
         
-        # 3. Owner type y organization_id
+        # 3. Owner info
         owner_info = self._enrich_owner_info(repo)
         updates.update(owner_info)
         fields_enriched.extend(owner_info.keys())
-        
-        # 4. README text (si está en la query pero no se parseó)
-        if not repo.get("readme_text"):
-            logger.debug(f"  ├─ Obteniendo README...")
-            readme = self._retry_with_backoff(self._fetch_readme_rest, name_with_owner)
-            if readme:
-                updates["readme_text"] = readme
-                updates["has_readme"] = True
-                fields_enriched.extend(["readme_text", "has_readme"])
-                self._increment_field_stat("readme_text")
-                self._increment_field_stat("has_readme")
-            else:
-                # No marcar como faltante - ya pasó filtro has_readme en ingesta
-                logger.debug(f"    ℹ️  Sin README (campo opcional)")
-        
-        # 5. Releases (REST API) - OPCIONAL: No todos los repos tienen releases
-        if not repo.get("releases") or repo.get("releases_count", 0) == 0:
-            logger.debug(f"  ├─ Obteniendo releases...")
-            releases_data = self._retry_with_backoff(self._fetch_releases_rest, name_with_owner)
-            if releases_data:
-                updates["releases"] = releases_data["releases"]
-                updates["releases_count"] = releases_data["count"]
-                updates["latest_release"] = releases_data["latest"]
-                fields_enriched.extend(["releases", "releases_count"])
-                if releases_data["latest"]:
-                    fields_enriched.append("latest_release")
-                self._increment_field_stat("releases")
-                self._increment_field_stat("releases_count")
-                if releases_data["latest"]:
-                    self._increment_field_stat("latest_release")
-            else:
-                # No marcar como faltante - es normal que repos no tengan releases
-                logger.debug(f"    ℹ️  Sin releases (campo opcional)")
-        
-        # 6. Branches count (REST API)
-        if repo.get("branches_count", 0) == 0:
-            logger.debug(f"  ├─ Contando branches...")
-            branches_count = self._retry_with_backoff(self._fetch_branches_count_rest, name_with_owner)
-            if branches_count and branches_count > 0:
-                updates["branches_count"] = branches_count
-                fields_enriched.append("branches_count")
-                self._increment_field_stat("branches_count")
-        
-        # 7. Tags count (REST API)
-        if repo.get("tags_count", 0) == 0:
-            logger.debug(f"  ├─ Contando tags...")
-            tags_count = self._retry_with_backoff(self._fetch_tags_count_rest, name_with_owner)
-            if tags_count and tags_count > 0:
-                updates["tags_count"] = tags_count
-                fields_enriched.append("tags_count")
-                self._increment_field_stat("tags_count")
-        
-        # 8. Recent commits (GraphQL)
-        if not repo.get("recent_commits"):
-            logger.debug(f"  ├─ Obteniendo commits recientes...")
-            recent_commits = self._retry_with_backoff(self._fetch_recent_commits_graphql, name_with_owner)
-            if recent_commits:
-                updates["recent_commits"] = recent_commits
-                fields_enriched.append("recent_commits")
-                self._increment_field_stat("recent_commits")
-                # Extraer last_commit_date
-                if recent_commits and "committed_date" in recent_commits[0]:
-                    updates["last_commit_date"] = recent_commits[0]["committed_date"]
-                    fields_enriched.append("last_commit_date")
-                    self._increment_field_stat("last_commit_date")
-        
-        # 9. Recent issues (GraphQL)
-        if not repo.get("recent_issues"):
-            logger.debug(f"  ├─ Obteniendo issues recientes...")
-            recent_issues = self._retry_with_backoff(self._fetch_recent_issues_graphql, name_with_owner)
-            if recent_issues:
-                updates["recent_issues"] = recent_issues
-                fields_enriched.append("recent_issues")
-                self._increment_field_stat("recent_issues")
-        
-        # 10. Recent pull requests (GraphQL)
-        if not repo.get("recent_pull_requests"):
-            logger.debug(f"  ├─ Obteniendo pull requests recientes...")
-            recent_prs = self._retry_with_backoff(self._fetch_recent_pull_requests_graphql, name_with_owner)
-            if recent_prs:
-                updates["recent_pull_requests"] = recent_prs
-                fields_enriched.append("recent_pull_requests")
-                self._increment_field_stat("recent_pull_requests")
-        
-        # 11. Pull requests detallados (REST API)
-        logger.debug(f"  ├─ Contando pull requests...")
-        pr_counts = self._retry_with_backoff(self._fetch_pull_request_counts_rest, name_with_owner)
-        if pr_counts:
-            updates.update(pr_counts)
-            fields_enriched.extend(pr_counts.keys())
-            for field in pr_counts.keys():
-                self._increment_field_stat(field)
         
         # 12. Campos calculables simples
         simple_fields = self._fix_simple_fields(repo)
         updates.update(simple_fields)
         fields_enriched.extend(simple_fields.keys())
         
-        # 13. Owner type (REST API)
-        if not repo.get("owner", {}).get("type"):
-            logger.debug(f"  ├─ Obteniendo tipo de owner...")
-            owner_type = self._retry_with_backoff(self._fetch_owner_type_rest, name_with_owner)
-            if owner_type:
-                owner = repo.get("owner", {})
-                owner["type"] = owner_type
-                updates["owner"] = owner
-                fields_enriched.append("owner.type")
-                self._increment_field_stat("owner.type")
-                
-                # Si es Organization, agregar organization_id
-                if owner_type == "Organization" and not repo.get("organization_id"):
-                    updates["organization_id"] = owner.get("id")
-                    fields_enriched.append("organization_id")
-                    self._increment_field_stat("organization_id")
+        # ═══════════════════════════════════════════════════════════
+        # FASE 2: Llamadas API paralelas (REST + GraphQL simultáneas)
+        # ═══════════════════════════════════════════════════════════
+        logger.debug(f"  ├─ 🚀 Lanzando llamadas API en paralelo...")
         
-        # 14. License info completa (REST API)
-        license_info = repo.get("license_info", {})
-        if license_info and (not license_info.get("key") or not license_info.get("url")):
-            logger.debug(f"  ├─ Obteniendo licencia completa...")
-            complete_license = self._retry_with_backoff(self._fetch_license_info_rest, name_with_owner)
-            if complete_license:
-                updates["license_info"] = complete_license
-                fields_enriched.extend(["license_info.key", "license_info.url"])
-                self._increment_field_stat("license_info.key")
-                self._increment_field_stat("license_info.url")
+        api_tasks = {}
+        needs_commits = not repo.get("recent_commits")
+        needs_issues = not repo.get("recent_issues")
+        needs_prs = not repo.get("recent_pull_requests")
         
-        # 15. Campos adicionales desde REST API
-        logger.debug(f"  ├─ Obteniendo campos adicionales (REST)...")
-        additional_fields = self._retry_with_backoff(self._fetch_additional_fields_rest, name_with_owner, repo)
-        if additional_fields:
-            updates.update(additional_fields)
-            fields_enriched.extend(additional_fields.keys())
-            for field in additional_fields.keys():
-                self._increment_field_stat(field)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+            # REST calls independientes
+            if not repo.get("readme_text"):
+                api_tasks["readme"] = executor.submit(
+                    self._retry_with_backoff, self._fetch_readme_rest, name_with_owner)
+            
+            if not repo.get("releases") or repo.get("releases_count", 0) == 0:
+                api_tasks["releases"] = executor.submit(
+                    self._retry_with_backoff, self._fetch_releases_rest, name_with_owner)
+            
+            if repo.get("branches_count", 0) == 0:
+                api_tasks["branches"] = executor.submit(
+                    self._retry_with_backoff, self._fetch_branches_count_rest, name_with_owner)
+            
+            if repo.get("tags_count", 0) == 0:
+                api_tasks["tags"] = executor.submit(
+                    self._retry_with_backoff, self._fetch_tags_count_rest, name_with_owner)
+            
+            # PR counts (Strategy 11)
+            api_tasks["pr_counts"] = executor.submit(
+                self._retry_with_backoff, self._fetch_pull_request_counts_rest, name_with_owner)
+            
+            # Consolidated repo info: strategies 13+14+15 → 1 sola llamada REST
+            api_tasks["repo_info"] = executor.submit(
+                self._retry_with_backoff, self._fetch_repo_info_combined, name_with_owner, repo)
+            
+            # GraphQL super-query (commits + issues + PRs + additional fields)
+            if needs_commits or needs_issues or needs_prs:
+                api_tasks["graphql"] = executor.submit(
+                    self._retry_with_backoff, self._fetch_repo_graphql_combined, name_with_owner)
         
-        # 16. Campos adicionales desde GraphQL
-        logger.debug(f"  ├─ Obteniendo campos adicionales (GraphQL)...")
-        graphql_fields = self._retry_with_backoff(self._fetch_additional_fields_graphql, name_with_owner, repo)
+        # ═══════════════════════════════════════════════════════════
+        # FASE 3: Procesar resultados de llamadas paralelas
+        # ═══════════════════════════════════════════════════════════
+        
+        # README (Strategy 4)
+        if "readme" in api_tasks:
+            try:
+                readme = api_tasks["readme"].result()
+                if readme:
+                    updates["readme_text"] = readme
+                    updates["has_readme"] = True
+                    fields_enriched.extend(["readme_text", "has_readme"])
+                    self._increment_field_stat("readme_text")
+                    self._increment_field_stat("has_readme")
+            except Exception:
+                logger.debug(f"    ℹ️  Error obteniendo README (campo opcional)")
+        
+        # Releases (Strategy 5)
+        if "releases" in api_tasks:
+            try:
+                releases_data = api_tasks["releases"].result()
+                if releases_data:
+                    updates["releases"] = releases_data["releases"]
+                    updates["releases_count"] = releases_data["count"]
+                    updates["latest_release"] = releases_data["latest"]
+                    fields_enriched.extend(["releases", "releases_count"])
+                    if releases_data["latest"]:
+                        fields_enriched.append("latest_release")
+                    self._increment_field_stat("releases")
+                    self._increment_field_stat("releases_count")
+                    if releases_data["latest"]:
+                        self._increment_field_stat("latest_release")
+            except Exception:
+                logger.debug(f"    ℹ️  Error obteniendo releases (campo opcional)")
+        
+        # Branches (Strategy 6)
+        if "branches" in api_tasks:
+            try:
+                branches_count = api_tasks["branches"].result()
+                if branches_count and branches_count > 0:
+                    updates["branches_count"] = branches_count
+                    fields_enriched.append("branches_count")
+                    self._increment_field_stat("branches_count")
+            except Exception:
+                pass
+        
+        # Tags (Strategy 7)
+        if "tags" in api_tasks:
+            try:
+                tags_count = api_tasks["tags"].result()
+                if tags_count and tags_count > 0:
+                    updates["tags_count"] = tags_count
+                    fields_enriched.append("tags_count")
+                    self._increment_field_stat("tags_count")
+            except Exception:
+                pass
+        
+        # PR counts (Strategy 11)
+        if "pr_counts" in api_tasks:
+            try:
+                pr_counts = api_tasks["pr_counts"].result()
+                if pr_counts:
+                    updates.update(pr_counts)
+                    fields_enriched.extend(pr_counts.keys())
+                    for field in pr_counts.keys():
+                        self._increment_field_stat(field)
+            except Exception:
+                pass
+        
+        # Consolidated repo info: Strategies 13+14+15 en 1 llamada
+        if "repo_info" in api_tasks:
+            try:
+                repo_info = api_tasks["repo_info"].result()
+                if repo_info:
+                    # Owner type (antigua Strategy 13)
+                    owner_type = repo_info.get("owner_type")
+                    if owner_type and not repo.get("owner", {}).get("type"):
+                        owner = repo.get("owner", {})
+                        owner["type"] = owner_type
+                        updates["owner"] = owner
+                        fields_enriched.append("owner.type")
+                        self._increment_field_stat("owner.type")
+                        if owner_type == "Organization" and not repo.get("organization_id"):
+                            updates["organization_id"] = owner.get("id")
+                            fields_enriched.append("organization_id")
+                            self._increment_field_stat("organization_id")
+                    
+                    # License (antigua Strategy 14)
+                    license_info_result = repo_info.get("license_info")
+                    current_license = repo.get("license_info", {})
+                    if license_info_result and current_license and (not current_license.get("key") or not current_license.get("url")):
+                        updates["license_info"] = license_info_result
+                        fields_enriched.extend(["license_info.key", "license_info.url"])
+                        self._increment_field_stat("license_info.key")
+                        self._increment_field_stat("license_info.url")
+                    
+                    # Additional fields (antigua Strategy 15)
+                    additional_fields = repo_info.get("additional_fields", {})
+                    if additional_fields:
+                        updates.update(additional_fields)
+                        fields_enriched.extend(additional_fields.keys())
+                        for field in additional_fields.keys():
+                            self._increment_field_stat(field)
+            except Exception:
+                pass
+        
+        # GraphQL super-query results (Strategies 8, 9, 10, 16)
+        graphql_prefetch = None
+        if "graphql" in api_tasks:
+            try:
+                graphql_prefetch = api_tasks["graphql"].result()
+            except Exception:
+                graphql_prefetch = None
+        
+        # 8. Recent commits
+        if needs_commits:
+            recent_commits = None
+            if graphql_prefetch:
+                recent_commits = self._parse_commits_from_data(graphql_prefetch)
+            else:
+                try:
+                    recent_commits = self._retry_with_backoff(self._fetch_recent_commits_graphql, name_with_owner)
+                except Exception:
+                    pass
+            if recent_commits:
+                updates["recent_commits"] = recent_commits
+                fields_enriched.append("recent_commits")
+                self._increment_field_stat("recent_commits")
+                if recent_commits and "committed_date" in recent_commits[0]:
+                    updates["last_commit_date"] = recent_commits[0]["committed_date"]
+                    fields_enriched.append("last_commit_date")
+                    self._increment_field_stat("last_commit_date")
+        
+        # 9. Recent issues
+        if not repo.get("recent_issues"):
+            recent_issues = None
+            if graphql_prefetch:
+                recent_issues = self._parse_issues_from_data(graphql_prefetch)
+            else:
+                try:
+                    recent_issues = self._retry_with_backoff(self._fetch_recent_issues_graphql, name_with_owner)
+                except Exception:
+                    pass
+            if recent_issues:
+                updates["recent_issues"] = recent_issues
+                fields_enriched.append("recent_issues")
+                self._increment_field_stat("recent_issues")
+        
+        # 10. Recent pull requests
+        if not repo.get("recent_pull_requests"):
+            recent_prs = None
+            if graphql_prefetch:
+                recent_prs = self._parse_prs_from_data(graphql_prefetch)
+            else:
+                try:
+                    recent_prs = self._retry_with_backoff(self._fetch_recent_pull_requests_graphql, name_with_owner)
+                except Exception:
+                    pass
+            if recent_prs:
+                updates["recent_pull_requests"] = recent_prs
+                fields_enriched.append("recent_pull_requests")
+                self._increment_field_stat("recent_pull_requests")
+        
+        # 16. Additional GraphQL fields (from prefetch or individual)
+        graphql_fields = {}
+        if graphql_prefetch:
+            graphql_fields = self._parse_additional_fields_from_data(graphql_prefetch, repo)
+        else:
+            try:
+                graphql_fields = self._retry_with_backoff(self._fetch_additional_fields_graphql, name_with_owner, repo)
+            except Exception:
+                graphql_fields = {}
         if graphql_fields:
             updates.update(graphql_fields)
             fields_enriched.extend(graphql_fields.keys())
             for field in graphql_fields.keys():
                 self._increment_field_stat(field)
         
-        # 17. Merged PRs count desde REST API (búsqueda)
-        if repo.get("merged_pull_requests_count", 0) == 0:
-            logger.debug(f"  ├─ Contando PRs merged...")
-            merged_count = self._retry_with_backoff(self._fetch_merged_prs_count_rest, name_with_owner)
-            if merged_count and merged_count > 0:
-                updates["merged_pull_requests_count"] = merged_count
-                fields_enriched.append("merged_pull_requests_count")
-                self._increment_field_stat("merged_pull_requests_count")
+        # ═══════════════════════════════════════════════════════════
+        # FASE 4: Colaboradores (paginación completa)
+        # Strategy 17 ELIMINADA: merged PRs ya se obtienen de super-query GraphQL
+        # ═══════════════════════════════════════════════════════════
         
-        # 18. Colaboradores completos (contributors + mentionableUsers)
+        # 18. Colaboradores (contributors + mentionableUsers)
         if not repo.get("collaborators") or len(repo.get("collaborators", [])) == 0:
-            logger.debug(f"  └─ Obteniendo colaboradores (puede tardar)...")
-            collaborators_data = self._retry_with_backoff(self._fetch_collaborators_combined, name_with_owner)
-            if collaborators_data:
-                updates["collaborators"] = collaborators_data["collaborators"]
-                updates["collaborators_count"] = collaborators_data["count"]
-                fields_enriched.extend(["collaborators", "collaborators_count"])
-                self._increment_field_stat("collaborators")
-                self._increment_field_stat("collaborators_count")
-            else:
+            logger.debug(f"  └─ Obteniendo colaboradores...")
+            try:
+                collaborators_data = self._retry_with_backoff(self._fetch_collaborators_combined, name_with_owner)
+                if collaborators_data:
+                    updates["collaborators"] = collaborators_data["collaborators"]
+                    updates["collaborators_count"] = collaborators_data["count"]
+                    fields_enriched.extend(["collaborators", "collaborators_count"])
+                    self._increment_field_stat("collaborators")
+                    self._increment_field_stat("collaborators_count")
+                else:
+                    fields_missing.append("collaborators")
+            except Exception:
                 fields_missing.append("collaborators")
         
-        # Agregar enrichment_status
+        # ═══════════════════════════════════════════════════════════
+        # FASE 5: Actualizar MongoDB
+        # ═══════════════════════════════════════════════════════════
+        
         is_complete = len(fields_missing) == 0
         updates["enrichment_status"] = {
             "is_complete": is_complete,
@@ -613,7 +877,6 @@ class EnrichmentEngine:
             "total_fields_enriched": len(set(fields_enriched))
         }
         
-        # Actualizar en MongoDB si hay cambios
         if updates:
             updates["updated_at"] = datetime.now()
             self.repos_repository.collection.update_one(
@@ -621,7 +884,6 @@ class EnrichmentEngine:
                 {"$set": updates}
             )
             
-            # Logging detallado
             status_icon = "✅" if is_complete else "⚠️"
             logger.info(f"  {status_icon} COMPLETADO: {len(updates)} campos actualizados, {len(set(fields_enriched))} enriquecidos")
             
@@ -710,7 +972,7 @@ class EnrichmentEngine:
         url = f"https://api.github.com/repos/{name_with_owner}/readme"
         
         try:
-            response = requests.get(url, headers=self.rest_headers, timeout=10)
+            response = self.session.get(url, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
@@ -748,7 +1010,7 @@ class EnrichmentEngine:
         params = {"per_page": max_releases}
         
         try:
-            response = requests.get(url, headers=self.rest_headers, params=params, timeout=10)
+            response = self.session.get(url, params=params, timeout=10)
             
             if response.status_code == 200:
                 releases = response.json()
@@ -801,9 +1063,14 @@ class EnrichmentEngine:
         params = {"per_page": 1}
         
         try:
-            response = requests.get(url, headers=self.rest_headers, params=params, timeout=10)
+            response = self.session.get(url, params=params, timeout=10)
             
-            if response.status_code == 200:
+            if response.status_code == 403 or response.status_code >= 500:
+                raise requests.exceptions.RequestException(
+                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    response=response
+                )
+            elif response.status_code == 200:
                 # El total viene en el header Link
                 link_header = response.headers.get("Link", "")
                 if "last" in link_header:
@@ -818,6 +1085,8 @@ class EnrichmentEngine:
                 return len(branches) if branches else 0
             else:
                 return 0
+        except requests.exceptions.RequestException:
+            raise  # Propagar para retry
         except Exception as e:
             logger.error(f"❌ Error en _fetch_branches_count_rest para {name_with_owner}: {e}")
             return 0
@@ -828,9 +1097,14 @@ class EnrichmentEngine:
         params = {"per_page": 1}
         
         try:
-            response = requests.get(url, headers=self.rest_headers, params=params, timeout=10)
+            response = self.session.get(url, params=params, timeout=10)
             
-            if response.status_code == 200:
+            if response.status_code == 403 or response.status_code >= 500:
+                raise requests.exceptions.RequestException(
+                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    response=response
+                )
+            elif response.status_code == 200:
                 link_header = response.headers.get("Link", "")
                 if "last" in link_header:
                     import re
@@ -842,9 +1116,174 @@ class EnrichmentEngine:
                 return len(tags) if tags else 0
             else:
                 return 0
+        except requests.exceptions.RequestException:
+            raise  # Propagar para retry
         except Exception as e:
             logger.error(f"❌ Error en _fetch_tags_count_rest para {name_with_owner}: {e}")
             return 0
+    
+    # ==================== GRAPHQL COMBINED QUERY + PARSERS ====================
+    
+    def _fetch_repo_graphql_combined(self, name_with_owner: str) -> Optional[Dict[str, Any]]:
+        """
+        Ejecuta la super-query GraphQL combinada (4→1) para un repositorio.
+        Obtiene commits, issues, PRs y campos adicionales en una sola llamada.
+        
+        Args:
+            name_with_owner: Nombre completo del repo (e.g., "Qiskit/qiskit")
+            
+        Returns:
+            Datos del repositorio o None si falla
+        """
+        try:
+            owner, repo_name = name_with_owner.split("/")
+            variables = {"owner": owner, "name": repo_name}
+            result = self.graphql_client.execute_query(self.REPO_ENRICHMENT_SUPER_QUERY, variables)
+            
+            if "errors" in result and "data" not in result:
+                logger.warning(f"⚠️ Combined query error for {name_with_owner}: {result.get('errors')}")
+                return None
+            
+            repo_data = result.get("data", {}).get("repository")
+            return repo_data
+            
+        except Exception as e:
+            logger.error(f"❌ Error in combined GraphQL query for {name_with_owner}: {e}")
+            return None
+    
+    def _parse_commits_from_data(self, repo_data: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Extrae y formatea commits recientes de los datos de la super-query."""
+        try:
+            default_branch = repo_data.get("defaultBranchRef", {})
+            if not default_branch:
+                return None
+            target = default_branch.get("target", {})
+            history = target.get("history", {})
+            commits = history.get("nodes", [])
+            
+            if not commits:
+                return None
+            
+            formatted = []
+            for commit in commits:
+                author = commit.get("author", {})
+                user = author.get("user", {})
+                formatted.append({
+                    "oid": commit.get("oid"),
+                    "message": commit.get("message", "")[:100],
+                    "committed_date": commit.get("committedDate"),
+                    "author_login": user.get("login") if user else None
+                })
+            
+            return formatted if formatted else None
+        except Exception as e:
+            logger.error(f"❌ Error parsing commits from prefetch: {e}")
+            return None
+    
+    def _parse_issues_from_data(self, repo_data: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Extrae y formatea issues recientes de los datos de la super-query."""
+        try:
+            issues = repo_data.get("issues", {}).get("nodes", [])
+            if not issues:
+                return None
+            
+            formatted = []
+            for issue in issues:
+                formatted.append({
+                    "id": issue.get("id"),
+                    "number": issue.get("number"),
+                    "title": issue.get("title", "")[:100],
+                    "state": issue.get("state"),
+                    "created_at": issue.get("createdAt"),
+                    "closed_at": issue.get("closedAt")
+                })
+            
+            return formatted if formatted else None
+        except Exception as e:
+            logger.error(f"❌ Error parsing issues from prefetch: {e}")
+            return None
+    
+    def _parse_prs_from_data(self, repo_data: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Extrae y formatea PRs recientes de los datos de la super-query."""
+        try:
+            prs = repo_data.get("pullRequests", {}).get("nodes", [])
+            if not prs:
+                return None
+            
+            formatted = []
+            for pr in prs:
+                formatted.append({
+                    "id": pr.get("id"),
+                    "number": pr.get("number"),
+                    "title": pr.get("title", "")[:100],
+                    "state": pr.get("state"),
+                    "created_at": pr.get("createdAt"),
+                    "closed_at": pr.get("closedAt"),
+                    "merged_at": pr.get("mergedAt")
+                })
+            
+            return formatted if formatted else None
+        except Exception as e:
+            logger.error(f"❌ Error parsing PRs from prefetch: {e}")
+            return None
+    
+    def _parse_additional_fields_from_data(self, repo_data: Dict[str, Any], current_repo: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extrae campos adicionales de los datos de la super-query.
+        Misma lógica que _fetch_additional_fields_graphql pero sin llamada API.
+        """
+        updates = {}
+        try:
+            # Code of Conduct
+            if not current_repo.get("code_of_conduct"):
+                code_of_conduct = repo_data.get("codeOfConduct")
+                if code_of_conduct:
+                    updates["code_of_conduct"] = {
+                        "name": code_of_conduct.get("name"),
+                        "url": code_of_conduct.get("url")
+                    }
+            
+            # Funding Links
+            if not current_repo.get("funding_links") or len(current_repo.get("funding_links", [])) == 0:
+                funding_links = repo_data.get("fundingLinks", [])
+                if funding_links:
+                    updates["funding_links"] = [
+                        {"platform": link.get("platform"), "url": link.get("url")}
+                        for link in funding_links
+                    ]
+            
+            # Discussions count
+            if current_repo.get("discussions_count", 0) == 0:
+                discussions = repo_data.get("discussionCategories", {}).get("totalCount", 0)
+                if discussions > 0:
+                    updates["discussions_count"] = discussions
+            
+            # Projects enabled
+            if current_repo.get("has_projects_enabled") is None:
+                updates["has_projects_enabled"] = repo_data.get("hasProjectsEnabled", False)
+            
+            # Vulnerability alerts count
+            if current_repo.get("vulnerability_alerts_count", 0) == 0:
+                vuln = repo_data.get("vulnerabilityAlerts", {}).get("totalCount", 0)
+                if vuln > 0:
+                    updates["vulnerability_alerts_count"] = vuln
+            
+            # Security policy enabled
+            if current_repo.get("is_security_policy_enabled") is None:
+                updates["is_security_policy_enabled"] = repo_data.get("isSecurityPolicyEnabled", False)
+            
+            # Merged PRs count
+            if current_repo.get("merged_pull_requests_count", 0) == 0:
+                merged = repo_data.get("mergedPullRequests", {}).get("totalCount", 0)
+                if merged > 0:
+                    updates["merged_pull_requests_count"] = merged
+            
+            return updates
+        except Exception as e:
+            logger.error(f"❌ Error parsing additional fields from prefetch: {e}")
+            return updates
+    
+    # ==================== QUERIES GRAPHQL INDIVIDUALES (FALLBACK) ====================
     
     def _fetch_recent_commits_graphql(self, name_with_owner: str, max_commits: int = 10) -> Optional[List[Dict[str, Any]]]:
         """Obtiene commits recientes usando GraphQL."""
@@ -1024,30 +1463,37 @@ class EnrichmentEngine:
         
         try:
             # PRs abiertos
-            response = requests.get(
+            response = self.session.get(
                 base_url,
-                headers=self.rest_headers,
                 params={"state": "open", "per_page": 1},
                 timeout=10
             )
+            if response.status_code == 403 or response.status_code >= 500:
+                raise requests.exceptions.RequestException(
+                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    response=response
+                )
             if response.status_code == 200:
                 counts["open_pull_requests_count"] = self._extract_total_count(response)
             
             # PRs cerrados
-            response = requests.get(
+            response = self.session.get(
                 base_url,
-                headers=self.rest_headers,
                 params={"state": "closed", "per_page": 1},
                 timeout=10
             )
+            if response.status_code == 403 or response.status_code >= 500:
+                raise requests.exceptions.RequestException(
+                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    response=response
+                )
             if response.status_code == 200:
                 closed_count = self._extract_total_count(response)
-                
-                # Para obtener merged vs closed sin merge, necesitamos otra query
-                # Por ahora, guardamos el total de cerrados
                 counts["closed_pull_requests_count"] = closed_count
             
             return counts if counts else None
+        except requests.exceptions.RequestException:
+            raise  # Propagar para retry
         except Exception as e:
             logger.error(f"❌ Error en _fetch_pull_request_counts_rest para {name_with_owner}: {e}")
             return None
@@ -1066,8 +1512,9 @@ class EnrichmentEngine:
         return len(data) if isinstance(data, list) else 0
     
     def _increment_field_stat(self, field: str) -> None:
-        """Incrementa el contador de un campo enriquecido."""
-        self.stats["fields_enriched"][field] = self.stats["fields_enriched"].get(field, 0) + 1
+        """Incrementa el contador de un campo enriquecido (thread-safe)."""
+        with self._stats_lock:
+            self.stats["fields_enriched"][field] = self.stats["fields_enriched"].get(field, 0) + 1
     
     def _fix_simple_fields(self, repo: Dict[str, Any]) -> Dict[str, Any]:
         """Corrige campos simples que son copias directas de otros campos."""
@@ -1085,6 +1532,102 @@ class EnrichmentEngine:
         
         return updates
     
+    def _fetch_repo_info_combined(self, name_with_owner: str, current_repo: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Obtiene owner_type, license y campos adicionales en UNA sola llamada REST.
+        Consolida las antiguas estrategias 13, 14 y 15 (3 llamadas → 1).
+        
+        v3.0: Optimización que ahorra 2 llamadas REST API por repositorio.
+        
+        Args:
+            name_with_owner: Nombre completo del repo
+            current_repo: Documento actual del repositorio
+            
+        Returns:
+            Diccionario con owner_type, license_info y additional_fields
+        """
+        result = {
+            "owner_type": None,
+            "license_info": None,
+            "additional_fields": {}
+        }
+        
+        try:
+            url = f"https://api.github.com/repos/{name_with_owner}"
+            response = self.session.get(url, timeout=10)
+            
+            if response.status_code == 403 or response.status_code >= 500:
+                # Rate limit o error de servidor — propagar para que _retry_with_backoff reintente
+                raise requests.exceptions.RequestException(
+                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    response=response
+                )
+            elif response.status_code == 404:
+                logger.debug(f"    ℹ️  Repo no encontrado en REST API: {name_with_owner}")
+                return result
+            elif response.status_code != 200:
+                logger.warning(f"⚠️ Error {response.status_code} al obtener info combinada para {name_with_owner}")
+                return result
+            
+            data = response.json()
+            
+            # Owner type (antigua Strategy 13)
+            owner_data = data.get("owner", {})
+            result["owner_type"] = owner_data.get("type")
+            
+            # License (antigua Strategy 14)
+            license_data = data.get("license")
+            if license_data:
+                result["license_info"] = {
+                    "key": license_data.get("key"),
+                    "name": license_data.get("name"),
+                    "spdx_id": license_data.get("spdx_id"),
+                    "url": license_data.get("url"),
+                    "nickname": None
+                }
+            
+            # Additional fields (antigua Strategy 15)
+            additional = {}
+            
+            if current_repo.get("subscribers_count", 0) == 0:
+                subscribers = data.get("subscribers_count", 0)
+                if subscribers > 0:
+                    additional["subscribers_count"] = subscribers
+            
+            if current_repo.get("network_count", 0) == 0:
+                network = data.get("network_count", 0)
+                if network > 0:
+                    additional["network_count"] = network
+            
+            if current_repo.get("has_projects_enabled") is None:
+                additional["has_projects_enabled"] = data.get("has_projects", False)
+            
+            if current_repo.get("has_discussions_enabled") is None:
+                additional["has_discussions_enabled"] = data.get("has_discussions", False)
+            
+            if current_repo.get("is_fork") and not current_repo.get("parent_id"):
+                parent = data.get("parent")
+                if parent:
+                    additional["parent_id"] = parent.get("node_id")
+                    additional["parent_name_with_owner"] = parent.get("full_name")
+            
+            if current_repo.get("is_mirror") and not current_repo.get("mirror_url"):
+                mirror_url = data.get("mirror_url")
+                if mirror_url:
+                    additional["mirror_url"] = mirror_url
+            
+            security = data.get("security_and_analysis")
+            if security:
+                additional["is_security_policy_enabled"] = security.get("advanced_security", {}).get("status") == "enabled"
+            
+            result["additional_fields"] = additional
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Error en _fetch_repo_info_combined para {name_with_owner}: {e}")
+            return result
+    
     def _fetch_owner_type_rest(self, name_with_owner: str) -> Optional[str]:
         """
         Obtiene el tipo de owner (User/Organization) desde la REST API.
@@ -1099,7 +1642,7 @@ class EnrichmentEngine:
             owner_login = name_with_owner.split("/")[0]
             url = f"https://api.github.com/users/{owner_login}"
             
-            response = requests.get(url, headers=self.rest_headers, timeout=10)
+            response = self.session.get(url, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
@@ -1123,7 +1666,7 @@ class EnrichmentEngine:
         """
         try:
             url = f"https://api.github.com/repos/{name_with_owner}"
-            response = requests.get(url, headers=self.rest_headers, timeout=10)
+            response = self.session.get(url, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
@@ -1160,9 +1703,14 @@ class EnrichmentEngine:
         
         try:
             url = f"https://api.github.com/repos/{name_with_owner}"
-            response = requests.get(url, headers=self.rest_headers, timeout=10)
+            response = self.session.get(url, timeout=10)
             
-            if response.status_code != 200:
+            if response.status_code == 403 or response.status_code >= 500:
+                raise requests.exceptions.RequestException(
+                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    response=response
+                )
+            elif response.status_code != 200:
                 logger.warning(f"⚠️  Error al obtener campos adicionales para {name_with_owner}: {response.status_code}")
                 return updates
             
@@ -1337,7 +1885,7 @@ class EnrichmentEngine:
                 "per_page": 1
             }
             
-            response = requests.get(url, headers=self.rest_headers, params=params, timeout=10)
+            response = self.session.get(url, params=params, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
@@ -1445,9 +1993,14 @@ class EnrichmentEngine:
                     "page": page
                 }
                 
-                response = requests.get(url, headers=self.rest_headers, params=params, timeout=10)
+                response = self.session.get(url, params=params, timeout=10)
                 
-                if response.status_code != 200:
+                if response.status_code == 403 or response.status_code >= 500:
+                    raise requests.exceptions.RequestException(
+                        f"HTTP {response.status_code}: {response.text[:200]}",
+                        response=response
+                    )
+                elif response.status_code != 200:
                     logger.warning(f"⚠️  Error al obtener contributors para {name_with_owner}: {response.status_code}")
                     break
                 

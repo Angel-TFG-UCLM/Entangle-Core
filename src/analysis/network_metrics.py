@@ -16,6 +16,7 @@ Node IDs use the same scheme as /collaboration/discover:
   org_{login}, repo_{full_name}, user_{login}
 """
 
+import re
 import networkx as nx
 import colorsys
 from collections import defaultdict
@@ -61,6 +62,36 @@ def community_color(idx: int) -> str:
     return _hsl_to_hex(hue, tier[0], tier[1])
 
 
+def _are_sibling_orgs(login_a: str, login_b: str) -> bool:
+    """
+    Return True if two org logins belong to the same parent entity.
+    E.g. 'qiskit' ↔ 'qiskit-community', 'microsoft' ↔ 'MicrosoftDocs'.
+    """
+    if not login_a or not login_b:
+        return False
+    la, lb = login_a.lower(), login_b.lower()
+    if la == lb:
+        return True
+    # PRONG 1 — Token-based: split by separators, match first token (≥4 chars).
+    # Require ONE name to be a single token (the brand itself) to avoid
+    # "quantum-X ↔ quantum-Y" false positives in this domain.
+    toks_a = [t for t in re.split(r'[-_.\s]+', la) if t]
+    toks_b = [t for t in re.split(r'[-_.\s]+', lb) if t]
+    if toks_a and toks_b and len(toks_a[0]) >= 4 and toks_a[0] == toks_b[0]:
+        if len(toks_a) == 1 or len(toks_b) == 1:
+            return True
+    # PRONG 2 — Prefix-based: shorter normalised name must be PREFIX of
+    # longer, ≥ 4 chars, and ratio ≤ 3.0 (rejects intel→intelligentquantum).
+    a = re.sub(r'[-_\s.]+', '', la)
+    b = re.sub(r'[-_\s.]+', '', lb)
+    if not a or not b:
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 4 and long_.startswith(short) and len(long_) / len(short) <= 3.0:
+        return True
+    return False
+
+
 class CollaborationNetworkAnalyzer:
     """
     Builds and analyzes a collaboration network from MongoDB data.
@@ -79,14 +110,20 @@ class CollaborationNetworkAnalyzer:
     # GRAPH CONSTRUCTION
     # ========================================================================
 
-    def build_from_mongodb(self, repos_collection, users_collection, orgs_collection):
+    def build_from_mongodb(self, repos_collection, users_collection, orgs_collection, year_from=None, year_to=None):
         """
         Build networkx graph from MongoDB collections.
         
         Nodes: org_{login}, repo_{full_name}, user_{login}
         Edges: owns (org→repo), contributed_to (user→repo)
         Weights: contribution count (higher = stronger connection)
+        
+        Args:
+            year_from: Optional[int] - filter repos with pushed_at >= Jan 1 of this year
+            year_to: Optional[int] - filter repos with pushed_at <= Dec 31 of this year
         """
+        from datetime import datetime as dt
+        
         # 1. Load all repos with collaborators
         all_repos = list(repos_collection.find(
             {"collaborators": {"$exists": True, "$ne": []}},
@@ -94,9 +131,31 @@ class CollaborationNetworkAnalyzer:
                 "_id": 0, "name": 1, "full_name": 1, "owner": 1,
                 "stargazer_count": 1, "primary_language": 1,
                 "collaborators": 1, "fork_count": 1,
-                "collaborators_count": 1
+                "collaborators_count": 1, "pushed_at": 1
             }
         ))
+        
+        # Apply temporal filter if specified
+        has_temporal = year_from is not None or year_to is not None
+        if has_temporal:
+            total_before = len(all_repos)
+            def _in_range(repo):
+                pushed = repo.get("pushed_at")
+                if not pushed:
+                    return False
+                if isinstance(pushed, str):
+                    try:
+                        pushed = dt.fromisoformat(pushed.replace("Z", "+00:00"))
+                    except (ValueError, TypeError):
+                        return False
+                y = pushed.year
+                if year_from is not None and y < year_from:
+                    return False
+                if year_to is not None and y > year_to:
+                    return False
+                return True
+            all_repos = [r for r in all_repos if _in_range(r)]
+            logger.info(f"[NetworkAnalyzer] Temporal filter: {total_before} → {len(all_repos)} repos")
 
         logger.info(f"[NetworkAnalyzer] Building graph from {len(all_repos)} repos")
 
@@ -180,13 +239,18 @@ class CollaborationNetworkAnalyzer:
         if org_logins:
             for doc in orgs_collection.find(
                 {"login": {"$in": org_logins}},
-                {"_id": 0, "login": 1, "name": 1, "avatar_url": 1}
+                {
+                    "_id": 0, "login": 1, "name": 1, "avatar_url": 1,
+                    "quantum_focus_score": 1, "is_quantum_focused": 1
+                }
             ):
                 oid = f"org_{doc['login']}"
                 if self.G.has_node(oid):
                     self.G.nodes[oid].update({
                         "name": doc.get("name"),
-                        "avatar_url": doc.get("avatar_url")
+                        "avatar_url": doc.get("avatar_url"),
+                        "quantum_focus_score": doc.get("quantum_focus_score", 0),
+                        "is_quantum_focused": doc.get("is_quantum_focused", False)
                     })
 
         logger.info(
@@ -320,6 +384,7 @@ class CollaborationNetworkAnalyzer:
         # ── Step 2: Org collaboration graph ──
         # org → { neighbor_org: shared_contributor_count }
         org_neighbors = {}
+        sibling_pairs_skipped = 0
         for user_id, orgs in user_orgs.items():
             if len(orgs) < 2:
                 continue
@@ -327,12 +392,20 @@ class CollaborationNetworkAnalyzer:
             for i in range(len(org_list)):
                 for j in range(i + 1, len(org_list)):
                     a, b = org_list[i], org_list[j]
+                    # Skip sibling orgs (e.g. qiskit / qiskit-community)
+                    login_a = a.replace("org_", "", 1)
+                    login_b = b.replace("org_", "", 1)
+                    if _are_sibling_orgs(login_a, login_b):
+                        sibling_pairs_skipped += 1
+                        continue
                     if a not in org_neighbors:
                         org_neighbors[a] = {}
                     if b not in org_neighbors:
                         org_neighbors[b] = {}
                     org_neighbors[a][b] = org_neighbors[a].get(b, 0) + 1
                     org_neighbors[b][a] = org_neighbors[b].get(a, 0) + 1
+        if sibling_pairs_skipped:
+            logger.info(f"[NetworkAnalyzer] Skipped {sibling_pairs_skipped} sibling org pairs in org_neighbors")
 
         # ── Step 3: Raw scores ──
         raw_scores = {}  # node_id → (centrality_raw, connectivity_raw)
@@ -348,8 +421,24 @@ class CollaborationNetworkAnalyzer:
                 connectivity_raw = len(repo_contributors.get(node_id, set()))
             elif node_type == "org":
                 neighbors = org_neighbors.get(node_id, {})
-                centrality_raw = sum(neighbors.values())  # total shared contributors
+                raw_collab = sum(neighbors.values())  # total shared contributors
                 connectivity_raw = len(neighbors)  # number of org neighbors
+
+                # ── Quantum relevance weighting ──
+                # The "Quantum Universe" should center quantum-focused orgs.
+                # Without weighting, mega-orgs like Microsoft dominate by
+                # sheer contributor volume despite not being quantum-focused.
+                qf = self.G.nodes[node_id].get("quantum_focus_score", 0)
+                is_q = self.G.nodes[node_id].get("is_quantum_focused", False)
+
+                if is_q:
+                    # Quantum orgs: full weight + bonus from focus score
+                    quantum_factor = 1.0 + (qf / 100)   # range [1.0 .. 2.0]
+                else:
+                    # Non-quantum orgs: heavily dampened
+                    quantum_factor = max(0.05, qf / 200)  # range [0.05 .. 0.5]
+
+                centrality_raw = int(raw_collab * quantum_factor)
             else:
                 centrality_raw = 0
                 connectivity_raw = 0

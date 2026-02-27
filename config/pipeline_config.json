@@ -2,7 +2,15 @@
   "pipeline": {
     "description": "Configuración del pipeline completo de ingesta y enriquecimiento",
     "auto_confirm": true,
-    "stop_on_error": true
+    "stop_on_error": true,
+    "parallel_phases": true,
+    "parallel_phases_description": "Si true, scripts independientes dentro de cada fase se ejecutan en paralelo (Fase 2: 3 scripts, Fase 3: 2 scripts)",
+    "mode": "incremental",
+    "mode_description": "Modo de ingesta: 'incremental' (solo nuevos/actualizados) o 'from_scratch' (limpia y reingesta todo)",
+    "entities": ["repositories", "users", "organizations"],
+    "entities_description": "Entidades a procesar. Opciones: 'repositories', 'users', 'organizations'. Array vacío o null = todas.",
+    "max_workers": 4,
+    "max_workers_description": "Número de workers para búsquedas paralelas de repos (segmentos GitHub). Rango: 1-8."
   },
   "enrichment": {
     "repositories": {

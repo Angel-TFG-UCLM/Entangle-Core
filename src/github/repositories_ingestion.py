@@ -6,11 +6,18 @@ Este módulo implementa el flujo completo de ingesta:
 2. Filtrado por criterios de calidad
 3. Validación con modelos Pydantic
 4. Almacenamiento en MongoDB usando MongoRepository
-5. Soporte para reingestas incrementales
+5. Soporte para reingestas incrementales y desde cero
+
+Modos de ingesta:
+- incremental: Solo busca repos nuevos/actualizados desde la última ingesta.
+  Usa el filtro `pushed:>DATE` en GitHub Search para reducir llamadas API.
+- from_scratch: Limpia la colección y reingesta todo desde cero.
+  Elimina datos "zombi" que ya no pasan los filtros actuales.
 """
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
@@ -43,7 +50,9 @@ class IngestionEngine:
         client: Optional[GitHubGraphQLClient] = None,
         config: Optional[IngestionConfig] = None,
         incremental: bool = False,
-        batch_size: int = 500  # ✅ OPTIMIZADO para vCore: batch masivo
+        from_scratch: bool = False,
+        batch_size: int = 500,  # ✅ OPTIMIZADO para vCore: batch masivo
+        max_workers: int = 4  # Workers para búsquedas paralelas de segmentos
     ):
         """
         Inicializa el motor de ingesta.
@@ -51,13 +60,17 @@ class IngestionEngine:
         Args:
             client: Cliente GraphQL de GitHub (crea uno nuevo si es None)
             config: Configuración de ingesta (usa global si es None)
-            incremental: Si True, solo actualiza documentos modificados
+            incremental: Si True, solo busca repos nuevos/actualizados desde última ingesta
+            from_scratch: Si True, limpia la colección antes de ingestar (elimina datos zombi)
             batch_size: Tamaño de lote para operaciones bulk
+            max_workers: Número de workers para búsquedas paralelas (1-8)
         """
         self.client = client or GitHubGraphQLClient()
         self.config = config or ingestion_config
         self.incremental = incremental
+        self.from_scratch = from_scratch
         self.batch_size = batch_size
+        self.max_workers = max(1, min(8, max_workers))  # Clamp 1-8
         
         # Conectar a MongoDB
         if not db.is_connected():
@@ -74,6 +87,11 @@ class IngestionEngine:
             # Extracción
             "total_found": 0,
             "total_filtered": 0,
+            
+            # Modo
+            "mode": "from_scratch" if from_scratch else ("incremental" if incremental else "full"),
+            "deleted_before_ingestion": 0,
+            "skipped_unchanged": 0,
             
             # Filtrado
             "filtered_by_archived": 0,
@@ -109,7 +127,8 @@ class IngestionEngine:
             "end_time": None
         }
         
-        logger.info(f"Motor de ingesta inicializado (incremental={'SÍ' if incremental else 'NO'}, batch_size={batch_size})")
+        mode_label = "DESDE CERO" if from_scratch else ("INCREMENTAL" if incremental else "COMPLETO")
+        logger.info(f"Motor de ingesta inicializado (modo={mode_label}, batch_size={batch_size}, workers={self.max_workers})")
     
     def _sanitize_repo_data(self, repo_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -155,6 +174,78 @@ class IngestionEngine:
             logger.error(f"❌ Error en operación: {e}")
             raise
     
+    def _cleanup_collection(self) -> None:
+        """
+        Limpia la colección de repositorios antes de una ingesta desde cero.
+        Elimina todos los documentos para garantizar que no queden datos zombi.
+        También limpia la metadata de última ingesta.
+        """
+        logger.info("\n🗑️  FASE 0: LIMPIEZA (Modo desde cero)")
+        
+        try:
+            count_before = self.repo_db.count_documents()
+            logger.info(f"  📊 Repositorios actuales en DB: {count_before}")
+            
+            if count_before > 0:
+                deleted = self.repo_db.delete_many({})
+                self.stats["deleted_before_ingestion"] = deleted
+                logger.info(f"  🗑️  Eliminados {deleted} repositorios de la colección")
+            
+            # Limpiar metadata de última ingesta
+            try:
+                from ..core.db import get_database
+                metadata_collection = get_database()["ingestion_metadata"]
+                metadata_collection.delete_one({"type": "repositories_last_ingestion"})
+                logger.info("  🗑️  Metadata de última ingesta eliminada")
+            except Exception:
+                pass
+            
+            logger.info("  ✅ Limpieza completada")
+            
+        except Exception as e:
+            logger.error(f"  ❌ Error durante limpieza: {e}")
+            raise
+    
+    def _get_last_ingestion_date(self) -> Optional[datetime]:
+        """
+        Obtiene la fecha de la última ingesta exitosa desde metadata en MongoDB.
+        
+        Returns:
+            datetime de la última ingesta o None si no existe
+        """
+        try:
+            from ..core.db import get_database
+            metadata_collection = get_database()["ingestion_metadata"]
+            doc = metadata_collection.find_one({"type": "repositories_last_ingestion"})
+            if doc and "date" in doc:
+                return doc["date"]
+        except Exception as e:
+            logger.debug(f"No se pudo obtener fecha de última ingesta: {e}")
+        return None
+    
+    def _save_ingestion_date(self) -> None:
+        """Guarda la fecha actual como última ingesta exitosa."""
+        try:
+            from ..core.db import get_database
+            metadata_collection = get_database()["ingestion_metadata"]
+            metadata_collection.update_one(
+                {"type": "repositories_last_ingestion"},
+                {"$set": {
+                    "type": "repositories_last_ingestion",
+                    "date": datetime.now(timezone.utc),
+                    "stats": {
+                        "total_found": self.stats["total_found"],
+                        "total_filtered": self.stats["total_filtered"],
+                        "repositories_inserted": self.stats["repositories_inserted"],
+                        "repositories_updated": self.stats["repositories_updated"]
+                    }
+                }},
+                upsert=True
+            )
+            logger.info("📅 Fecha de ingesta guardada en metadata")
+        except Exception as e:
+            logger.warning(f"⚠️  No se pudo guardar fecha de ingesta: {e}")
+    
     def run(
         self,
         max_results: Optional[int] = None,
@@ -165,11 +256,11 @@ class IngestionEngine:
         Ejecuta el flujo completo de ingesta con validación y persistencia.
         
         Flujo:
+        0. Limpieza (solo en modo from_scratch)
         1. Extracción → Búsqueda de repositorios
         2. Filtrado → Aplicar criterios de calidad
         3. Validación → Parsear y validar con Pydantic
         4. Persistencia → Guardar en MongoDB (bulk operations)
-        5. Relaciones → Crear relaciones entre entidades
         
         Args:
             max_results: Número máximo de repositorios a obtener (None = todos)
@@ -182,12 +273,18 @@ class IngestionEngine:
         logger.info("=" * 80)
         logger.info("🚀 INICIANDO PROCESO DE INGESTA")
         logger.info("=" * 80)
-        logger.info(f"Modo: {'Incremental' if self.incremental else 'Completo'}")
+        mode_label = "DESDE CERO" if self.from_scratch else ("INCREMENTAL" if self.incremental else "COMPLETO")
+        logger.info(f"Modo: {mode_label}")
         logger.info(f"Tamaño de lote: {self.batch_size}")
+        logger.info(f"Workers paralelos: {self.max_workers}")
         
         self.stats["start_time"] = datetime.now(timezone.utc)
         
         try:
+            # ==================== FASE 0: LIMPIEZA (SOLO FROM_SCRATCH) ====================
+            if self.from_scratch:
+                self._cleanup_collection()
+            
             # ==================== FASE 1: EXTRACCIÓN ====================
             start_extraction = time.time()
             logger.info("\n📥 FASE 1: Extracción de Repositorios")
@@ -240,6 +337,9 @@ class IngestionEngine:
             
             self.stats["end_time"] = datetime.now(timezone.utc)
             
+            # Guardar fecha de ingesta para modo incremental futuro
+            self._save_ingestion_date()
+            
             # ==================== REPORTE FINAL ====================
             report = self._generate_report(validated_repos, validation_errors)
             
@@ -256,7 +356,8 @@ class IngestionEngine:
     def _search_repositories(self, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Busca repositorios usando el cliente GraphQL.
-        Si la segmentación está habilitada, ejecuta búsquedas segmentadas.
+        En modo incremental, filtra por fecha de última ingesta para reducir consultas.
+        Si la segmentación está habilitada, ejecuta búsquedas segmentadas (con paralelismo).
         
         Args:
             max_results: Número máximo de repositorios a obtener
@@ -266,11 +367,20 @@ class IngestionEngine:
         """
         logger.info("🔎 Ejecutando búsqueda en GitHub...")
         
+        # En modo incremental, obtener fecha de última ingesta
+        incremental_since = None
+        if self.incremental:
+            incremental_since = self._get_last_ingestion_date()
+            if incremental_since:
+                logger.info(f"📅 Modo incremental: buscando repos actualizados desde {incremental_since.strftime('%Y-%m-%d')}")
+            else:
+                logger.info("📅 Modo incremental: sin fecha previa, búsqueda completa")
+        
         try:
             # Verificar si está habilitada la segmentación
             if self.config.enable_segmentation and self.config.segmentation:
                 logger.info("📊 Modo de segmentación dinámica activado")
-                return self._search_with_segmentation(max_results)
+                return self._search_with_segmentation(max_results, incremental_since)
             else:
                 # Búsqueda tradicional con paginación automática
                 result = self.client.search_repositories_all_pages(
@@ -285,13 +395,24 @@ class IngestionEngine:
             logger.error(f"❌ Error en la búsqueda de repositorios: {e}")
             raise
     
-    def _search_with_segmentation(self, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
+    def _search_with_segmentation(
+        self,
+        max_results: Optional[int] = None,
+        incremental_since: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
         """
         Ejecuta búsquedas segmentadas por rangos de estrellas y años de creación
         para superar el límite de 1000 resultados de GitHub Search API.
         
+        Usa ThreadPoolExecutor para ejecutar segmentos en paralelo (respetando
+        rate limits de GitHub con check proactivo).
+        
+        En modo incremental, añade filtro `pushed:>DATE` para solo obtener repos
+        actualizados desde la última ingesta, reduciendo drásticamente las llamadas API.
+        
         Args:
             max_results: Número máximo total de repositorios a obtener
+            incremental_since: Fecha desde la cual buscar repos actualizados (modo incremental)
             
         Returns:
             Lista combinada de repositorios de todos los segmentos
@@ -307,30 +428,145 @@ class IngestionEngine:
         total_combinations = len(star_ranges) * len(created_years)
         logger.info(f"  • Total de consultas a ejecutar: {total_combinations}")
         
-        all_repositories = {}  # Usar dict para evitar duplicados por full_name
-        query_count = 0
+        if incremental_since:
+            logger.info(f"  • Filtro incremental: pushed > {incremental_since.strftime('%Y-%m-%d')}")
         
+        if self.max_workers > 1:
+            logger.info(f"  • Workers paralelos: {self.max_workers}")
+        
+        # Generar lista de segmentos a procesar
+        segments = []
         for star_range in star_ranges:
             min_stars, max_stars = star_range
-            
             for year in created_years:
-                query_count += 1
+                segments.append((min_stars, max_stars, year))
+        
+        all_repositories = {}  # Usar dict para evitar duplicados por full_name
+        
+        if self.max_workers > 1:
+            # Ejecución PARALELA con ThreadPoolExecutor
+            all_repositories = self._search_segments_parallel(
+                segments, total_combinations, max_results, incremental_since
+            )
+        else:
+            # Ejecución SECUENCIAL (legacy)
+            all_repositories = self._search_segments_sequential(
+                segments, total_combinations, max_results, incremental_since
+            )
+        
+        result = list(all_repositories.values())
+        
+        logger.info(f"\n✅ Búsqueda segmentada completada:")
+        logger.info(f"  • Repositorios únicos obtenidos: {len(result)}")
+        if incremental_since:
+            logger.info(f"  • Modo: incremental (desde {incremental_since.strftime('%Y-%m-%d')})")
+        
+        return result
+    
+    def _search_single_segment(
+        self,
+        min_stars: int,
+        max_stars: int,
+        year: int,
+        incremental_since: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Ejecuta la búsqueda de un segmento individual con reintentos.
+        Hilo-safe: cada llamada usa el cliente GraphQL singleton con su propio estado.
+        
+        Si falla por 403 (secondary rate limit) u otro error transitorio,
+        reintenta hasta 3 veces con backoff exponencial.
+        
+        Args:
+            min_stars: Estrellas mínimas
+            max_stars: Estrellas máximas
+            year: Año de creación
+            incremental_since: Fecha para filtro pushed (modo incremental)
+            
+        Returns:
+            Lista de repos encontrados en este segmento
+        """
+        segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
+        max_segment_retries = 3
+        
+        for attempt in range(max_segment_retries):
+            try:
+                # Verificar rate limit antes de cada búsqueda
+                self._check_rate_limit()
+                
+                # En modo incremental, crear un config modificado con filtro pushed
+                config_to_use = self.config
+                
+                segment_repos = self.client.search_repositories_segmented(
+                    config_criteria=config_to_use,
+                    min_stars=min_stars,
+                    max_stars=max_stars,
+                    created_year=year,
+                    max_results=1000,
+                    pushed_after=incremental_since.strftime('%Y-%m-%d') if incremental_since else None
+                )
+                
+                return segment_repos
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                is_retryable = any(kw in error_str for kw in ['403', 'forbidden', 'rate limit', 'secondary', '502', '503', '504', 'timeout'])
+                
+                if is_retryable and attempt < max_segment_retries - 1:
+                    wait_time = 60 * (2 ** attempt)  # 60s, 120s, 240s
+                    logger.warning(
+                        f"⚠️ Error retryable en segmento {segment_name} "
+                        f"(intento {attempt + 1}/{max_segment_retries}): {e}. "
+                        f"Reintentando en {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"❌ Error en segmento {segment_name} tras {attempt + 1} intentos: {e}")
+                    return []
+    
+    def _search_segments_parallel(
+        self,
+        segments: List[tuple],
+        total_combinations: int,
+        max_results: Optional[int],
+        incremental_since: Optional[datetime]
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Ejecuta búsquedas en paralelo usando ThreadPoolExecutor.
+        
+        Args:
+            segments: Lista de (min_stars, max_stars, year)
+            total_combinations: Total de segmentos
+            max_results: Límite máximo de repos
+            incremental_since: Fecha para filtro incremental
+            
+        Returns:
+            Dict {full_name: repo_data} deduplicado
+        """
+        all_repositories = {}
+        completed = 0
+        
+        logger.info(f"\n🚀 Ejecutando {total_combinations} segmentos con {self.max_workers} workers...")
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Enviar todos los segmentos al pool
+            future_to_segment = {
+                executor.submit(
+                    self._search_single_segment,
+                    min_stars, max_stars, year, incremental_since
+                ): (min_stars, max_stars, year)
+                for min_stars, max_stars, year in segments
+            }
+            
+            # Recoger resultados a medida que terminan
+            for future in as_completed(future_to_segment):
+                min_stars, max_stars, year = future_to_segment[future]
+                completed += 1
                 segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
                 
-                logger.info(f"\n📍 Consulta {query_count}/{total_combinations}: {segment_name}")
-                
                 try:
-                    # Verificar rate limit antes de cada búsqueda
-                    self._check_rate_limit()
-                    
-                    # Crear query específica para este segmento
-                    segment_repos = self.client.search_repositories_segmented(
-                        config_criteria=self.config,
-                        min_stars=min_stars,
-                        max_stars=max_stars,
-                        created_year=year,
-                        max_results=1000  # Máximo por segmento
-                    )
+                    segment_repos = future.result()
                     
                     # Agregar al conjunto total (evitando duplicados)
                     new_repos = 0
@@ -340,29 +576,80 @@ class IngestionEngine:
                             all_repositories[full_name] = repo
                             new_repos += 1
                     
-                    logger.info(f"  ✓ Encontrados: {len(segment_repos)} repos, {new_repos} nuevos")
-                    logger.info(f"  📊 Total acumulado: {len(all_repositories)} repos únicos")
-                    
-                    # Si se alcanzó el límite global, parar
-                    if max_results and len(all_repositories) >= max_results:
-                        logger.info(f"\n🎯 Límite alcanzado: {len(all_repositories)} repositorios")
-                        break
+                    if new_repos > 0:
+                        logger.info(
+                            f"  [{completed}/{total_combinations}] {segment_name}: "
+                            f"{len(segment_repos)} encontrados, {new_repos} nuevos "
+                            f"(total: {len(all_repositories)})"
+                        )
+                    else:
+                        logger.debug(
+                            f"  [{completed}/{total_combinations}] {segment_name}: "
+                            f"{len(segment_repos)} encontrados, 0 nuevos"
+                        )
                     
                 except Exception as e:
-                    logger.warning(f"⚠️  Error en segmento {segment_name}: {e}")
-                    continue
+                    logger.warning(f"  [{completed}/{total_combinations}] ❌ {segment_name}: {e}")
+                
+                # Si se alcanzó el límite global, cancelar futures pendientes
+                if max_results and len(all_repositories) >= max_results:
+                    logger.info(f"\n🎯 Límite alcanzado: {len(all_repositories)} repositorios")
+                    # Cancelar futures pendientes
+                    for f in future_to_segment:
+                        f.cancel()
+                    break
+        
+        return all_repositories
+    
+    def _search_segments_sequential(
+        self,
+        segments: List[tuple],
+        total_combinations: int,
+        max_results: Optional[int],
+        incremental_since: Optional[datetime]
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Ejecuta búsquedas secuencialmente (modo legacy, 1 worker).
+        
+        Args:
+            segments: Lista de (min_stars, max_stars, year)
+            total_combinations: Total de segmentos
+            max_results: Límite máximo de repos
+            incremental_since: Fecha para filtro incremental
             
-            # Salir del loop exterior si se alcanzó el límite
+        Returns:
+            Dict {full_name: repo_data} deduplicado
+        """
+        all_repositories = {}
+        query_count = 0
+        
+        for min_stars, max_stars, year in segments:
+            query_count += 1
+            segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
+            
+            logger.info(f"\n📍 Consulta {query_count}/{total_combinations}: {segment_name}")
+            
+            segment_repos = self._search_single_segment(
+                min_stars, max_stars, year, incremental_since
+            )
+            
+            # Agregar al conjunto total (evitando duplicados)
+            new_repos = 0
+            for repo in segment_repos:
+                full_name = repo.get("nameWithOwner", repo.get("name", ""))
+                if full_name and full_name not in all_repositories:
+                    all_repositories[full_name] = repo
+                    new_repos += 1
+            
+            logger.info(f"  ✓ Encontrados: {len(segment_repos)} repos, {new_repos} nuevos")
+            logger.info(f"  📊 Total acumulado: {len(all_repositories)} repos únicos")
+            
+            # Si se alcanzó el límite global, parar
             if max_results and len(all_repositories) >= max_results:
+                logger.info(f"\n🎯 Límite alcanzado: {len(all_repositories)} repositorios")
                 break
         
-        result = list(all_repositories.values())
-        
-        logger.info(f"\n✅ Búsqueda segmentada completada:")
-        logger.info(f"  • Consultas ejecutadas: {query_count}/{total_combinations}")
-        logger.info(f"  • Repositorios únicos obtenidos: {len(result)}")
-        
-        return result
+        return all_repositories
     
     def _check_rate_limit(self) -> None:
         """
@@ -806,6 +1093,32 @@ class IngestionEngine:
         total_persisted = self.stats["repositories_inserted"] + self.stats["repositories_updated"]
         persistence_rate = (total_persisted / len(repositories) * 100) if repositories else 0
         
+        # Contexto de la base de datos (útil para modo incremental)
+        db_context = {}
+        try:
+            db_total = self.repo_db.count_documents()
+            from ..core.db import get_database
+            db = get_database()
+            db_enriched = db["repositories"].count_documents({"enrichment_status.is_complete": True})
+            db_pending_enrichment = db_total - db_enriched
+            db_users = db["users"].count_documents({})
+            db_orgs = db["organizations"].count_documents({})
+            
+            # Obtener fecha de última ingesta
+            metadata = db["ingestion_metadata"].find_one({"type": "repositories_last_ingestion"})
+            last_ingestion_date = metadata.get("date") if metadata else None
+            
+            db_context = {
+                "total_repos_in_db": db_total,
+                "enriched_repos": db_enriched,
+                "pending_enrichment": db_pending_enrichment,
+                "total_users": db_users,
+                "total_organizations": db_orgs,
+                "last_ingestion_date": last_ingestion_date.strftime('%Y-%m-%d %H:%M UTC') if last_ingestion_date else "N/A"
+            }
+        except Exception as e:
+            logger.debug(f"No se pudo obtener contexto de BD: {e}")
+        
         report = {
             "summary": {
                 "total_found": self.stats["total_found"],
@@ -814,12 +1127,12 @@ class IngestionEngine:
                 "validation_errors": self.stats["validation_errors"],
                 "repositories_inserted": self.stats["repositories_inserted"],
                 "repositories_updated": self.stats["repositories_updated"],
-                # "relations_created": self.stats["relations_created"],  # DESHABILITADO: Para futura implementación de análisis de grafos
-                "success_rate": f"{(self.stats['total_filtered'] / self.stats['total_found'] * 100):.1f}%" if self.stats["total_found"] > 0 else "0%",
+                "success_rate": f"{(self.stats['total_filtered'] / self.stats['total_found'] * 100):.1f}%" if self.stats["total_found"] > 0 else "N/A",
                 "persistence_rate": f"{persistence_rate:.1f}%",
                 "duration_seconds": duration,
-                "incremental_mode": self.incremental
+                "mode": "from_scratch" if self.from_scratch else ("incremental" if self.incremental else "full")
             },
+            "database_context": db_context,
             "timing": {
                 "extraction": f"{self.stats['time_extraction']:.2f}s",
                 "filtering": f"{self.stats['time_filtering']:.2f}s",
@@ -852,34 +1165,51 @@ class IngestionEngine:
         
         # Log del reporte
         logger.info("\n" + "=" * 80)
-        logger.info("📊 REPORTE DE INGESTA")
+        mode_label = report['summary']['mode'].upper()
+        logger.info(f"📊 REPORTE DE INGESTA ({mode_label})")
         logger.info("=" * 80)
+        
+        # En modo incremental, mostrar contexto de BD primero
+        if self.incremental and db_context:
+            is_up_to_date = (self.stats["total_found"] == 0)
+            if is_up_to_date:
+                logger.info(f"\n✅ BASE DE DATOS AL DÍA — No se encontraron repositorios nuevos/actualizados")
+            logger.info(f"\n🗄️  Estado de la Base de Datos:")
+            logger.info(f"  • Repositorios totales en BD: {db_context.get('total_repos_in_db', '?')}")
+            logger.info(f"  • Enriquecidos completamente: {db_context.get('enriched_repos', '?')}")
+            logger.info(f"  • Pendientes de enriquecimiento: {db_context.get('pending_enrichment', '?')}")
+            logger.info(f"  • Usuarios en BD: {db_context.get('total_users', '?')}")
+            logger.info(f"  • Organizaciones en BD: {db_context.get('total_organizations', '?')}")
+            logger.info(f"  • Última ingesta: {db_context.get('last_ingestion_date', 'N/A')}")
+        
         logger.info(f"\n🔍 Extracción:")
-        logger.info(f"  • Repositorios encontrados: {report['summary']['total_found']}")
+        logger.info(f"  • Repos nuevos/actualizados encontrados: {report['summary']['total_found']}")
         logger.info(f"  • Tiempo: {report['timing']['extraction']}")
         
-        logger.info(f"\n🔍 Filtrado:")
-        logger.info(f"  • Repositorios válidos: {report['summary']['total_filtered']}")
-        logger.info(f"  • Tasa de aceptación: {report['summary']['success_rate']}")
-        logger.info(f"  • Tiempo: {report['timing']['filtering']}")
-        
-        logger.info(f"\n✔️  Validación:")
-        logger.info(f"  • Validaciones exitosas: {report['summary']['validation_success']}")
-        logger.info(f"  • Errores de validación: {report['summary']['validation_errors']}")
-        logger.info(f"  • Tiempo: {report['timing']['validation']}")
-        
-        logger.info(f"\n💾 Persistencia:")
-        logger.info(f"  • Repositorios nuevos: {report['summary']['repositories_inserted']}")
-        logger.info(f"  • Repositorios actualizados: {report['summary']['repositories_updated']}")
-        # logger.info(f"  • Relaciones creadas: {report['summary']['relations_created']}")  # DESHABILITADO: Para futura implementación de análisis de grafos
-        logger.info(f"  • Tasa de persistencia: {report['summary']['persistence_rate']}")
-        logger.info(f"  • Tiempo: {report['timing']['persistence']}")
-        
-        logger.info(f"\n📈 Estadísticas:")
-        logger.info(f"  • Distribución por lenguaje:")
-        for lang, count in sorted(language_stats.items(), key=lambda x: x[1], reverse=True)[:5]:
-            logger.info(f"    - {lang}: {count}")
-        logger.info(f"  • Estrellas promedio: {report['statistics']['average_stars']}")
+        if self.stats["total_found"] > 0:
+            logger.info(f"\n🔍 Filtrado:")
+            logger.info(f"  • Repositorios válidos: {report['summary']['total_filtered']}")
+            logger.info(f"  • Tasa de aceptación: {report['summary']['success_rate']}")
+            logger.info(f"  • Tiempo: {report['timing']['filtering']}")
+            
+            logger.info(f"\n✔️  Validación:")
+            logger.info(f"  • Validaciones exitosas: {report['summary']['validation_success']}")
+            logger.info(f"  • Errores de validación: {report['summary']['validation_errors']}")
+            logger.info(f"  • Tiempo: {report['timing']['validation']}")
+            
+            logger.info(f"\n💾 Persistencia:")
+            logger.info(f"  • Repositorios nuevos: {report['summary']['repositories_inserted']}")
+            logger.info(f"  • Repositorios actualizados: {report['summary']['repositories_updated']}")
+            logger.info(f"  • Tasa de persistencia: {report['summary']['persistence_rate']}")
+            logger.info(f"  • Tiempo: {report['timing']['persistence']}")
+            
+            logger.info(f"\n📈 Estadísticas:")
+            logger.info(f"  • Distribución por lenguaje:")
+            for lang, count in sorted(language_stats.items(), key=lambda x: x[1], reverse=True)[:5]:
+                logger.info(f"    - {lang}: {count}")
+            logger.info(f"  • Estrellas promedio: {report['statistics']['average_stars']}")
+        else:
+            logger.info(f"\n💡 No se requirieron fases de filtrado/validación/persistencia")
         
         logger.info(f"\n⏱️  Tiempo total: {report['timing']['total']}")
         logger.info("=" * 80)
@@ -892,7 +1222,9 @@ class IngestionEngine:
 def run_ingestion(
     max_results: Optional[int] = None,
     incremental: bool = False,
+    from_scratch: bool = False,
     batch_size: int = 500,  # ✅ OPTIMIZADO para vCore
+    max_workers: int = 4,
     save_to_json: bool = True,
     output_file: str = "ingestion_results.json"
 ) -> Dict[str, Any]:
@@ -901,8 +1233,10 @@ def run_ingestion(
     
     Args:
         max_results: Número máximo de repositorios
-        incremental: Si True, solo actualiza documentos modificados
+        incremental: Si True, solo busca repos nuevos/actualizados
+        from_scratch: Si True, limpia colección antes de ingestar
         batch_size: Tamaño de lote para operaciones bulk
+        max_workers: Workers paralelos para segmentos
         save_to_json: Guardar en JSON
         output_file: Archivo de salida
         
@@ -911,7 +1245,9 @@ def run_ingestion(
     """
     engine = IngestionEngine(
         incremental=incremental,
-        batch_size=batch_size
+        from_scratch=from_scratch,
+        batch_size=batch_size,
+        max_workers=max_workers
     )
     return engine.run(
         max_results=max_results,
@@ -922,14 +1258,16 @@ def run_ingestion(
 
 def run_incremental_ingestion(
     max_results: Optional[int] = None,
-    batch_size: int = 500  # ✅ OPTIMIZADO para vCore
+    batch_size: int = 500,  # ✅ OPTIMIZADO para vCore
+    max_workers: int = 4
 ) -> Dict[str, Any]:
     """
-    Ejecuta una ingesta incremental (solo actualiza documentos modificados).
+    Ejecuta una ingesta incremental (solo repos nuevos/actualizados desde última ingesta).
     
     Args:
         max_results: Número máximo de repositorios
-        batch_size: Tamaño de lote (puede ser mayor en incrementales)
+        batch_size: Tamaño de lote
+        max_workers: Workers paralelos
         
     Returns:
         Reporte de la ingesta
@@ -938,5 +1276,32 @@ def run_incremental_ingestion(
         max_results=max_results,
         incremental=True,
         batch_size=batch_size,
+        max_workers=max_workers,
+        save_to_json=False
+    )
+
+
+def run_from_scratch_ingestion(
+    max_results: Optional[int] = None,
+    batch_size: int = 500,
+    max_workers: int = 4
+) -> Dict[str, Any]:
+    """
+    Ejecuta una ingesta desde cero (limpia colección y reingesta todo).
+    Elimina datos zombi que ya no pasan los filtros actuales.
+    
+    Args:
+        max_results: Número máximo de repositorios
+        batch_size: Tamaño de lote
+        max_workers: Workers paralelos
+        
+    Returns:
+        Reporte de la ingesta
+    """
+    return run_ingestion(
+        max_results=max_results,
+        from_scratch=True,
+        batch_size=batch_size,
+        max_workers=max_workers,
         save_to_json=False
     )
