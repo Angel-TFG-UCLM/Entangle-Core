@@ -91,7 +91,9 @@ class OrganizationIngestionEngine:
         organizations_repository: MongoRepository,
         batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
         config: Optional[Dict[str, Any]] = None,
-        from_scratch: bool = False
+        from_scratch: bool = False,
+        progress_callback=None,
+        cancel_event=None
     ):
         """
         Inicializa el motor de ingesta de organizaciones.
@@ -103,6 +105,7 @@ class OrganizationIngestionEngine:
             batch_size: Tamaño del lote (default 5 para Rate Limit)
             config: Configuración opcional
             from_scratch: Si True, limpia colección antes de ingestar
+            progress_callback: Callback opcional fn(items_processed, items_total, message)
         """
         self.github_token = github_token
         self.users_repository = users_repository
@@ -110,6 +113,8 @@ class OrganizationIngestionEngine:
         self.batch_size = batch_size
         self.config = config or {}
         self.from_scratch = from_scratch
+        self.progress_callback = progress_callback
+        self.cancel_event = cancel_event
         self.graphql_client = GitHubGraphQLClient(github_token)
         
         # Thread coordination
@@ -383,11 +388,27 @@ class OrganizationIngestionEngine:
                 futures[future] = batch_num
             
             for future in concurrent.futures.as_completed(futures):
+                if self.cancel_event and self.cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    logger.warning("⚠️ Cancelación detectada en _process_orgs_batched")
+                    break
                 batch_num = futures[future]
                 try:
                     future.result()
                 except Exception as e:
                     logger.error(f"❌ Error en lote {batch_num}: {e}")
+                
+                # Notificar progreso
+                if self.progress_callback:
+                    try:
+                        self.progress_callback(
+                            self.stats.get('total_processed', 0) + self.stats.get('total_skipped', 0),
+                            total,
+                            f"Ingesta orgs: {self.stats.get('total_processed', 0) + self.stats.get('total_skipped', 0)}/{total}"
+                        )
+                    except Exception:
+                        pass
     
     def _fetch_and_save_batch_with_retry(
         self,
@@ -481,6 +502,8 @@ class OrganizationIngestionEngine:
             update_ops = []
             
             for i, login in enumerate(logins):
+                if self.cancel_event and self.cancel_event.is_set():
+                    break
                 alias_key = f"org{i}"
                 org_data = data.get(alias_key)
                 

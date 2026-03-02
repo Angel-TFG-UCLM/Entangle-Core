@@ -104,7 +104,9 @@ class EnrichmentEngine:
         github_token: str,
         repos_repository: MongoRepository,
         batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[Dict[str, Any]] = None,
+        progress_callback=None,
+        cancel_event=None
     ):
         """
         Inicializa el motor de enriquecimiento.
@@ -114,11 +116,14 @@ class EnrichmentEngine:
             repos_repository: Repositorio MongoDB para repositorios
             batch_size: Número de repositorios a procesar por lote
             config: Configuración opcional (se usa para rate limit y reintentos)
+            progress_callback: Callback opcional fn(items_processed, items_total, message)
         """
         self.github_token = github_token
         self.repos_repository = repos_repository
         self.config = config or {}
         self.batch_size = batch_size
+        self.progress_callback = progress_callback
+        self.cancel_event = cancel_event
         self.graphql_client = GitHubGraphQLClient(github_token)
         
         # Headers para REST API
@@ -459,6 +464,9 @@ class EnrichmentEngine:
         
         # Procesar en lotes
         for i in range(0, total_repos, self.batch_size):
+            if self.cancel_event and self.cancel_event.is_set():
+                logger.warning("⚠️ Cancelación detectada en enrich_all_repositories")
+                break
             batch = repos[i:i + self.batch_size]
             batch_num = (i // self.batch_size) + 1
             total_batches = (total_repos + self.batch_size - 1) // self.batch_size
@@ -484,6 +492,10 @@ class EnrichmentEngine:
                     futures[future] = (idx, repo_name)
                 
                 for future in concurrent.futures.as_completed(futures):
+                    if self.cancel_event and self.cancel_event.is_set():
+                        for f in futures:
+                            f.cancel()
+                        break
                     idx, repo_name = futures[future]
                     try:
                         future.result()
@@ -496,6 +508,16 @@ class EnrichmentEngine:
                         with self._stats_lock:
                             self.stats["total_errors"] += 1
                             self.stats["total_processed"] += 1
+                    
+                    # Notificar progreso
+                    if self.progress_callback:
+                        try:
+                            self.progress_callback(
+                                self.stats["total_processed"], total_repos,
+                                f"Enriqueciendo repos: {self.stats['total_processed']}/{total_repos}"
+                            )
+                        except Exception:
+                            pass
             
             # Mostrar resumen del lote
             logger.info(f"\n📊 Lote {batch_num} completado:")

@@ -103,7 +103,9 @@ class OrganizationEnrichmentEngine:
         users_repository: MongoRepository,
         batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
         sleep_time: float = 0.5,
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[Dict[str, Any]] = None,
+        progress_callback=None,
+        cancel_event=None
     ):
         """
         Inicializa el motor de enriquecimiento.
@@ -116,6 +118,7 @@ class OrganizationEnrichmentEngine:
             batch_size: Tamaño del lote (optimizado para vCore)
             sleep_time: Tiempo de espera entre requests GitHub API (default 0.5s)
             config: Configuración opcional
+            progress_callback: Callback opcional fn(items_processed, items_total, message)
         """
         self.github_token = github_token
         self.orgs_repository = organizations_repository
@@ -124,6 +127,8 @@ class OrganizationEnrichmentEngine:
         self.batch_size = batch_size
         self.sleep_time = sleep_time
         self.config = config or {}
+        self.progress_callback = progress_callback
+        self.cancel_event = cancel_event
         self.graphql_client = GitHubGraphQLClient(github_token)
         
         # Lock para estadísticas thread-safe
@@ -218,6 +223,7 @@ class OrganizationEnrichmentEngine:
         
         orgs = list(orgs_cursor)
         total_orgs = len(orgs)
+        self._total_items = total_orgs
         
         logger.info(f"📊 Total organizaciones a enriquecer: {total_orgs}")
         
@@ -243,6 +249,11 @@ class OrganizationEnrichmentEngine:
                 futures[future] = batch_num
             
             for future in concurrent.futures.as_completed(futures):
+                if self.cancel_event and self.cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    logger.warning("⚠️ Cancelación detectada en enrich_all_organizations")
+                    break
                 batch_num = futures[future]
                 try:
                     future.result()
@@ -372,6 +383,8 @@ class OrganizationEnrichmentEngine:
             bulk_updates = []
             
             for org in orgs_batch:
+                if self.cancel_event and self.cancel_event.is_set():
+                    break
                 login = org.get("login")
                 graphql_data = graphql_map.get(login)
                 
@@ -402,6 +415,17 @@ class OrganizationEnrichmentEngine:
                 
                 with self._stats_lock:
                     self.stats["total_processed"] += 1
+                
+                # Notificar progreso
+                if self.progress_callback:
+                    try:
+                        total = getattr(self, '_total_items', 0)
+                        self.progress_callback(
+                            self.stats["total_processed"], total,
+                            f"Enriqueciendo orgs: {self.stats['total_processed']}/{total}"
+                        )
+                    except Exception:
+                        pass
             
             # Bulk write de todas las actualizaciones
             if bulk_updates:

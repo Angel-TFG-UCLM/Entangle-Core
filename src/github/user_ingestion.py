@@ -48,7 +48,9 @@ class UserIngestionEngine:
         repos_repository: MongoRepository,
         users_repository: MongoRepository,
         batch_size: int = 500,  # ✅ OPTIMIZADO para vCore
-        from_scratch: bool = False
+        from_scratch: bool = False,
+        progress_callback=None,
+        cancel_event=None
     ):
         """
         Inicializa el motor de ingesta de usuarios.
@@ -59,12 +61,15 @@ class UserIngestionEngine:
             users_repository: Repositorio de usuarios
             batch_size: Tamaño del lote para procesamiento
             from_scratch: Si True, limpia colección antes de ingestar
+            progress_callback: Callback opcional fn(items_processed, items_total, message)
         """
         self.github_client = github_client
         self.repos_repository = repos_repository
         self.users_repository = users_repository
         self.batch_size = batch_size
         self.from_scratch = from_scratch
+        self.progress_callback = progress_callback
+        self.cancel_event = cancel_event
         
         # Lock para estadísticas thread-safe
         self._stats_lock = threading.Lock()
@@ -125,10 +130,20 @@ class UserIngestionEngine:
         
         if len(users_dict) == 0:
             logger.warning("⚠️  No se encontraron usuarios para ingestar")
+            if self.progress_callback:
+                try:
+                    self.progress_callback(1, 1, "No se encontraron usuarios nuevos")
+                except Exception:
+                    pass
             return self.stats
         
         # 2. Obtener información completa y guardar
         logger.info(f"\n📊 Obteniendo información completa de {len(users_dict)} usuarios...")
+        if self.progress_callback:
+            try:
+                self.progress_callback(0, len(users_dict), f"Obteniendo datos de {len(users_dict)} usuarios...")
+            except Exception:
+                pass
         self._fetch_and_save_users(users_dict)
         
         # 3. Finalizar
@@ -196,6 +211,8 @@ class UserIngestionEngine:
         logger.info(f"📂 Procesando {total_repos} repositorios con colaboradores...")
         
         for idx, repo in enumerate(repos, 1):
+            if self.cancel_event and self.cancel_event.is_set():
+                break
             repo_name = repo.get("name_with_owner", repo.get("name", "unknown"))
             collaborators = repo.get("collaborators", [])
             
@@ -350,11 +367,27 @@ class UserIngestionEngine:
                     futures[future] = batch_num
                 
                 for future in concurrent.futures.as_completed(futures):
+                    if self.cancel_event and self.cancel_event.is_set():
+                        for f in futures:
+                            f.cancel()
+                        logger.warning("⚠️ Cancelación detectada en _fetch_and_save_users")
+                        break
                     batch_num = futures[future]
                     try:
                         future.result()
                     except Exception as e:
                         logger.error(f"❌ Error en lote {batch_num}/{total_batches}: {e}")
+                    
+                    # Notificar progreso
+                    if self.progress_callback:
+                        try:
+                            processed = self.stats.get('users_inserted', 0) + self.stats.get('total_errors', 0)
+                            self.progress_callback(
+                                batch_num, total_batches,
+                                f"Ingesta usuarios: lote {batch_num}/{total_batches} ({self.stats.get('users_inserted', 0)} insertados)"
+                            )
+                        except Exception:
+                            pass
     
     def _fetch_and_save_batch_with_retry(self, batch: List[Dict[str, Any]], batch_num: int, total_batches: int) -> None:
         """
@@ -528,6 +561,8 @@ class UserIngestionEngine:
             docs_to_insert = []
             
             for i, login in enumerate(logins):
+                if self.cancel_event and self.cancel_event.is_set():
+                    break
                 alias_key = f"user{i}"
                 user_data = data.get(alias_key)
                 

@@ -148,7 +148,9 @@ class UserEnrichmentEngine:
         users_repository: MongoRepository,
         repos_repository: MongoRepository,
         batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[Dict[str, Any]] = None,
+        progress_callback=None,
+        cancel_event=None
     ):
         """
         Inicializa el motor de enriquecimiento.
@@ -159,12 +161,15 @@ class UserEnrichmentEngine:
             repos_repository: Repositorio de repositorios
             batch_size: Tamaño del lote (optimizado para vCore)
             config: Configuración opcional
+            progress_callback: Callback opcional fn(items_processed, items_total, message)
         """
         self.github_token = github_token
         self.users_repository = users_repository
         self.repos_repository = repos_repository
         self.batch_size = batch_size
         self.config = config or {}
+        self.progress_callback = progress_callback
+        self.cancel_event = cancel_event
         self.graphql_client = GitHubGraphQLClient(github_token)
         
         # Lock para estadísticas thread-safe
@@ -233,6 +238,7 @@ class UserEnrichmentEngine:
         
         users = list(users_cursor)
         total_users = len(users)
+        self._total_items = total_users
         
         logger.info(f"📊 Total usuarios a enriquecer: {total_users}")
         
@@ -260,6 +266,11 @@ class UserEnrichmentEngine:
                 futures[future] = batch_num
             
             for future in concurrent.futures.as_completed(futures):
+                if self.cancel_event and self.cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    logger.warning("⚠️ Cancelación detectada en enrich_all_users")
+                    break
                 batch_num = futures[future]
                 try:
                     future.result()
@@ -390,6 +401,8 @@ class UserEnrichmentEngine:
             data = result['data']
             
             for i, user in enumerate(valid_users):
+                if self.cancel_event and self.cancel_event.is_set():
+                    break
                 alias_key = f"user{i}"
                 graphql_data = data.get(alias_key)
                 login = user.get('login')
@@ -541,6 +554,17 @@ class UserEnrichmentEngine:
                 self.stats["total_enriched"] += 1
                 self.stats["total_processed"] += 1
             logger.debug(f"✅ {login} enriquecido")
+            
+            # Notificar progreso
+            if self.progress_callback:
+                try:
+                    total = getattr(self, '_total_items', 0)
+                    self.progress_callback(
+                        self.stats["total_processed"], total,
+                        f"Enriqueciendo usuarios: {self.stats['total_processed']}/{total}"
+                    )
+                except Exception:
+                    pass
             
             return True
             

@@ -17,6 +17,9 @@ networkx>=3.0
 # Serialización JSON rápida
 orjson>=3.9
 
+# Autenticación
+bcrypt==4.2.1
+
 # Utilidades
 python-dotenv==1.0.1
 

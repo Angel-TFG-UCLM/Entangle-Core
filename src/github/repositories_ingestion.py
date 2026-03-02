@@ -52,7 +52,9 @@ class IngestionEngine:
         incremental: bool = False,
         from_scratch: bool = False,
         batch_size: int = 500,  # ✅ OPTIMIZADO para vCore: batch masivo
-        max_workers: int = 4  # Workers para búsquedas paralelas de segmentos
+        max_workers: int = 4,  # Workers para búsquedas paralelas de segmentos
+        progress_callback=None,
+        cancel_event=None
     ):
         """
         Inicializa el motor de ingesta.
@@ -64,6 +66,7 @@ class IngestionEngine:
             from_scratch: Si True, limpia la colección antes de ingestar (elimina datos zombi)
             batch_size: Tamaño de lote para operaciones bulk
             max_workers: Número de workers para búsquedas paralelas (1-8)
+            progress_callback: Callback opcional fn(items_processed, items_total, message)
         """
         self.client = client or GitHubGraphQLClient()
         self.config = config or ingestion_config
@@ -71,6 +74,8 @@ class IngestionEngine:
         self.from_scratch = from_scratch
         self.batch_size = batch_size
         self.max_workers = max(1, min(8, max_workers))  # Clamp 1-8
+        self.progress_callback = progress_callback
+        self.cancel_event = cancel_event
         
         # Conectar a MongoDB
         if not db.is_connected():
@@ -288,24 +293,47 @@ class IngestionEngine:
             # ==================== FASE 1: EXTRACCIÓN ====================
             start_extraction = time.time()
             logger.info("\n📥 FASE 1: Extracción de Repositorios")
+            if self.progress_callback:
+                try:
+                    self.progress_callback(0, 4, "Fase 1/4: Extrayendo repositorios...")
+                except Exception:
+                    pass
             repositories_raw = self._search_repositories(max_results)
             self.stats["total_found"] = len(repositories_raw)
             self.stats["time_extraction"] = time.time() - start_extraction
             
             logger.info(f"✅ {len(repositories_raw)} repositorios extraídos en {self.stats['time_extraction']:.2f}s")
             
+            if self.cancel_event and self.cancel_event.is_set():
+                self.stats["end_time"] = datetime.now(timezone.utc)
+                return self.stats
+            
             # ==================== FASE 2: FILTRADO ====================
             start_filtering = time.time()
             logger.info("\n🔍 FASE 2: Filtrado de Calidad")
+            if self.progress_callback:
+                try:
+                    self.progress_callback(1, 4, f"Fase 2/4: Filtrando {len(repositories_raw)} repos...")
+                except Exception:
+                    pass
             filtered_repos_raw = self.filter_repositories(repositories_raw)
             self.stats["total_filtered"] = len(filtered_repos_raw)
             self.stats["time_filtering"] = time.time() - start_filtering
             
             logger.info(f"✅ {len(filtered_repos_raw)} repositorios válidos en {self.stats['time_filtering']:.2f}s")
             
+            if self.cancel_event and self.cancel_event.is_set():
+                self.stats["end_time"] = datetime.now(timezone.utc)
+                return self.stats
+            
             # ==================== FASE 3: VALIDACIÓN ====================
             start_validation = time.time()
             logger.info("\n✔️  FASE 3: Validación con Modelos Pydantic")
+            if self.progress_callback:
+                try:
+                    self.progress_callback(2, 4, f"Fase 3/4: Validando {len(filtered_repos_raw)} repos...")
+                except Exception:
+                    pass
             validated_repos, validation_errors = self._validate_repositories(filtered_repos_raw)
             self.stats["validation_success"] = len(validated_repos)
             self.stats["validation_errors"] = len(validation_errors)
@@ -315,9 +343,18 @@ class IngestionEngine:
             if validation_errors:
                 logger.warning(f"⚠️  {len(validation_errors)} errores de validación")
             
+            if self.cancel_event and self.cancel_event.is_set():
+                self.stats["end_time"] = datetime.now(timezone.utc)
+                return self.stats
+            
             # ==================== FASE 4: PERSISTENCIA ====================
             start_persistence = time.time()
             logger.info("\n💾 FASE 4: Persistencia en MongoDB")
+            if self.progress_callback:
+                try:
+                    self.progress_callback(3, 4, f"Fase 4/4: Guardando {len(validated_repos)} repos en BD...")
+                except Exception:
+                    pass
             self._persist_repositories(validated_repos)
             self.stats["time_persistence"] = time.time() - start_persistence
             
@@ -561,6 +598,10 @@ class IngestionEngine:
             
             # Recoger resultados a medida que terminan
             for future in as_completed(future_to_segment):
+                if self.cancel_event and self.cancel_event.is_set():
+                    for f in future_to_segment:
+                        f.cancel()
+                    break
                 min_stars, max_stars, year = future_to_segment[future]
                 completed += 1
                 segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
@@ -624,6 +665,8 @@ class IngestionEngine:
         query_count = 0
         
         for min_stars, max_stars, year in segments:
+            if self.cancel_event and self.cancel_event.is_set():
+                break
             query_count += 1
             segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
             
@@ -764,6 +807,8 @@ class IngestionEngine:
         
         # Procesar en lotes
         for i in range(0, len(repositories), self.batch_size):
+            if self.cancel_event and self.cancel_event.is_set():
+                break
             batch = repositories[i:i + self.batch_size]
             batch_num = i // self.batch_size + 1
             total_batches = (len(repositories) + self.batch_size - 1) // self.batch_size
