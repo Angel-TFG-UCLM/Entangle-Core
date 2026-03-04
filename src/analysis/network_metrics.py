@@ -865,10 +865,14 @@ class CollaborationNetworkAnalyzer:
     # FULL ANALYSIS - Runs everything and returns combined result
     # ========================================================================
 
-    def get_full_analysis(self):
+    def get_full_analysis(self, users_collection=None, repos_collection=None):
         """
         Run ALL analyses and return combined results.
         This is what the /collaboration/network-metrics endpoint returns.
+        
+        Args:
+            users_collection: Optional pymongo collection for discipline classification
+            repos_collection: Optional pymongo collection for discipline classification
         """
         logger.info("[NetworkAnalyzer] Computing full network analysis...")
 
@@ -879,6 +883,24 @@ class CollaborationNetworkAnalyzer:
         intensity = self.compute_collaboration_intensity()
         global_metrics = self.compute_global_metrics()
         searchable = self.get_searchable_nodes()
+
+        # Discipline classification (requires MongoDB collections)
+        node_disciplines = {}
+        discipline_analysis = None
+        if users_collection is not None and repos_collection is not None:
+            try:
+                from .discipline_classifier import classify_all_users
+                node_disciplines, discipline_analysis = classify_all_users(
+                    self.G, users_collection, repos_collection
+                )
+                logger.info(
+                    f"[NetworkAnalyzer] Discipline classification: "
+                    f"{len(node_disciplines)} users classified"
+                )
+            except Exception as e:
+                logger.error(f"[NetworkAnalyzer] Discipline classification failed: {e}", exc_info=True)
+                node_disciplines = {}
+                discipline_analysis = None
 
         # Merge per-node metrics into a single dict
         node_metrics = {}
@@ -896,6 +918,10 @@ class CollaborationNetworkAnalyzer:
                 metrics["bus_factor_risk"] = bf.get("risk", "unknown")
                 metrics["top_contributors"] = bf.get("top_contributors", [])
                 metrics["total_contributors"] = bf.get("total_contributors", 0)
+
+            # Add discipline for users
+            if node_id in node_disciplines:
+                metrics.update(node_disciplines[node_id])
 
             node_metrics[node_id] = metrics
 
@@ -929,6 +955,10 @@ class CollaborationNetworkAnalyzer:
             "global_metrics": global_metrics,
             "searchable_nodes": searchable
         }
+
+        # Add discipline analysis if available
+        if discipline_analysis:
+            result["discipline_analysis"] = discipline_analysis
 
         logger.info(
             f"[NetworkAnalyzer] Analysis complete: "

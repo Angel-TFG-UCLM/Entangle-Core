@@ -636,7 +636,7 @@ query GetOrgEnrichmentBatch({var_defs}) {{
         Thread-safe: coordina entre hilos con _rate_limit_lock.
         El primer hilo que detecta el rate limit loguea; los demás esperan silenciosamente.
         """
-        wait_seconds = 60  # Fallback
+        wait_seconds = 120  # Fallback conservador
         try:
             rate_limit = self.graphql_client.get_rate_limit()
             remaining = rate_limit.get("remaining", 5000)
@@ -648,6 +648,12 @@ query GetOrgEnrichmentBatch({var_defs}) {{
                 wait = (reset_time - now).total_seconds() + 5
                 if 0 < wait < 3600:
                     wait_seconds = wait
+            else:
+                # Si GraphQL no da reset, consultar REST API
+                rest_info = self.graphql_client._get_rate_limit_rest()
+                gql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                if gql_reset > 0:
+                    wait_seconds = max(0, gql_reset - time.time()) + 5
         except Exception:
             pass
         

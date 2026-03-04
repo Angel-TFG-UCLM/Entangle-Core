@@ -9,10 +9,11 @@ Funcionalidades:
 - Historial persistente de operaciones
 """
 import bcrypt
+import logging
 import threading
 import uuid
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
 from fastapi import APIRouter, HTTPException, Query, Depends
@@ -64,6 +65,47 @@ active_operations: Dict[str, Dict[str, Any]] = {}
 
 # Flags de cancelación (threading.Event para cada operación)
 cancel_flags: Dict[str, threading.Event] = {}
+
+# Buffers de logs por operación (captura en tiempo real)
+MAX_OPERATION_LOGS = 2000
+operation_logs: Dict[str, List[Dict]] = {}
+
+# Thread-local para rastrear qué operación ejecuta cada hilo
+_thread_local = threading.local()
+
+
+class OperationLogHandler(logging.Handler):
+    """
+    Handler de logging que captura mensajes para la operación activa
+    en el hilo actual. Permite al frontend ver logs en tiempo real.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setLevel(logging.DEBUG)
+
+    def emit(self, record):
+        try:
+            op_id = getattr(_thread_local, 'operation_id', None)
+            if op_id and op_id in operation_logs:
+                entry = {
+                    "ts": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                    "level": record.levelname,
+                    "msg": record.getMessage(),
+                    "src": f"{record.module}.{record.funcName}",
+                }
+                buf = operation_logs[op_id]
+                buf.append(entry)
+                # Limitar tamaño del buffer
+                if len(buf) > MAX_OPERATION_LOGS:
+                    del buf[:len(buf) - MAX_OPERATION_LOGS]
+        except Exception:
+            pass  # Nunca dejar que un error de logging crashee la operación
+
+
+# Registrar handler en el logger global para capturar logs de operaciones
+_op_log_handler = OperationLogHandler()
+logger.addHandler(_op_log_handler)
 
 
 # ============================================================================
@@ -300,6 +342,32 @@ async def cancel_operation(operation_id: str, token: str = Query(..., descriptio
     return {"message": "Cancelación solicitada", "operation_id": operation_id}
 
 
+@admin_router.get("/operations/{operation_id}/logs")
+async def get_operation_logs(
+    operation_id: str,
+    token: str = Query(..., description="Token de sesión admin"),
+    since: int = Query(0, ge=0, description="Índice desde el que obtener logs nuevos")
+):
+    """
+    Obtiene los logs de ejecución de una operación en tiempo real.
+    Usa el parámetro `since` para obtener solo logs nuevos (polling incremental).
+    """
+    _require_admin(token)
+
+    if operation_id not in operation_logs:
+        return {"logs": [], "total": 0, "next_index": 0}
+
+    logs = operation_logs[operation_id]
+    total = len(logs)
+    new_logs = logs[since:] if since < total else []
+
+    return {
+        "logs": new_logs,
+        "total": total,
+        "next_index": total,
+    }
+
+
 # ============================================================================
 # HISTORIAL PERSISTENTE
 # ============================================================================
@@ -426,20 +494,61 @@ def _update_progress(operation_id: str, message: str, items_processed: int = 0, 
     op["items_total"] = items_total
     
     if items_total > 0:
-        op["progress"] = round((items_processed / items_total) * 100, 1)
+        pct = (items_processed / items_total) * 100
+        op["progress"] = round(pct, 1)
         
-        # Calcular ETA
-        started = datetime.fromisoformat(op["started_at"])
-        elapsed = (datetime.now() - started).total_seconds()
-        if items_processed > 0:
-            rate = items_processed / elapsed
-            remaining = items_total - items_processed
-            op["eta_seconds"] = round(remaining / rate)
-        else:
+        # ETA suavizado con EMA (Exponential Moving Average)
+        now_ts = datetime.now().timestamp()
+        prev_ts = op.get("_eta_last_ts")
+        prev_items = op.get("_eta_last_items", 0)
+        
+        if prev_ts is not None and items_processed > prev_items:
+            dt = now_ts - prev_ts
+            dp = items_processed - prev_items
+            if dt > 0:
+                instant_rate = dp / dt  # items/segundo
+                
+                # EMA: suavizar con factor alpha=0.2 (80% peso anterior, 20% nuevo)
+                alpha = 0.2
+                prev_rate = op.get("_eta_smooth_rate")
+                if prev_rate and prev_rate > 0:
+                    smooth_rate = prev_rate * (1 - alpha) + instant_rate * alpha
+                else:
+                    smooth_rate = instant_rate
+                op["_eta_smooth_rate"] = smooth_rate
+                
+                remaining = items_total - items_processed
+                new_eta = remaining / smooth_rate if smooth_rate > 0 else None
+                
+                if new_eta is not None and pct >= 5:
+                    # Damping: el ETA no puede cambiar más de 25% respecto al anterior
+                    prev_eta = op.get("eta_seconds")
+                    if prev_eta and prev_eta > 0:
+                        max_eta = prev_eta * 1.25
+                        min_eta = prev_eta * 0.75
+                        new_eta = max(min_eta, min(new_eta, max_eta))
+                    op["eta_seconds"] = min(round(new_eta), 86400)
+                else:
+                    op["eta_seconds"] = None
+        
+        op["_eta_last_ts"] = now_ts
+        op["_eta_last_items"] = items_processed
+        
+        # No mostrar ETA hasta tener suficiente progreso
+        if pct < 5:
             op["eta_seconds"] = None
     else:
         op["progress"] = 0
         op["eta_seconds"] = None
+
+    # También registrar en el buffer de logs de la operación
+    if operation_id in operation_logs:
+        operation_logs[operation_id].append({
+            "ts": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "level": "PROGRESS",
+            "msg": message,
+            "src": "admin.progress",
+        })
 
 
 def _is_cancelled(operation_id: str) -> bool:
@@ -487,9 +596,17 @@ def _finalize_operation(operation_id: str, status: str, stats: Any = None, error
     
     logger.info(f"{'✅' if status == 'completed' else '⚠️'} Operación finalizada [{status}]: {operation_id} ({op['duration_seconds']}s)")
 
+    # Recortar buffer de logs (mantener últimas 500 entradas para revisión post-ejecución)
+    if operation_id in operation_logs:
+        operation_logs[operation_id] = operation_logs[operation_id][-500:]
+
 
 def _execute_operation(operation_id: str, request: OperationRequest, cancel_event: threading.Event):
     """Ejecutor principal de operaciones en background."""
+    # Inicializar buffer de logs y marcar hilo para captura
+    operation_logs[operation_id] = []
+    _thread_local.operation_id = operation_id
+
     try:
         if request.operation_type == "pipeline":
             _run_pipeline_operation(operation_id, request, cancel_event)
@@ -502,6 +619,9 @@ def _execute_operation(operation_id: str, request: OperationRequest, cancel_even
     except Exception as e:
         logger.error(f"❌ Error en operación {operation_id}: {e}")
         _finalize_operation(operation_id, "failed", error=str(e))
+    finally:
+        # Limpiar contexto del hilo
+        _thread_local.operation_id = None
 
 
 # ── Ingesta ──────────────────────────────────────────────────────────────────
@@ -702,7 +822,7 @@ def _run_enrichment_operation(operation_id: str, request: OperationRequest, canc
 # ── Pipeline completo ────────────────────────────────────────────────────────
 
 def _run_pipeline_operation(operation_id: str, request: OperationRequest, cancel_event: threading.Event):
-    """Ejecuta el pipeline completo (6 fases)."""
+    """Ejecuta el pipeline completo (6 fases) con progreso granular."""
     import os
     import traceback
     from ..github.user_ingestion import run_user_ingestion
@@ -715,74 +835,109 @@ def _run_pipeline_operation(operation_id: str, request: OperationRequest, cancel
         _finalize_operation(operation_id, "failed", error="GITHUB_TOKEN no configurado")
         return
     
-    phases = [
-        ("Ingesta de Repositorios", 1),
-        ("Enriquecimiento de Repositorios", 2),
-        ("Ingesta de Usuarios", 3),
-        ("Enriquecimiento de Usuarios", 4),
-        ("Ingesta de Organizaciones", 5),
-        ("Enriquecimiento de Organizaciones", 6),
+    phase_names = [
+        "Ingesta de Repositorios",
+        "Enriquecimiento de Repositorios",
+        "Ingesta de Usuarios",
+        "Enriquecimiento de Usuarios",
+        "Ingesta de Organizaciones",
+        "Enriquecimiento de Organizaciones",
     ]
     
+    total_phases = len(phase_names)
     results = []
-    total_phases = len(phases)
-    
-    active_operations[operation_id]["items_total"] = total_phases
+
+    # items_total=600 para resolución de sub-progreso (100 unidades por fase)
+    active_operations[operation_id]["items_total"] = total_phases * 100
+
+    def make_phase_progress_cb(phase_index):
+        """Crea un callback que mapea el progreso interno del engine al progreso global del pipeline."""
+        phase_label = phase_names[phase_index]
+        def cb(processed, total, message):
+            if total > 0:
+                sub_pct = processed / total
+            else:
+                sub_pct = 0
+            global_items = int((phase_index + sub_pct) * 100)
+            _update_progress(
+                operation_id,
+                f"{phase_index + 1}/{total_phases} - {phase_label}: {message}",
+                global_items,
+                total_phases * 100
+            )
+        return cb
     
     try:
         # Fase 1: Ingesta de Repositorios
         if cancel_event.is_set():
             _finalize_operation(operation_id, "cancelled")
             return
-        _update_progress(operation_id, f"1/{total_phases} — {phases[0][0]} ({mode_label})", 0, total_phases)
+        _update_progress(operation_id, f"1/{total_phases} - {phase_names[0]} ({mode_label})", 0, total_phases * 100)
         
         try:
             stats = IngestionEngine(
                 incremental=not from_scratch,
                 from_scratch=from_scratch,
-                max_workers=request.max_workers
+                max_workers=request.max_workers,
+                progress_callback=make_phase_progress_cb(0),
+                cancel_event=cancel_event
             ).run(max_results=None, save_to_json=False)
-            results.append({"phase": phases[0][0], "success": True, "stats": stats})
+            results.append({"phase": phase_names[0], "success": True, "stats": stats})
         except Exception as e:
-            results.append({"phase": phases[0][0], "success": False, "error": str(e)})
+            results.append({"phase": phase_names[0], "success": False, "error": str(e)})
             logger.error(f"Error en fase 1: {e}")
         
         # Fase 2: Enriquecimiento de Repositorios
         if cancel_event.is_set():
             _finalize_operation(operation_id, "cancelled")
             return
-        _update_progress(operation_id, f"2/{total_phases} — {phases[1][0]}", 1, total_phases)
+        _update_progress(operation_id, f"2/{total_phases} - {phase_names[1]}", 100, total_phases * 100)
         
         repo_repo = MongoRepository("repositories")
         try:
             stats = EnrichmentEngine(
                 github_token=github_token,
                 repos_repository=repo_repo,
-                batch_size=100
-            ).enrich_all_repositories(max_repos=None)
-            results.append({"phase": phases[1][0], "success": True, "stats": stats})
+                batch_size=100,
+                progress_callback=make_phase_progress_cb(1),
+                cancel_event=cancel_event
+            ).enrich_all_repositories(max_repos=None, force_reenrich=request.force_reenrich)
+            results.append({"phase": phase_names[1], "success": True, "stats": stats})
         except Exception as e:
-            results.append({"phase": phases[1][0], "success": False, "error": str(e)})
+            results.append({"phase": phase_names[1], "success": False, "error": str(e)})
             logger.error(f"Error en fase 2: {e}")
         
         # Fase 3: Ingesta de Usuarios
         if cancel_event.is_set():
             _finalize_operation(operation_id, "cancelled")
             return
-        _update_progress(operation_id, f"3/{total_phases} — {phases[2][0]} ({mode_label})", 2, total_phases)
+        _update_progress(operation_id, f"3/{total_phases} - {phase_names[2]} ({mode_label})", 200, total_phases * 100)
         
         try:
-            stats = run_user_ingestion(from_scratch=from_scratch)
-            results.append({"phase": phases[2][0], "success": True, "stats": stats})
+            github_client = GitHubGraphQLClient()
+            repos_repo_u = MongoRepository("repositories")
+            users_repo = MongoRepository("users", unique_fields=["id"])
+            
+            user_engine = UserIngestionEngine(
+                github_client=github_client,
+                repos_repository=repos_repo_u,
+                users_repository=users_repo,
+                batch_size=request.batch_size,
+                from_scratch=from_scratch,
+                progress_callback=make_phase_progress_cb(2),
+                cancel_event=cancel_event
+            )
+            stats = user_engine.run(max_repos=None)
+            results.append({"phase": phase_names[2], "success": True, "stats": stats})
         except Exception as e:
-            results.append({"phase": phases[2][0], "success": False, "error": str(e)})
+            results.append({"phase": phase_names[2], "success": False, "error": str(e)})
             logger.error(f"Error en fase 3: {e}")
         
         # Fase 4: Enriquecimiento de Usuarios
         if cancel_event.is_set():
             _finalize_operation(operation_id, "cancelled")
             return
-        _update_progress(operation_id, f"4/{total_phases} — {phases[3][0]}", 3, total_phases)
+        _update_progress(operation_id, f"4/{total_phases} - {phase_names[3]}", 300, total_phases * 100)
         
         users_repo = MongoRepository("users")
         try:
@@ -790,18 +945,20 @@ def _run_pipeline_operation(operation_id: str, request: OperationRequest, cancel
                 github_token=github_token,
                 users_repository=users_repo,
                 repos_repository=repo_repo,
-                batch_size=100
-            ).enrich_all_users(max_users=None, force_reenrich=False)
-            results.append({"phase": phases[3][0], "success": True, "stats": stats})
+                batch_size=100,
+                progress_callback=make_phase_progress_cb(3),
+                cancel_event=cancel_event
+            ).enrich_all_users(max_users=None, force_reenrich=request.force_reenrich)
+            results.append({"phase": phase_names[3], "success": True, "stats": stats})
         except Exception as e:
-            results.append({"phase": phases[3][0], "success": False, "error": str(e)})
+            results.append({"phase": phase_names[3], "success": False, "error": str(e)})
             logger.error(f"Error en fase 4: {e}")
         
         # Fase 5: Ingesta de Organizaciones
         if cancel_event.is_set():
             _finalize_operation(operation_id, "cancelled")
             return
-        _update_progress(operation_id, f"5/{total_phases} — {phases[4][0]} ({mode_label})", 4, total_phases)
+        _update_progress(operation_id, f"5/{total_phases} - {phase_names[4]} ({mode_label})", 400, total_phases * 100)
         
         orgs_repo = MongoRepository("organizations")
         try:
@@ -810,18 +967,20 @@ def _run_pipeline_operation(operation_id: str, request: OperationRequest, cancel
                 users_repository=users_repo,
                 organizations_repository=orgs_repo,
                 batch_size=100,
-                from_scratch=from_scratch
+                from_scratch=from_scratch,
+                progress_callback=make_phase_progress_cb(4),
+                cancel_event=cancel_event
             ).run(force_update=from_scratch)
-            results.append({"phase": phases[4][0], "success": True, "stats": stats})
+            results.append({"phase": phase_names[4], "success": True, "stats": stats})
         except Exception as e:
-            results.append({"phase": phases[4][0], "success": False, "error": str(e)})
+            results.append({"phase": phase_names[4], "success": False, "error": str(e)})
             logger.error(f"Error en fase 5: {e}")
         
         # Fase 6: Enriquecimiento de Organizaciones
         if cancel_event.is_set():
             _finalize_operation(operation_id, "cancelled")
             return
-        _update_progress(operation_id, f"6/{total_phases} — {phases[5][0]}", 5, total_phases)
+        _update_progress(operation_id, f"6/{total_phases} - {phase_names[5]}", 500, total_phases * 100)
         
         try:
             stats = OrganizationEnrichmentEngine(
@@ -829,11 +988,13 @@ def _run_pipeline_operation(operation_id: str, request: OperationRequest, cancel
                 organizations_repository=orgs_repo,
                 repositories_repository=repo_repo,
                 users_repository=users_repo,
-                batch_size=100
-            ).enrich_all_organizations(max_orgs=None, force_reenrich=False)
-            results.append({"phase": phases[5][0], "success": True, "stats": stats})
+                batch_size=100,
+                progress_callback=make_phase_progress_cb(5),
+                cancel_event=cancel_event
+            ).enrich_all_organizations(max_orgs=None, force_reenrich=request.force_reenrich)
+            results.append({"phase": phase_names[5], "success": True, "stats": stats})
         except Exception as e:
-            results.append({"phase": phases[5][0], "success": False, "error": str(e)})
+            results.append({"phase": phase_names[5], "success": False, "error": str(e)})
             logger.error(f"Error en fase 6: {e}")
         
         # Resultado final

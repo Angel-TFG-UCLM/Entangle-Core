@@ -1659,7 +1659,8 @@ async def discover_collaboration(
             if org_id not in added_nodes:
                 org_doc = orgs_collection.find_one(
                     {"login": org_login},
-                    {"_id": 0, "name": 1, "avatar_url": 1}
+                    {"_id": 0, "name": 1, "avatar_url": 1,
+                     "quantum_focus_score": 1, "is_quantum_focused": 1}
                 )
                 nodes.append({
                     "id": org_id,
@@ -1667,6 +1668,8 @@ async def discover_collaboration(
                     "login": org_login,
                     "name": (org_doc.get("name") if org_doc else None) or org_login,
                     "avatar_url": org_doc.get("avatar_url") if org_doc else None,
+                    "quantum_focus_score": org_doc.get("quantum_focus_score", 0) if org_doc else 0,
+                    "is_quantum_focused": org_doc.get("is_quantum_focused", False) if org_doc else False,
                 })
                 added_nodes.add(org_id)
                 
@@ -2318,7 +2321,10 @@ async def get_network_metrics(
         
         analyzer = CollaborationNetworkAnalyzer()
         analyzer.build_from_mongodb(repos_col, users_col, orgs_col, year_from=year_from, year_to=year_to)
-        full = analyzer.get_full_analysis()
+        full = analyzer.get_full_analysis(
+            users_collection=users_col,
+            repos_collection=repos_col
+        )
         
         # Construir respuesta compacta - solo lo que el frontend necesita
         compact_node_metrics = {}
@@ -2343,6 +2349,12 @@ async def get_network_metrics(
                         {"login": c["login"], "percentage": c.get("percentage", 0)}
                         for c in tc[:3]
                     ]
+            # Discipline data for users
+            if "discipline" in m:
+                entry["discipline"] = m["discipline"]
+                entry["discipline_color"] = m.get("discipline_color", "#888888")
+                entry["discipline_label"] = m.get("discipline_label", "")
+                entry["discipline_confidence"] = m.get("discipline_confidence", 0)
             compact_node_metrics[node_id] = entry
         
         # Comunidades compactas
@@ -2361,6 +2373,10 @@ async def get_network_metrics(
             "communities": compact_communities,
             "global_metrics": full.get("global_metrics", {}),
         }
+        
+        # Add discipline analysis if available
+        if "discipline_analysis" in full:
+            result["discipline_analysis"] = full["discipline_analysis"]
         
         # Serializar con orjson (~10x más rápido que json.dumps)
         json_bytes = orjson.dumps(result)

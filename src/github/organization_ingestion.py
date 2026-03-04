@@ -693,13 +693,22 @@ class OrganizationIngestionEngine:
                         else:
                             return
                     else:
-                        wait = 60
+                        # Consultar REST API para timestamp real
+                        try:
+                            rest_info = self.graphql_client._get_rate_limit_rest()
+                            gql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                            if gql_reset > 0:
+                                wait = max(0, gql_reset - now) + 5
+                            else:
+                                wait = 120
+                        except Exception:
+                            wait = 120
                         self._rate_limit_until = now + wait
-                        logger.warning("⏳ No se pudo consultar reset. Esperando 60s por seguridad...")
+                        logger.warning(f"⏳ Rate limit: esperando {wait:.0f}s hasta reset...")
                 except Exception:
-                    wait = 60
+                    wait = 120
                     self._rate_limit_until = now + wait
-                    logger.warning("⏳ No se pudo consultar reset. Esperando 60s por seguridad...")
+                    logger.warning(f"⏳ No se pudo consultar reset. Esperando {wait:.0f}s por seguridad...")
         
         # Dormir fuera del lock
         time.sleep(max(wait, 0))

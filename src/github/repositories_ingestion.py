@@ -100,6 +100,8 @@ class IngestionEngine:
             
             # Filtrado
             "filtered_by_archived": 0,
+            "filtered_by_blacklist": 0,
+            "filtered_by_relevance": 0,
             "filtered_by_fork": 0,
             "filtered_by_stars": 0,
             "filtered_by_language": 0,
@@ -390,6 +392,14 @@ class IngestionEngine:
             logger.error(f"❌ Error durante el proceso de ingesta: {e}", exc_info=True)
             raise
     
+    def _report_progress(self, processed: int, total: int, message: str):
+        """Wrapper para reportar progreso de forma segura."""
+        if self.progress_callback:
+            try:
+                self.progress_callback(processed, total, message)
+            except Exception:
+                pass
+
     def _search_repositories(self, max_results: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Busca repositorios usando el cliente GraphQL.
@@ -458,11 +468,15 @@ class IngestionEngine:
         star_ranges = segmentation.get("stars", [])
         created_years = segmentation.get("created_years", [])
         
+        # Obtener keywords de búsqueda (cada una genera su propio set de segmentos)
+        search_keywords = self.config.search_keywords
+        
         logger.info(f"🎯 Segmentación configurada:")
+        logger.info(f"  • Keywords de búsqueda: {search_keywords}")
         logger.info(f"  • Rangos de estrellas: {len(star_ranges)}")
         logger.info(f"  • Años de creación: {len(created_years)}")
         
-        total_combinations = len(star_ranges) * len(created_years)
+        total_combinations = len(star_ranges) * len(created_years) * len(search_keywords)
         logger.info(f"  • Total de consultas a ejecutar: {total_combinations}")
         
         if incremental_since:
@@ -471,12 +485,13 @@ class IngestionEngine:
         if self.max_workers > 1:
             logger.info(f"  • Workers paralelos: {self.max_workers}")
         
-        # Generar lista de segmentos a procesar
+        # Generar lista de segmentos a procesar (keyword, stars, year)
         segments = []
-        for star_range in star_ranges:
-            min_stars, max_stars = star_range
-            for year in created_years:
-                segments.append((min_stars, max_stars, year))
+        for keyword in search_keywords:
+            for star_range in star_ranges:
+                min_stars, max_stars = star_range
+                for year in created_years:
+                    segments.append((min_stars, max_stars, year, keyword))
         
         all_repositories = {}  # Usar dict para evitar duplicados por full_name
         
@@ -505,7 +520,8 @@ class IngestionEngine:
         min_stars: int,
         max_stars: int,
         year: int,
-        incremental_since: Optional[datetime] = None
+        incremental_since: Optional[datetime] = None,
+        search_keyword: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Ejecuta la búsqueda de un segmento individual con reintentos.
@@ -519,11 +535,12 @@ class IngestionEngine:
             max_stars: Estrellas máximas
             year: Año de creación
             incremental_since: Fecha para filtro pushed (modo incremental)
+            search_keyword: Keyword específica para la búsqueda
             
         Returns:
             Lista de repos encontrados en este segmento
         """
-        segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
+        segment_name = f"[{search_keyword or 'default'}] stars:{min_stars}..{max_stars} year:{year}"
         max_segment_retries = 3
         
         for attempt in range(max_segment_retries):
@@ -540,7 +557,8 @@ class IngestionEngine:
                     max_stars=max_stars,
                     created_year=year,
                     max_results=1000,
-                    pushed_after=incremental_since.strftime('%Y-%m-%d') if incremental_since else None
+                    pushed_after=incremental_since.strftime('%Y-%m-%d') if incremental_since else None,
+                    search_keyword=search_keyword
                 )
                 
                 return segment_repos
@@ -550,11 +568,23 @@ class IngestionEngine:
                 is_retryable = any(kw in error_str for kw in ['403', 'forbidden', 'rate limit', 'secondary', '502', '503', '504', 'timeout'])
                 
                 if is_retryable and attempt < max_segment_retries - 1:
-                    wait_time = 60 * (2 ** attempt)  # 60s, 120s, 240s
+                    # Consultar timestamp real de reset vía REST API
+                    try:
+                        rest_info = self.client._get_rate_limit_rest()
+                        core_reset = rest_info.get('resources', {}).get('core', {}).get('reset', 0)
+                        gql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                        search_reset = rest_info.get('resources', {}).get('search', {}).get('reset', 0)
+                        reset_ts = max(core_reset, gql_reset, search_reset)
+                        if reset_ts > 0:
+                            wait_time = max(0, reset_ts - time.time()) + 5
+                        else:
+                            wait_time = 120  # Fallback conservador
+                    except Exception:
+                        wait_time = 120  # Fallback conservador
                     logger.warning(
                         f"⚠️ Error retryable en segmento {segment_name} "
                         f"(intento {attempt + 1}/{max_segment_retries}): {e}. "
-                        f"Reintentando en {wait_time}s..."
+                        f"Reintentando en {wait_time:.0f}s..."
                     )
                     time.sleep(wait_time)
                     continue
@@ -573,7 +603,7 @@ class IngestionEngine:
         Ejecuta búsquedas en paralelo usando ThreadPoolExecutor.
         
         Args:
-            segments: Lista de (min_stars, max_stars, year)
+            segments: Lista de (min_stars, max_stars, year, keyword)
             total_combinations: Total de segmentos
             max_results: Límite máximo de repos
             incremental_since: Fecha para filtro incremental
@@ -591,9 +621,9 @@ class IngestionEngine:
             future_to_segment = {
                 executor.submit(
                     self._search_single_segment,
-                    min_stars, max_stars, year, incremental_since
-                ): (min_stars, max_stars, year)
-                for min_stars, max_stars, year in segments
+                    min_stars, max_stars, year, incremental_since, keyword
+                ): (min_stars, max_stars, year, keyword)
+                for min_stars, max_stars, year, keyword in segments
             }
             
             # Recoger resultados a medida que terminan
@@ -602,9 +632,16 @@ class IngestionEngine:
                     for f in future_to_segment:
                         f.cancel()
                     break
-                min_stars, max_stars, year = future_to_segment[future]
+                min_stars, max_stars, year, keyword = future_to_segment[future]
                 completed += 1
-                segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
+                segment_name = f"[{keyword}] stars:{min_stars}..{max_stars} year:{year}"
+
+                # Progreso granular durante extracci\u00f3n (0-74 de 100)
+                extraction_progress = int((completed / total_combinations) * 74)
+                self._report_progress(
+                    extraction_progress, 100,
+                    f"Fase 1/4: Segmento {completed}/{total_combinations} - {len(all_repositories)} repos"
+                )
                 
                 try:
                     segment_repos = future.result()
@@ -653,7 +690,7 @@ class IngestionEngine:
         Ejecuta búsquedas secuencialmente (modo legacy, 1 worker).
         
         Args:
-            segments: Lista de (min_stars, max_stars, year)
+            segments: Lista de (min_stars, max_stars, year, keyword)
             total_combinations: Total de segmentos
             max_results: Límite máximo de repos
             incremental_since: Fecha para filtro incremental
@@ -664,16 +701,23 @@ class IngestionEngine:
         all_repositories = {}
         query_count = 0
         
-        for min_stars, max_stars, year in segments:
+        for min_stars, max_stars, year, keyword in segments:
             if self.cancel_event and self.cancel_event.is_set():
                 break
             query_count += 1
-            segment_name = f"stars:{min_stars}..{max_stars} year:{year}"
+            segment_name = f"[{keyword}] stars:{min_stars}..{max_stars} year:{year}"
+
+            # Progreso granular durante extracción (0-74 de 100)
+            extraction_progress = int((query_count / total_combinations) * 74)
+            self._report_progress(
+                extraction_progress, 100,
+                f"Fase 1/4: Segmento {query_count}/{total_combinations} - {len(all_repositories)} repos"
+            )
             
             logger.info(f"\n📍 Consulta {query_count}/{total_combinations}: {segment_name}")
             
             segment_repos = self._search_single_segment(
-                min_stars, max_stars, year, incremental_since
+                min_stars, max_stars, year, incremental_since, keyword
             )
             
             # Agregar al conjunto total (evitando duplicados)
@@ -970,13 +1014,25 @@ class IngestionEngine:
                 logger.debug(f"❌ RECHAZADO [Archivado]: {repo_name} | {repo_url}")
                 continue
             
-            # 2. Filtro: Tiene descripción o README
+            # 2. Filtro: Blacklist (QuantumultX, Firefox Quantum, Non-QC conocidos)
+            if not RepositoryFilters.is_not_blacklisted(repo):
+                self.stats["filtered_by_blacklist"] += 1
+                logger.debug(f"❌ RECHAZADO [Blacklist FP]: {repo_name} | {repo_url}")
+                continue
+            
+            # 3. Filtro: Relevancia contextual QC
+            if not RepositoryFilters.has_quantum_relevance(repo):
+                self.stats["filtered_by_relevance"] += 1
+                logger.debug(f"❌ RECHAZADO [Sin relevancia QC]: {repo_name} | {repo_url}")
+                continue
+            
+            # 4. Filtro: Tiene descripción o README
             if not RepositoryFilters.has_description(repo):
                 self.stats["filtered_by_no_description"] += 1
                 logger.debug(f"❌ RECHAZADO [Sin descripción/README]: {repo_name} | {repo_url}")
                 continue
             
-            # 3. Filtro: Tamaño mínimo (commits y KB)
+            # 5. Filtro: Tamaño mínimo (commits y KB)
             if not RepositoryFilters.is_minimal_project(repo, min_commits=10, min_size_kb=10):
                 self.stats["filtered_by_minimal_project"] += 1
                 default_branch = repo.get("defaultBranchRef") or {}
@@ -987,26 +1043,26 @@ class IngestionEngine:
                 logger.debug(f"❌ RECHAZADO [Tamaño mínimo: {commits} commits, {size_kb} KB]: {repo_name} | {repo_url}")
                 continue
             
-            # 4. Filtro: Actividad reciente
+            # 6. Filtro: Actividad reciente
             if not RepositoryFilters.is_active(repo, self.config.max_inactivity_days):
                 self.stats["filtered_by_inactivity"] += 1
                 last_update = repo.get("updatedAt", "unknown")
                 logger.debug(f"❌ RECHAZADO [Inactivo desde {last_update}]: {repo_name} | {repo_url}")
                 continue
             
-            # 5. Filtro: Fork válido (si es fork, debe tener contribuciones propias)
+            # 7. Filtro: Fork válido (si es fork, debe tener contribuciones propias)
             if not RepositoryFilters.is_valid_fork(repo):
                 self.stats["filtered_by_fork"] += 1
                 logger.debug(f"❌ RECHAZADO [Fork sin contribuciones propias]: {repo_name} | {repo_url}")
                 continue
             
-            # 6. Filtro: Keywords cuánticas
+            # 8. Filtro: Keywords cuánticas
             if not RepositoryFilters.matches_keywords(repo, self.config.keywords):
                 self.stats["filtered_by_keywords"] += 1
                 logger.debug(f"❌ RECHAZADO [Sin keywords cuánticas]: {repo_name} | {repo_url}")
                 continue
             
-            # 7. Filtro: Lenguaje válido
+            # 9. Filtro: Lenguaje válido
             if not RepositoryFilters.has_valid_language(repo, self.config.languages):
                 self.stats["filtered_by_language"] += 1
                 primary_lang = (repo.get("primaryLanguage") or {}).get("name", "unknown")
@@ -1014,14 +1070,14 @@ class IngestionEngine:
                 logger.debug(f"❌ RECHAZADO [Lenguaje: primario={primary_lang}, secundarios={secondary_langs}]: {repo_name} | {repo_url}")
                 continue
             
-            # 8. Filtro: Estrellas mínimas
+            # 10. Filtro: Estrellas mínimas
             if not RepositoryFilters.has_minimum_stars(repo, self.config.min_stars):
                 self.stats["filtered_by_stars"] += 1
                 stars = repo.get("stargazerCount", 0)
                 logger.debug(f"❌ RECHAZADO [Pocas estrellas: {stars}]: {repo_name} | {repo_url}")
                 continue
             
-            # 9. Filtro: Engagement de comunidad (opcional pero recomendado)
+            # 11. Filtro: Engagement de comunidad (opcional pero recomendado)
             if not RepositoryFilters.has_community_engagement(repo, min_watchers=3, min_forks=1):
                 self.stats["filtered_by_community_engagement"] += 1
                 watchers = (repo.get("watchers") or {}).get("totalCount", 0)
@@ -1037,6 +1093,8 @@ class IngestionEngine:
         
         logger.info(f"Filtrado completado: {len(filtered)} repositorios válidos")
         logger.info(f"  - Rechazados por archivado: {self.stats['filtered_by_archived']}")
+        logger.info(f"  - Rechazados por blacklist FP: {self.stats.get('filtered_by_blacklist', 0)}")
+        logger.info(f"  - Rechazados por sin relevancia QC: {self.stats.get('filtered_by_relevance', 0)}")
         logger.info(f"  - Rechazados por falta de descripción: {self.stats['filtered_by_no_description']}")
         logger.info(f"  - Rechazados por tamaño mínimo: {self.stats['filtered_by_minimal_project']}")
         logger.info(f"  - Rechazados por inactividad: {self.stats['filtered_by_inactivity']}")
@@ -1187,6 +1245,8 @@ class IngestionEngine:
             },
             "filtering": {
                 "rejected_by_archived": self.stats["filtered_by_archived"],
+                "rejected_by_blacklist": self.stats.get("filtered_by_blacklist", 0),
+                "rejected_by_relevance": self.stats.get("filtered_by_relevance", 0),
                 "rejected_by_no_description": self.stats["filtered_by_no_description"],
                 "rejected_by_minimal_project": self.stats["filtered_by_minimal_project"],
                 "rejected_by_inactivity": self.stats["filtered_by_inactivity"],
@@ -1218,7 +1278,7 @@ class IngestionEngine:
         if self.incremental and db_context:
             is_up_to_date = (self.stats["total_found"] == 0)
             if is_up_to_date:
-                logger.info(f"\n✅ BASE DE DATOS AL DÍA — No se encontraron repositorios nuevos/actualizados")
+                logger.info(f"\n✅ BASE DE DATOS AL DÍA - No se encontraron repositorios nuevos/actualizados")
             logger.info(f"\n🗄️  Estado de la Base de Datos:")
             logger.info(f"  • Repositorios totales en BD: {db_context.get('total_repos_in_db', '?')}")
             logger.info(f"  • Enriquecidos completamente: {db_context.get('enriched_repos', '?')}")

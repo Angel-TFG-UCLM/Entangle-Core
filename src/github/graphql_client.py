@@ -119,16 +119,41 @@ class GitHubGraphQLClient:
                                     # Salir del for de errores para reintentar
                                     break
                                 else:
-                                    # Espera por defecto si no hay timestamp
-                                    logger.warning("⚠️ No se pudo obtener tiempo de reset. Esperando 1 hora...")
-                                    time.sleep(3600)
+                                    # No hay timestamp — consultar REST directamente
+                                    logger.warning("⚠️ No se obtuvo timestamp de reset. Consultando REST API...")
+                                    try:
+                                        fallback_info = self._get_rate_limit_rest()
+                                        fb_reset = fallback_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                                        if fb_reset > 0:
+                                            fb_wait = max(0, fb_reset - time.time()) + 5
+                                            logger.info(f"Esperando {fb_wait:.0f}s hasta reset real...")
+                                            time.sleep(fb_wait)
+                                        else:
+                                            logger.warning("Sin timestamp de reset. Esperando 120s por seguridad...")
+                                            time.sleep(120)
+                                    except Exception:
+                                        logger.warning("No se pudo consultar REST. Esperando 120s por seguridad...")
+                                        time.sleep(120)
                                     break
                                     
                             except Exception as rate_err:
                                 logger.error(f"❌ Error obteniendo rate limit REST: {rate_err}")
-                                # Espera por defecto
-                                logger.info("Esperando 1 hora por defecto...")
-                                time.sleep(3600)
+                                # Reintentar obtener timestamp con retry
+                                logger.info("Reintentando obtener timestamp de reset...")
+                                try:
+                                    time.sleep(5)
+                                    retry_info = self._get_rate_limit_rest()
+                                    retry_reset = retry_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                                    if retry_reset > 0:
+                                        retry_wait = max(0, retry_reset - time.time()) + 5
+                                        logger.info(f"Esperando {retry_wait:.0f}s hasta reset real...")
+                                        time.sleep(retry_wait)
+                                    else:
+                                        logger.warning("Sin timestamp. Esperando 120s por seguridad...")
+                                        time.sleep(120)
+                                except Exception:
+                                    logger.warning("No se pudo consultar REST. Esperando 120s por seguridad...")
+                                    time.sleep(120)
                                 break
                     
                     # Si detectamos rate limit, continuar al siguiente intento
@@ -185,8 +210,18 @@ class GitHubGraphQLClient:
                         if retry_after:
                             wait_time = int(retry_after) + 2  # +2s margen
                         else:
-                            # Backoff exponencial: 60s, 120s, 240s...
-                            wait_time = 60 * (2 ** attempt)
+                            # Consultar el timestamp real de reset vía REST API
+                            try:
+                                rest_info = self._get_rate_limit_rest()
+                                core_reset = rest_info.get('resources', {}).get('core', {}).get('reset', 0)
+                                graphql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                                reset_ts = max(core_reset, graphql_reset)
+                                if reset_ts > 0:
+                                    wait_time = max(0, reset_ts - time.time()) + 5
+                                else:
+                                    wait_time = 120  # Fallback conservador
+                            except Exception:
+                                wait_time = 120  # Fallback conservador
                         
                         logger.warning(
                             f"⚠️ Secondary rate limit (403) detectado. "
@@ -589,7 +624,8 @@ class GitHubGraphQLClient:
         max_stars: int = 999999,
         created_year: int = 2020,
         max_results: Optional[int] = 1000,
-        pushed_after: Optional[str] = None
+        pushed_after: Optional[str] = None,
+        search_keyword: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Busca repositorios en un segmento específico (estrellas + año de creación).
@@ -605,6 +641,8 @@ class GitHubGraphQLClient:
             max_results: Máximo de resultados para este segmento (default 1000)
             pushed_after: Fecha ISO (YYYY-MM-DD) para filtrar repos actualizados después de esta fecha.
                           Usado en modo incremental para reducir consultas API.
+            search_keyword: Keyword específica para buscar. Si None, usa config.keywords[0].
+                           Permite búsquedas separadas por keyword (qiskit, cirq, etc.)
             
         Returns:
             Lista de repositorios del segmento especificado
@@ -616,11 +654,13 @@ class GitHubGraphQLClient:
         # Construir query base con keywords y lenguajes
         query_parts = []
         
-        # Keyword principal (solo la primera, sin comillas si tiene espacios)
-        if config.keywords:
-            # Usar solo la primera keyword para simplificar
-            main_keyword = config.keywords[0]
-            query_parts.append(main_keyword)
+        # Keyword de búsqueda
+        if search_keyword:
+            # Usar la keyword específica proporcionada
+            query_parts.append(search_keyword)
+        elif config.keywords:
+            # Fallback: primera keyword del config
+            query_parts.append(config.keywords[0])
         
         # Segmentación por estrellas
         query_parts.append(f"stars:{min_stars}..{max_stars}")
@@ -792,7 +832,16 @@ class GitHubGraphQLClient:
             except Exception as e:
                 page_retries += 1
                 if page_retries <= max_page_retries:
-                    wait_time = 60 * page_retries  # 60s, 120s, 180s
+                    # Consultar timestamp real de reset antes de reintentar
+                    try:
+                        rest_info = self._get_rate_limit_rest()
+                        gql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                        if gql_reset > 0:
+                            wait_time = max(0, gql_reset - time.time()) + 5
+                        else:
+                            wait_time = 60 * page_retries
+                    except Exception:
+                        wait_time = 60 * page_retries
                     logger.warning(
                         f"⚠️ Error en paginación del segmento (intento {page_retries}/{max_page_retries}): {e}. "
                         f"Reintentando en {wait_time}s..."

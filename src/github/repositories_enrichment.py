@@ -257,9 +257,20 @@ class EnrichmentEngine:
                 
         except Exception as e:
             logger.error(f"❌ Error esperando reset de rate limit: {e}")
-            # Esperar 60 segundos por defecto
-            logger.warning("⏳ Esperando 60 segundos por seguridad...")
-            time.sleep(60)
+            # Consultar timestamp real vía REST API en vez de sleep arbitrario
+            try:
+                rest_info = self.graphql_client._get_rate_limit_rest()
+                gql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                if gql_reset > 0:
+                    fallback_wait = max(0, gql_reset - time.time()) + 5
+                    logger.warning(f"⏳ Esperando {fallback_wait:.0f}s hasta reset real (vía REST)...")
+                    time.sleep(fallback_wait)
+                else:
+                    logger.warning("⏳ Sin timestamp de reset disponible. Esperando 120s por seguridad...")
+                    time.sleep(120)
+            except Exception:
+                logger.warning("⏳ No se pudo consultar REST API. Esperando 120s por seguridad...")
+                time.sleep(120)
     
     def _retry_with_backoff(self, func, *args, **kwargs) -> Any:
         """
@@ -331,8 +342,22 @@ class EnrichmentEngine:
                                 except (ValueError, TypeError):
                                     pass
                         
-                        # Tiempo de espera: Retry-After + 5s margen, o backoff exponencial
-                        wait_time = (retry_after + 5) if retry_after else min(60 * (2 ** attempt), 300)
+                        # Tiempo de espera: Retry-After + 5s margen, o consultar REST API para reset real
+                        if retry_after:
+                            wait_time = retry_after + 5
+                        else:
+                            # Consultar timestamp real de reset vía REST API
+                            try:
+                                rest_info = self.graphql_client._get_rate_limit_rest()
+                                core_reset = rest_info.get('resources', {}).get('core', {}).get('reset', 0)
+                                gql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                                reset_ts = max(core_reset, gql_reset)
+                                if reset_ts > 0:
+                                    wait_time = max(0, reset_ts - time.time()) + 5
+                                else:
+                                    wait_time = 120  # Fallback conservador
+                            except Exception:
+                                wait_time = 120  # Fallback conservador
                         
                         # ═══ COORDINACIÓN: Solo el PRIMER hilo loguea y marca ═══
                         with self._rate_limit_lock:

@@ -1,6 +1,6 @@
 {
   "description": "Configuración de criterios de ingesta para repositorios de software cuántico",
-  "version": "2.0",
+  "version": "3.0",
   "keywords": [
     "quantum",
     "qiskit",
@@ -73,6 +73,16 @@
     "quantum measurement",
     "quantum decoherence",
     "quantum noise"
+  ],
+  "search_keywords": [
+    "quantum",
+    "qiskit",
+    "cirq",
+    "pennylane",
+    "braket",
+    "pyquil",
+    "openqasm",
+    "projectq"
   ],
   "languages": [
     "Python",

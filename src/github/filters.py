@@ -9,6 +9,7 @@ relacionados con software cuántico.
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 import logging
+import re
 
 # Usar logging directo para evitar importaciones circulares
 logger = logging.getLogger(__name__)
@@ -64,6 +65,87 @@ def _has_strong_keywords(text: str, keywords: List[str]) -> bool:
         if keyword.lower() in text:
             return True
     return False
+
+
+# ============================================================================
+# Constantes para filtro de relevancia contextual
+# ============================================================================
+
+# Patrones que NUNCA son computación cuántica
+NON_QC_BLACKLIST_PATTERNS = [
+    r"\bquantumult\b",                          # Proxy iOS (QuantumultX)
+    r"\bquantumultx\b",                         # QuantumultX variante
+    r"firefox[\s._-]*quantum",                  # Firefox Quantum
+    r"\bquantum[\s._-]*ui\b",                   # UI frameworks genéricos
+    r"\bquantumui\b",                            # UI framework AngularJS
+    r"\bminecraft\b.*\bquantum|quantum.*\bminecraft\b",  # Gaming
+    r"\bdrum[\s._-]*machine\b",                  # Music
+    r"\breact[\s._-]*quantum\b|\bquantum[\s._-]*react\b",  # React perf tools
+]
+
+# Repos específicos conocidos como Non-QC (por full_name / nameWithOwner)
+NON_QC_KNOWN_REPOS = {
+    "sahibzada-allahyar/yc-killer",         # AI agents enterprise
+    "joaomilho/enterprise",                 # lenguaje satírico
+    "nashvail/quttons",                     # botones CSS "Quantum Paper"
+    "bloomberg/quantum",                    # C++ coroutine dispatcher
+    "foxyproxy/firefox-extension",          # extensión Firefox proxy
+    "atilafassina/quantum",                 # Tauri + SolidStart
+    "rafaelgoulartb/next-ecommerce",        # "Quantum Ecommerce" Next.js
+    "rodyherrera/quantum",                  # alternativa a Vercel/Heroku
+    "quantumui/quantumui",                  # UI framework AngularJS
+    "mrmayman/quantumlauncher",             # Minecraft launcher
+    "kareldonk/quantumgate",                # P2P protocol C++
+    "fox-it/quantuminsert",                 # herramienta seguridad NSA
+    "heydon/beadz-drum-machine",            # drum machine
+    "reactquantum/reactquantum",            # React performance tool
+}
+
+# Keywords QC reales para validación de relevancia contextual
+REAL_QC_KEYWORDS = [
+    # Frameworks y SDKs
+    "qiskit", "cirq", "pennylane", "braket", "pyquil", "projectq",
+    "strawberry fields", "ocean sdk", "openqasm", "qasm", "quil",
+    "tket", "pytket", "stim", "quirk", "silq",
+    # Conceptos core
+    "qubit", "qubits", "superposition", "entanglement", "decoherence",
+    "quantum gate", "quantum circuit", "quantum state", "bloch sphere",
+    "hamiltonian", "unitary", "hermitian", "density matrix",
+    "wave function", "wavefunction", "quantum mechanics",
+    "quantum physics", "quantum theory",
+    # Algoritmos
+    "grover", "shor", "vqe", "qaoa", "qft", "quantum fourier",
+    "quantum walk", "quantum annealing", "adiabatic",
+    "variational quantum", "quantum approximate",
+    # Hardware
+    "quantum processor", "quantum computer", "qpu", "nisq",
+    "fault.tolerant", "topological quantum", "trapped.ion",
+    "superconducting qubit", "transmon", "quantum hardware",
+    # Campos de estudio
+    "quantum machine learning", "quantum chemistry", "quantum simulation",
+    "quantum error correction", "quantum key distribution", "qkd",
+    "quantum teleportation", "quantum cryptography",
+    "quantum information", "quantum computing",
+    "quantum programming", "quantum software",
+    "quantum neural network", "qnn",
+    "quantum optics", "photonic quantum",
+    # Proveedores
+    "ibm quantum", "google quantum", "azure quantum", "aws quantum",
+    "rigetti", "ionq", "d-wave", "xanadu", "zapata",
+    # Post-quantum (mantener en scope)
+    "post-quantum", "post quantum", "pqc", "lattice-based",
+    "code-based cryptography", "hash-based signature",
+    # Otros QC
+    "quantum spin", "many-body", "quantum field",
+    "quantum dynamics", "quantum control",
+    "quantum sensing", "quantum metrology",
+    "quantum communication", "quantum network",
+    "quantum internet", "quantum channel",
+    "quantum espresso", "quantum optics",
+    "quantum transport", "quantum dot",
+    "quantum tomography", "quantum noise",
+    "quantum measurement", "quantum state",
+]
 
 
 # ============================================================================
@@ -500,6 +582,147 @@ class RepositoryFilters:
         
         return True
 
+    @staticmethod
+    def is_not_blacklisted(repo: Dict[str, Any]) -> bool:
+        """
+        Verifica que el repositorio NO esté en la blacklist de falsos positivos.
+        
+        Comprueba:
+        1. Lista de repos conocidos como Non-QC (por nombre exacto)
+        2. Patrones regex de contextos no-QC (QuantumultX, Firefox Quantum, etc.)
+        
+        Args:
+            repo: Repositorio a evaluar
+            
+        Returns:
+            True si NO está blacklisted (pasa el filtro), False si es un FP conocido
+        """
+        # Obtener identificador del repo
+        name_with_owner = (
+            repo.get("nameWithOwner") or repo.get("name_with_owner") or ""
+        ).lower()
+        
+        # 1. Verificar contra lista de repos conocidos
+        if name_with_owner in NON_QC_KNOWN_REPOS:
+            logger.debug(
+                f"Repo rechazado (blacklist - Non-QC conocido): "
+                f"{repo.get('nameWithOwner', name_with_owner)}"
+            )
+            return False
+        
+        # 2. Verificar contra patrones regex en texto buscable
+        searchable_text = _get_searchable_text(repo)
+        name = repo.get("name", "").lower()
+        
+        for pattern in NON_QC_BLACKLIST_PATTERNS:
+            if re.search(pattern, searchable_text, re.IGNORECASE):
+                logger.debug(
+                    f"Repo rechazado (blacklist - patrón '{pattern}'): "
+                    f"{repo.get('nameWithOwner', name_with_owner)}"
+                )
+                return False
+        
+        return True
+
+    @staticmethod
+    def has_quantum_relevance(repo: Dict[str, Any]) -> bool:
+        """
+        Verifica relevancia contextual para repos que contienen 'quantum'.
+        
+        Para repos que matchean la keyword genérica 'quantum' pero no contienen
+        keywords QC específicas (qiskit, cirq, qubit, etc.), aplica verificación
+        adicional para descartar usos de 'quantum' como marca o nombre sin
+        relación con computación cuántica.
+        
+        Lógica:
+        - Si el repo contiene al menos 1 keyword QC específica → PASA
+        - Si el repo NO contiene 'quantum' en absoluto → PASA (otro keyword lo trajo)
+        - Si contiene solo 'quantum' genérico sin keywords QC:
+          → Se requieren al menos 2 señales de contexto QC → PASA
+          → Si no, RECHAZA
+        
+        Args:
+            repo: Repositorio a evaluar
+            
+        Returns:
+            True si es relevante para QC, False si parece un FP
+        """
+        searchable_text = _get_searchable_text(repo)
+        name = (repo.get("name") or "").lower()
+        description = (repo.get("description") or "").lower()
+        
+        # Si no contiene "quantum" en absoluto, no aplicar este filtro
+        # (fue encontrado por otra keyword como qiskit/cirq)
+        if "quantum" not in searchable_text:
+            return True
+        
+        # Buscar keywords QC específicas en el texto
+        qc_keywords_found = []
+        for kw in REAL_QC_KEYWORDS:
+            # Flexibilizar separadores (puntos, guiones, espacios)
+            pattern = re.escape(kw).replace(r"\.", r"[\s._-]?")
+            if re.search(pattern, searchable_text, re.IGNORECASE):
+                qc_keywords_found.append(kw)
+        
+        # Si tiene al menos 1 keyword QC específica → relevante
+        if qc_keywords_found:
+            logger.debug(
+                f"Repo aceptado (relevancia QC confirmada - keywords: "
+                f"{', '.join(qc_keywords_found[:3])}): "
+                f"{repo.get('nameWithOwner')}"
+            )
+            return True
+        
+        # Solo tiene "quantum" genérico, sin keywords QC específicas
+        # Verificar señales de contexto (topics QC, patrones de README)
+        context_signals = 0
+        
+        # Señal 1: Topics relacionados con QC
+        topics = (repo.get("repositoryTopics") or {}).get("nodes", [])
+        qc_topic_patterns = [
+            "quantum", "physics", "simulation", "scientific",
+            "chemistry", "optics", "photon", "spin",
+        ]
+        for topic_node in topics:
+            topic_name = (topic_node.get("topic") or {}).get("name", "").lower()
+            for tp in qc_topic_patterns:
+                if tp in topic_name:
+                    context_signals += 1
+                    break
+        
+        # Señal 2: Lenguaje típico de QC (Python, C++, Julia, Q#)
+        primary_lang = (repo.get("primaryLanguage") or {}).get("name", "").lower()
+        if primary_lang in ["python", "julia", "q#", "c++", "rust"]:
+            context_signals += 1
+        
+        # Señal 3: Descripción contiene lenguaje científico/técnico
+        scientific_terms = [
+            "simulation", "algorithm", "model", "solver", "library",
+            "framework", "toolkit", "package", "dynamics", "system",
+            "theory", "physics", "calculation", "matrix", "computation",
+            "operator", "eigenvalue", "equation", "numerical",
+        ]
+        scientific_matches = sum(1 for t in scientific_terms if t in description)
+        if scientific_matches >= 2:
+            context_signals += 1
+        
+        # Necesita al menos 2 señales de contexto
+        if context_signals >= 2:
+            logger.debug(
+                f"Repo aceptado (relevancia QC por contexto - "
+                f"{context_signals} señales): "
+                f"{repo.get('nameWithOwner')}"
+            )
+            return True
+        
+        # Sin suficientes señales de QC
+        logger.debug(
+            f"Repo rechazado (sin relevancia QC - 'quantum' genérico, "
+            f"solo {context_signals} señales de contexto): "
+            f"{repo.get('nameWithOwner')}"
+        )
+        return False
+
 
 # Funciones helper para usar filtros individuales fácilmente
 
@@ -630,35 +853,43 @@ def apply_all_filters(
     filtered = [r for r in filtered if RepositoryFilters.is_not_archived(r)]
     logger.info(f"  Después de filtro archivados: {len(filtered)}")
     
-    # 2. Documentación (mover antes de actividad para rechazar rápido proyectos sin docs)
+    # 2. Blacklist (falsos positivos conocidos - QuantumultX, Firefox Quantum, etc.)
+    filtered = [r for r in filtered if RepositoryFilters.is_not_blacklisted(r)]
+    logger.info(f"  Después de filtro blacklist: {len(filtered)}")
+    
+    # 3. Relevancia contextual (verificar que 'quantum' sea QC, no marca/nombre)
+    filtered = [r for r in filtered if RepositoryFilters.has_quantum_relevance(r)]
+    logger.info(f"  Después de filtro relevancia QC: {len(filtered)}")
+    
+    # 4. Documentación (mover antes de actividad para rechazar rápido proyectos sin docs)
     filtered = filter_by_documentation(filtered)
     logger.info(f"  Después de filtro documentación: {len(filtered)}")
     
-    # 3. Tamaño mínimo
+    # 5. Tamaño mínimo
     filtered = filter_by_project_size(filtered, min_commits, min_size_kb)
     logger.info(f"  Después de filtro tamaño: {len(filtered)}")
     
-    # 4. Actividad reciente
+    # 6. Actividad reciente
     filtered = filter_by_activity(filtered, max_inactivity_days)
     logger.info(f"  Después de filtro actividad: {len(filtered)}")
     
-    # 5. Forks válidos
+    # 7. Forks válidos
     filtered = filter_by_fork_validity(filtered)
     logger.info(f"  Después de filtro forks: {len(filtered)}")
     
-    # 6. Keywords
+    # 8. Keywords
     filtered = filter_by_keywords(filtered, keywords)
     logger.info(f"  Después de filtro keywords: {len(filtered)}")
     
-    # 7. Lenguaje (con lógica inteligente que usa strong_keywords para override)
+    # 9. Lenguaje (con lógica inteligente que usa strong_keywords para override)
     filtered = filter_by_language(filtered, valid_languages, strong_keywords)
     logger.info(f"  Después de filtro lenguaje: {len(filtered)}")
     
-    # 8. Estrellas
+    # 10. Estrellas
     filtered = [r for r in filtered if RepositoryFilters.has_minimum_stars(r, min_stars)]
     logger.info(f"  Después de filtro estrellas: {len(filtered)}")
     
-    # 9. Community engagement
+    # 11. Community engagement
     filtered = [r for r in filtered if RepositoryFilters.has_community_engagement(r)]
     logger.info(f"  Después de filtro engagement: {len(filtered)}")
     
