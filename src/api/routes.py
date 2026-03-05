@@ -142,7 +142,8 @@ async def get_dashboard_stats(
     language: Optional[str] = Query(default=None, description="Filtrar por lenguaje de programación"),
     repo: Optional[str] = Query(default=None, description="Filtrar por repositorio (full_name)"),
     collab_type: Optional[str] = Query(default=None, description="Tipo de colaborador: 'contributors' (con commits), 'reviewers' (solo mencionables), 'all'"),
-    include_bots: bool = Query(default=False, description="Incluir cuentas de bots en el análisis de colaboradores")
+    include_bots: bool = Query(default=False, description="Incluir cuentas de bots en el análisis de colaboradores"),
+    discipline: Optional[str] = Query(default=None, description="Filtrar colaboradores por disciplina (e.g. 'quantum_algorithms', 'hardware_engineering')")
 ):
     """
     Endpoint COMPLETO para dashboard con sistema de caché MongoDB.
@@ -175,7 +176,7 @@ async def get_dashboard_stats(
         
         # Detectar si hay filtros activos
         # include_bots=False es el default, solo cuenta como filtro si es True
-        has_filters = bool(org or language or repo or collab_type or include_bots)
+        has_filters = bool(org or language or repo or collab_type or include_bots or discipline)
         
         # 1. INTENTAR OBTENER CACHÉ (solo si no hay filtros y no se fuerza refresh)
         # Caché PERMANENTE: sin TTL, persiste hasta invalidación explícita
@@ -197,7 +198,7 @@ async def get_dashboard_stats(
         
         # Log de filtros activos
         if has_filters:
-            logger.info(f"📊 Calculando dashboard stats CON FILTROS: org={org}, language={language}, repo={repo}")
+            logger.info(f"📊 Calculando dashboard stats CON FILTROS: org={org}, language={language}, repo={repo}, discipline={discipline}")
         else:
             logger.info("📊 Calculando dashboard stats COMPLETO desde MongoDB...")
         
@@ -205,6 +206,49 @@ async def get_dashboard_stats(
         repos_collection = db.get_collection("repositories")
         users_collection = db.get_collection("users")
         orgs_collection = db.get_collection("organizations")
+        
+        # === Cargar node_metrics para features de disciplina ===
+        # Se usa para: 1) filtro de disciplina, 2) distribución filtrada por disciplina
+        _node_metrics_data = None   # Objeto completo de network_metrics
+        _node_metrics = {}          # Diccionario node_id → métricas
+        _login_to_discipline = {}   # Fallback: login → discipline (documento compacto)
+        if has_filters:
+            try:
+                import orjson as _orjson
+                cache_data = _network_metrics_cache.get("json_bytes")
+                if cache_data:
+                    _node_metrics_data = _orjson.loads(cache_data)
+                    _node_metrics = _node_metrics_data.get("node_metrics", {})
+                else:
+                    from ..core.chunked_cache import load_chunked
+                    _node_metrics_data = load_chunked(metrics_collection, "network_metrics")
+                    _node_metrics = _node_metrics_data.get("node_metrics", {}) if _node_metrics_data else {}
+            except Exception as nm_err:
+                logger.warning(f"⚠️ No se pudo cargar node_metrics: {nm_err}")
+            
+            # Fallback: si _node_metrics está vacío, cargar mapeo compacto user_disciplines
+            if not _node_metrics:
+                try:
+                    _disc_doc = metrics_collection.find_one({"_id": "user_disciplines"})
+                    if _disc_doc and _disc_doc.get("mapping"):
+                        _login_to_discipline = _disc_doc["mapping"]
+                        logger.info(f"📋 Fallback: cargado user_disciplines con {len(_login_to_discipline)} usuarios")
+                except Exception as disc_err:
+                    logger.warning(f"⚠️ No se pudo cargar user_disciplines fallback: {disc_err}")
+        
+        # === Construir set de logins por disciplina (si filtro activo) ===
+        discipline_logins = None
+        if discipline and (_node_metrics or _login_to_discipline):
+            discipline_logins = set()
+            if _node_metrics:
+                for node_id, m in _node_metrics.items():
+                    if node_id.startswith("user_") and m.get("discipline") == discipline:
+                        discipline_logins.add(node_id[5:])  # Strip "user_" prefix
+            else:
+                for login, disc in _login_to_discipline.items():
+                    if disc == discipline:
+                        discipline_logins.add(login)
+            logger.info(f"🔬 Filtro disciplina '{discipline}': {len(discipline_logins)} usuarios encontrados")
         
         # === Construir filtros base para MongoDB ===
         repo_filter = {}
@@ -699,16 +743,25 @@ async def get_dashboard_stats(
                     collaborators = [c for c in collaborators if c.get("is_mentionable", False) and not c.get("has_commits", False)]
                 # collab_type == "all" o None -> no filtrar
                 
+                # Filtrar por disciplina si aplica
+                if discipline_logins is not None:
+                    collaborators = [c for c in collaborators if c.get("login") in discipline_logins]
+                
                 # Enriquecer con info de users
+                # collab_score = round(sqrt(contributions × repos × 100))
+                # En contexto de single repo: repos=1, así que el orden no cambia vs contributions
+                import math
                 chart_users = []
                 for collab in sorted(collaborators, key=lambda x: x.get("contributions", 0), reverse=True)[:10]:
                     user_info = users_collection.find_one({"login": collab.get("login")})
+                    c = collab.get("contributions", 0)
                     chart_users.append({
                         "login": collab.get("login"),
                         "name": user_info.get("name") if user_info else None,
                         "avatar_url": collab.get("avatar_url") or (user_info.get("avatar_url") if user_info else None),
                         "relevant_repos_count": 1,
-                        "total_contributions": collab.get("contributions", 0),
+                        "total_contributions": c,
+                        "collab_score": round(math.sqrt(c * 1 * 100)),
                         "has_commits": collab.get("has_commits", False),
                         "is_mentionable": collab.get("is_mentionable", False),
                         "total_commit_contributions": user_info.get("total_commit_contributions", 0) if user_info else 0,
@@ -729,6 +782,8 @@ async def get_dashboard_stats(
                         "website_url": user_info.get("website_url") if user_info else None,
                         "twitter_username": user_info.get("twitter_username") if user_info else None,
                         "is_hireable": user_info.get("is_hireable", False) if user_info else False,
+                        "is_enriched": user_info.get("enrichment_status", {}).get("is_complete", False) if user_info else False,
+                        "contributions_to_quantum_repos": collab.get("contributions", 0),
                     })
             else:
                 chart_users = []
@@ -785,7 +840,11 @@ async def get_dashboard_stats(
                     "is_mentionable": {"$max": {"$ifNull": ["$collaborators.is_mentionable", False]}}
                 }},
                 {"$match": {"_id": {"$ne": None}}},
-                {"$sort": {"total_contributions": -1, "repos_in_language": -1}},
+                # collab_score = round(sqrt(contributions × repos × 100))
+                {"$addFields": {
+                    "collab_score": {"$round": [{"$sqrt": {"$multiply": ["$total_contributions", "$repos_in_language", 100]}}, 0]}
+                }},
+                {"$sort": {"collab_score": -1, "total_contributions": -1}},
                 {"$limit": 10},
                 {"$lookup": {
                     "from": "users",
@@ -802,6 +861,7 @@ async def get_dashboard_stats(
                     "total_contributions": 1,
                     "has_commits": 1,
                     "is_mentionable": 1,
+                    "collab_score": 1,
                     "total_commit_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_commit_contributions", 0]}, 0]},
                     "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
                     "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
@@ -819,9 +879,17 @@ async def get_dashboard_stats(
                     "url": {"$arrayElemAt": ["$user_info.url", 0]},
                     "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
                     "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
-                    "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
+                    "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]},
+                    "is_enriched": {"$ifNull": [{"$arrayElemAt": ["$user_info.enrichment_status.is_complete", 0]}, False]},
+                    "contributions_to_quantum_repos": "$total_contributions"
                 }}
             ])
+            # Insertar filtro de disciplina antes del $sort si aplica
+            if discipline_logins is not None:
+                for i, stage in enumerate(top_users_pipeline):
+                    if "$sort" in stage:
+                        top_users_pipeline.insert(i, {"$match": {"_id": {"$in": list(discipline_logins)}}})
+                        break
             chart_users = list(repos_collection.aggregate(top_users_pipeline))
         else:
             # Sin filtro de lenguaje ni repo
@@ -866,7 +934,11 @@ async def get_dashboard_stats(
                         "is_mentionable": {"$max": {"$ifNull": ["$collaborators.is_mentionable", False]}}
                     }},
                     {"$match": {"_id": {"$ne": None}}},
-                    {"$sort": {"total_contributions": -1, "repos_count": -1}},
+                    # collab_score = round(sqrt(contributions × repos × 100))
+                    {"$addFields": {
+                        "collab_score": {"$round": [{"$sqrt": {"$multiply": ["$total_contributions", "$repos_count", 100]}}, 0]}
+                    }},
+                    {"$sort": {"collab_score": -1, "total_contributions": -1}},
                     {"$limit": 10},
                     {"$lookup": {
                         "from": "users",
@@ -883,6 +955,7 @@ async def get_dashboard_stats(
                         "total_contributions": 1,
                         "has_commits": 1,
                         "is_mentionable": 1,
+                        "collab_score": 1,
                         "total_commit_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_commit_contributions", 0]}, 0]},
                         "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
                         "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
@@ -900,15 +973,27 @@ async def get_dashboard_stats(
                         "url": {"$arrayElemAt": ["$user_info.url", 0]},
                         "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
                         "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
-                        "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
+                        "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]},
+                        "is_enriched": {"$ifNull": [{"$arrayElemAt": ["$user_info.enrichment_status.is_complete", 0]}, False]},
+                        "contributions_to_quantum_repos": "$total_contributions"
                     }}
                 ])
+                # Insertar filtro de disciplina antes del $sort si aplica
+                if discipline_logins is not None:
+                    for i, stage in enumerate(top_users_pipeline):
+                        if "$sort" in stage:
+                            top_users_pipeline.insert(i, {"$match": {"_id": {"$in": list(discipline_logins)}}})
+                            break
                 chart_users = list(repos_collection.aggregate(top_users_pipeline))
             else:
                 # Sin collab_type: usar datos pre-calculados de users collection
                 user_match = {"relevant_repos_count": {"$gt": 0}}
                 if user_filter:
                     user_match.update(user_filter)
+                
+                # Filtrar por disciplina directamente en el match inicial
+                if discipline_logins is not None:
+                    user_match["login"] = {"$in": list(discipline_logins)}
                 
                 top_users_pipeline = [
                     {"$match": user_match},
@@ -923,13 +1008,43 @@ async def get_dashboard_stats(
                         "total_pr_contributions": {"$ifNull": ["$total_pr_contributions", 0]},
                         "total_pr_review_contributions": {"$ifNull": ["$total_pr_review_contributions", 0]},
                         "total_issue_contributions": {"$ifNull": ["$total_issue_contributions", 0]},
+                        # contributionsCollection solo cubre el último año de GitHub.
+                        # Fallback: sumar contributions de extracted_from (all-time a repos trackeados)
                         "total_contributions": {
-                            "$add": [
-                                {"$ifNull": ["$total_commit_contributions", 0]},
-                                {"$ifNull": ["$total_pr_contributions", 0]},
-                                {"$ifNull": ["$total_pr_review_contributions", 0]},
-                                {"$ifNull": ["$total_issue_contributions", 0]}
-                            ]
+                            "$let": {
+                                "vars": {
+                                    "github_contribs": {
+                                        "$add": [
+                                            {"$ifNull": ["$total_commit_contributions", 0]},
+                                            {"$ifNull": ["$total_pr_contributions", 0]},
+                                            {"$ifNull": ["$total_pr_review_contributions", 0]},
+                                            {"$ifNull": ["$total_issue_contributions", 0]}
+                                        ]
+                                    },
+                                    "repo_contribs": {
+                                        "$reduce": {
+                                            "input": {"$ifNull": ["$extracted_from", []]},
+                                            "initialValue": 0,
+                                            "in": {"$add": ["$$value", {"$ifNull": ["$$this.contributions", 0]}]}
+                                        }
+                                    }
+                                },
+                                "in": {
+                                    "$cond": [
+                                        {"$gt": ["$$github_contribs", 0]},
+                                        "$$github_contribs",
+                                        "$$repo_contribs"
+                                    ]
+                                }
+                            }
+                        },
+                        # Contribuciones all-time a repos quantum (de extracted_from)
+                        "contributions_to_quantum_repos": {
+                            "$reduce": {
+                                "input": {"$ifNull": ["$extracted_from", []]},
+                                "initialValue": 0,
+                                "in": {"$add": ["$$value", {"$ifNull": ["$$this.contributions", 0]}]}
+                            }
                         },
                         "organizations": 1,
                         "bio": 1,
@@ -944,9 +1059,15 @@ async def get_dashboard_stats(
                         "url": 1,
                         "website_url": 1,
                         "twitter_username": 1,
-                        "is_hireable": {"$ifNull": ["$is_hireable", False]}
+                        "is_hireable": {"$ifNull": ["$is_hireable", False]},
+                        "is_enriched": {"$ifNull": ["$enrichment_status.is_complete", False]}
                     }},
-                    {"$sort": {"total_contributions": -1, "relevant_repos_count": -1}},
+                    # collab_score = round(sqrt(contributions × repos × 100))
+                    # Debe ser $addFields separado porque $total_contributions se computa en el $project anterior
+                    {"$addFields": {
+                        "collab_score": {"$round": [{"$sqrt": {"$multiply": ["$total_contributions", "$relevant_repos_count", 100]}}, 0]}
+                    }},
+                    {"$sort": {"collab_score": -1, "total_contributions": -1}},
                     {"$limit": 10}
                 ]
                 chart_users = list(users_collection.aggregate(top_users_pipeline))
@@ -1002,14 +1123,143 @@ async def get_dashboard_stats(
                 "url": {"$arrayElemAt": ["$user_info.url", 0]},
                 "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
                 "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
-                "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
+                "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]},
+                "is_enriched": {"$ifNull": [{"$arrayElemAt": ["$user_info.enrichment_status.is_complete", 0]}, False]},
+                "contributions_to_quantum_repos": "$total_contributions"
             }}
         ]
+        # Insertar filtro de disciplina antes del $sort si aplica
+        if discipline_logins is not None:
+            for i, stage in enumerate(multi_repo_user_pipeline):
+                if "$sort" in stage:
+                    multi_repo_user_pipeline.insert(i, {"$match": {"_id": {"$in": list(discipline_logins)}}})
+                    break
         # Filtrar bots si no se incluyen
         chart_users_by_repos_raw = list(repos_collection.aggregate(multi_repo_user_pipeline))
         if not include_bots:
             chart_users_by_repos_raw = [u for u in chart_users_by_repos_raw if not is_bot(u.get("login", ""))]
         chart_users_by_repos = chart_users_by_repos_raw[:10]
+        
+        # === DISTRIBUCIÓN DE DISCIPLINAS FILTRADA ===
+        # Paso 1: Obtener TODOS los logins filtrados (no depende de datos de disciplina)
+        # Paso 2: Si hay datos de disciplina, computar distribución en el backend
+        # Paso 3: Si no, devolver logins al frontend para cómputo client-side
+        filtered_discipline_dist = None
+        _filtered_collab_logins = None  # Fallback para frontend
+        
+        if has_filters:
+            _all_filtered_logins = set()
+            try:
+                if repo:
+                    # Collaborators from repo doc
+                    _rd = repos_collection.find_one({"full_name": repo})
+                    if _rd and _rd.get("collaborators"):
+                        _cc = _rd.get("collaborators", [])
+                        if not include_bots:
+                            _cc = [c for c in _cc if not is_bot(c.get("login", ""))]
+                        if collab_type == "contributors":
+                            _cc = [c for c in _cc if c.get("has_commits", False)]
+                        elif collab_type == "reviewers":
+                            _cc = [c for c in _cc if c.get("is_mentionable", False) and not c.get("has_commits", False)]
+                        if discipline_logins is not None:
+                            _cc = [c for c in _cc if c.get("login") in discipline_logins]
+                        _all_filtered_logins = {c.get("login") for c in _cc if c.get("login")}
+                elif language:
+                    # Lightweight pipeline: repos by language → all collaborator logins
+                    _lf = {"$or": [{"primary_language.name": language}, {"primary_language": language}]}
+                    if org:
+                        _lf = {"$and": [{"$or": _lf.pop("$or")}, {"$or": [{"owner.login": org}, {"organization.login": org}]}]}
+                    _pipe = [
+                        {"$match": _lf},
+                        {"$match": {"collaborators": {"$exists": True, "$ne": []}}},
+                        {"$unwind": "$collaborators"},
+                    ]
+                    if not include_bots:
+                        _pipe.append({"$match": {"collaborators.login": {"$not": {"$regex": "\\[bot\\]|^bot-|-bot$", "$options": "i"}}}})
+                    if collab_type == "contributors":
+                        _pipe.append({"$match": {"collaborators.has_commits": True}})
+                    elif collab_type == "reviewers":
+                        _pipe.append({"$match": {"collaborators.is_mentionable": True, "$or": [{"collaborators.has_commits": False}, {"collaborators.has_commits": {"$exists": False}}]}})
+                    _pipe.append({"$group": {"_id": "$collaborators.login"}})
+                    if discipline_logins is not None:
+                        _pipe.append({"$match": {"_id": {"$in": list(discipline_logins)}}})
+                    _all_filtered_logins = {r["_id"] for r in repos_collection.aggregate(_pipe) if r.get("_id")}
+                elif org or (collab_type and collab_type != "all") or not include_bots:
+                    # Lightweight pipeline from repos with org/collab filters
+                    _bm = {"collaborators": {"$exists": True, "$ne": []}}
+                    if org:
+                        _bm["$or"] = [{"owner.login": org}, {"organization.login": org}]
+                    _pipe = [{"$match": _bm}, {"$unwind": "$collaborators"}]
+                    if not include_bots:
+                        _pipe.append({"$match": {"collaborators.login": {"$not": {"$regex": "\\[bot\\]|^bot-|-bot$", "$options": "i"}}}})
+                    if collab_type == "contributors":
+                        _pipe.append({"$match": {"collaborators.has_commits": True}})
+                    elif collab_type == "reviewers":
+                        _pipe.append({"$match": {"collaborators.is_mentionable": True, "$or": [{"collaborators.has_commits": False}, {"collaborators.has_commits": {"$exists": False}}]}})
+                    _pipe.append({"$group": {"_id": "$collaborators.login"}})
+                    if discipline_logins is not None:
+                        _pipe.append({"$match": {"_id": {"$in": list(discipline_logins)}}})
+                    _all_filtered_logins = {r["_id"] for r in repos_collection.aggregate(_pipe) if r.get("_id")}
+                else:
+                    # Discipline-only or default filter → global users
+                    _um = {"relevant_repos_count": {"$gt": 0}}
+                    if discipline_logins is not None:
+                        _um["login"] = {"$in": list(discipline_logins)}
+                    _all_filtered_logins = {r["login"] for r in users_collection.find(_um, {"login": 1, "_id": 0})}
+            except Exception as _fl_err:
+                logger.warning(f"⚠️ Error computing filtered logins: {_fl_err}")
+            
+            # Paso 2: Computar distribución de disciplinas si tenemos datos
+            if _all_filtered_logins and (_node_metrics or _login_to_discipline):
+                try:
+                    _login_disc = {}
+                    if _node_metrics:
+                        for _nid, _nm in _node_metrics.items():
+                            if _nid.startswith("user_"):
+                                _d = _nm.get("discipline")
+                                if _d:
+                                    _login_disc[_nid[5:]] = _d
+                    else:
+                        _login_disc = dict(_login_to_discipline)
+                    
+                    if _login_disc:
+                        _dist = {}
+                        for _login in _all_filtered_logins:
+                            _d = _login_disc.get(_login)
+                            if _d:
+                                _dist[_d] = _dist.get(_d, 0) + 1
+                        
+                        _total = sum(_dist.values())
+                        _dist_pct = {k: round(v / _total * 100, 1) for k, v in _dist.items()} if _total > 0 else {}
+                        
+                        # Cross-discipline index: normalized Shannon entropy (0-100%)
+                        import math
+                        if _total > 0 and len(_dist) > 1:
+                            _entropy = -sum((v / _total) * math.log2(v / _total) for v in _dist.values() if v > 0)
+                            _max_entropy = math.log2(6)  # 6 discipline categories
+                            _cdi = round(_entropy / _max_entropy * 100, 1) if _max_entropy > 0 else 0
+                        else:
+                            _cdi = 0.0
+                        
+                        # Filter bridge profiles to only include users matching filters
+                        _existing_bridges = (_node_metrics_data or {}).get("discipline_analysis", {}).get("bridge_profiles", [])
+                        _filtered_bridges = [bp for bp in _existing_bridges if bp.get("login") in _all_filtered_logins]
+                        
+                        filtered_discipline_dist = {
+                            "distribution": _dist,
+                            "distribution_pct": _dist_pct,
+                            "total_classified": _total,
+                            "cross_discipline_index": _cdi,
+                            "bridge_profiles": _filtered_bridges[:20],
+                        }
+                        logger.info(f"📊 Distribución de disciplinas filtrada: {_total} usuarios, CDI={_cdi}%")
+                except Exception as _dd_err:
+                    logger.warning(f"⚠️ Error computing filtered discipline distribution: {_dd_err}")
+            
+            # Paso 3: Si no pudimos computar distribución pero sí logins, enviar al frontend
+            if not filtered_discipline_dist and _all_filtered_logins:
+                _filtered_collab_logins = list(_all_filtered_logins)
+                logger.info(f"📋 Enviando {len(_filtered_collab_logins)} logins filtrados para cómputo client-side")
         
         # === GRAFO: Nodos y enlaces pre-calculados ===
         # Top 15 orgs para el grafo
@@ -1125,7 +1375,9 @@ async def get_dashboard_stats(
                     "byContributions": chart_users,
                     "byRepos": chart_users_by_repos
                 },
-                "languageDistribution": language_distribution
+                "languageDistribution": language_distribution,
+                "disciplineDistribution": filtered_discipline_dist,
+                "filteredCollaboratorLogins": _filtered_collab_logins
             },
             "graph": {
                 "organizations": graph_orgs,
@@ -1148,7 +1400,8 @@ async def get_dashboard_stats(
                     "language": language,
                     "repo": repo,
                     "collab_type": collab_type,
-                    "include_bots": include_bots
+                    "include_bots": include_bots,
+                    "discipline": discipline
                 } if has_filters else None
             }
         }
@@ -2355,6 +2608,9 @@ async def get_network_metrics(
                 entry["discipline_color"] = m.get("discipline_color", "#888888")
                 entry["discipline_label"] = m.get("discipline_label", "")
                 entry["discipline_confidence"] = m.get("discipline_confidence", 0)
+                # Multidisciplinary users: include top discipline colors for cycling animation
+                if m.get("discipline_top_colors"):
+                    entry["discipline_top_colors"] = m["discipline_top_colors"]
             compact_node_metrics[node_id] = entry
         
         # Comunidades compactas
@@ -2398,6 +2654,23 @@ async def get_network_metrics(
                 )
             except Exception as mongo_err:
                 logger.warning(f"[NetworkMetrics] No se pudo persistir a MongoDB: {mongo_err}")
+            
+            # Guardar mapeo compacto login→discipline (documento pequeño, siempre persiste)
+            # Usado como fallback por dashboard/stats cuando _node_metrics no está disponible
+            try:
+                _disc_mapping = {}
+                for _nid, _nm in compact_node_metrics.items():
+                    if _nid.startswith("user_") and _nm.get("discipline"):
+                        _disc_mapping[_nid[5:]] = _nm["discipline"]
+                if _disc_mapping:
+                    metrics_collection.replace_one(
+                        {"_id": "user_disciplines"},
+                        {"_id": "user_disciplines", "mapping": _disc_mapping, "_cached_at": datetime.utcnow()},
+                        upsert=True
+                    )
+                    logger.info(f"[NetworkMetrics] Guardado mapeo user_disciplines: {len(_disc_mapping)} usuarios")
+            except Exception as disc_err:
+                logger.warning(f"[NetworkMetrics] No se pudo guardar user_disciplines: {disc_err}")
         
         cache_label = "sin cachear (filtro temporal)" if has_temporal_filter else "cacheado en memoria + MongoDB"
         logger.info(
@@ -2684,6 +2957,79 @@ async def get_user_by_id(user_id: str):
         return user
     except Exception as e:
         logger.error(f"Error al obtener usuario: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/users/profile/{login}")
+async def get_user_profile(login: str):
+    """
+    Obtiene el perfil completo de un usuario por login.
+    Devuelve los mismos campos que el chart de usuarios para consistencia.
+    Usado cuando el usuario no está en el top 10 del dashboard.
+    """
+    try:
+        from ..core.db import db
+
+        user_collection = db.get_collection("users")
+        user = user_collection.find_one(
+            {"login": login},
+            {
+                "_id": 0,
+                "id": 1,
+                "login": 1,
+                "name": 1,
+                "avatar_url": 1,
+                "relevant_repos_count": 1,
+                "total_commit_contributions": 1,
+                "total_pr_contributions": 1,
+                "total_pr_review_contributions": 1,
+                "total_issue_contributions": 1,
+                "organizations": 1,
+                "bio": 1,
+                "company": 1,
+                "location": 1,
+                "created_at": 1,
+                "followers_count": 1,
+                "following_count": 1,
+                "public_repos_count": 1,
+                "top_languages": 1,
+                "quantum_expertise_score": 1,
+                "url": 1,
+                "website_url": 1,
+                "twitter_username": 1,
+                "is_hireable": 1,
+                "extracted_from": 1,
+                "enrichment_status": 1,
+                "has_commits": 1,
+                "is_mentionable": 1,
+            }
+        )
+
+        if not user:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        # Calcular total_contributions con fallback a extracted_from
+        github_contribs = (
+            (user.get("total_commit_contributions") or 0)
+            + (user.get("total_pr_contributions") or 0)
+            + (user.get("total_pr_review_contributions") or 0)
+            + (user.get("total_issue_contributions") or 0)
+        )
+        extracted_from = user.get("extracted_from", [])
+        repo_contribs = sum(e.get("contributions", 0) for e in extracted_from)
+        user["total_contributions"] = github_contribs if github_contribs > 0 else repo_contribs
+        user["contributions_to_quantum_repos"] = repo_contribs
+        user["is_enriched"] = user.get("enrichment_status", {}).get("is_complete", False)
+
+        # Limpiar campos internos pesados
+        user.pop("extracted_from", None)
+        user.pop("enrichment_status", None)
+
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error al obtener perfil de usuario {login}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

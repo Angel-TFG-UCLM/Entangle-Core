@@ -35,6 +35,7 @@ DISCIPLINES = [
     "quantum_hardware",
     "classical_tooling",
     "education_research",
+    "multidisciplinary",
 ]
 
 DISCIPLINE_COLORS = {
@@ -43,6 +44,7 @@ DISCIPLINE_COLORS = {
     "quantum_hardware":  "#ff6b6b",   # Rojo
     "classical_tooling": "#ffd166",   # Amarillo
     "education_research":"#00ff9f",   # Verde
+    "multidisciplinary": "#e0e0ff",   # Blanco iridiscente (transiciona entre colores en frontend)
 }
 
 DISCIPLINE_LABELS = {
@@ -51,6 +53,7 @@ DISCIPLINE_LABELS = {
     "quantum_hardware":  "Quantum Hardware",
     "classical_tooling": "Classical Tooling",
     "education_research":"Education & Research",
+    "multidisciplinary": "Multidisciplinar",
 }
 
 # ============================================================================
@@ -282,8 +285,49 @@ def classify_user(
             "discipline_signals": [],
         }
 
-    best_disc = max(scores, key=scores.get)
-    best_score = scores[best_disc]
+    # Check for multidisciplinary profile: 2+ disciplines with meaningful scores
+    # where no single discipline clearly dominates
+    significant = sorted(
+        [(d, s) for d, s in scores.items() if d != "multidisciplinary" and s >= 1.5],
+        key=lambda x: x[1], reverse=True,
+    )
+    if len(significant) >= 2:
+        top_score = significant[0][1]
+        second_score = significant[1][1]
+        # Second discipline has ≥ 35% of top → spread is wide enough
+        if second_score / top_score >= 0.35:
+            # Multidisciplinary user!
+            # Confidence = how evenly spread (higher = more balanced)
+            top2_sum = top_score + second_score
+            balance = second_score / top_score  # 0.35..1.0
+            confidence = min(0.4 + balance * 0.6, 1.0)  # 0.61..1.0
+            # Collect the top discipline colors for frontend cycling
+            top_colors = [
+                {
+                    "discipline": d,
+                    "color": DISCIPLINE_COLORS[d],
+                    "label": DISCIPLINE_LABELS[d],
+                    "score_pct": round(s / total * 100, 1),
+                }
+                for d, s in significant[:4]  # Up to 4 disciplines
+            ]
+            all_signals = []
+            for d, _ in significant[:4]:
+                all_signals.extend(signals.get(d, [])[:2])
+            return {
+                "discipline": "multidisciplinary",
+                "discipline_color": DISCIPLINE_COLORS["multidisciplinary"],
+                "discipline_label": DISCIPLINE_LABELS["multidisciplinary"],
+                "discipline_confidence": round(confidence, 2),
+                "discipline_signals": all_signals[:6],
+                "discipline_top_colors": top_colors,
+            }
+
+    best_disc = max(
+        [(d, s) for d, s in scores.items() if d != "multidisciplinary"],
+        key=lambda x: x[1],
+    )
+    best_disc, best_score = best_disc
     confidence = min(best_score / max(total, 1), 1.0)
 
     # If confidence is very low (< 0.25) and best score < 3, classify as classical_tooling

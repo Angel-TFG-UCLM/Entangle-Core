@@ -523,6 +523,11 @@ class UserEnrichmentEngine:
             if quantum_repos:
                 updates["quantum_repositories"] = quantum_repos
                 updates["is_quantum_contributor"] = True
+                # Contribuciones all-time a repos quantum (sum de extracted_from)
+                # Útil porque contributionsCollection de GitHub solo cubre el último año
+                updates["contributions_to_quantum_repos"] = sum(
+                    r.get("contributions", 0) for r in quantum_repos
+                )
             
             # Métricas sociales calculadas
             social_metrics = self._calculate_social_metrics(user, updates)
