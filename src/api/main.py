@@ -8,6 +8,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from .routes import router
 from .admin_routes import admin_router
+from .chat_routes import chat_router
 from ..core.config import config
 from ..core.logger import logger
 from ..core.db import db
@@ -84,6 +85,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # Incluir rutas
 app.include_router(router, prefix="/api/v1", tags=["api"])
 app.include_router(admin_router, prefix="/api/v1", tags=["admin"])
+app.include_router(chat_router, prefix="/api/v1", tags=["chat"])
 
 
 if __name__ == "__main__":
