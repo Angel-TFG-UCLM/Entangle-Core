@@ -1907,13 +1907,43 @@ async def discover_collaboration(
                 if org_login and org_login not in org_logins_in_graph:
                     org_logins_in_graph.add(org_login)
         
+        # Pre-compute per-org graph stats from the data we already have
+        _org_repo_counts = {}   # org_login → count of repos in graph
+        _org_contrib_logins = {}  # org_login → set of contributor logins
+        _org_bridge_logins = {}   # org_login → set of bridge user logins
+        for login, repos_list in user_to_repos.items():
+            for r in repos_list:
+                owner = r.get("owner")
+                if not owner or owner not in org_logins_in_graph:
+                    continue
+                fn = r.get("full_name")
+                if fn not in connected_repos:
+                    continue
+                if owner not in _org_contrib_logins:
+                    _org_contrib_logins[owner] = set()
+                _org_contrib_logins[owner].add(login)
+                if login in human_bridge_users:
+                    if owner not in _org_bridge_logins:
+                        _org_bridge_logins[owner] = set()
+                    _org_bridge_logins[owner].add(login)
+        for repo in all_repos:
+            fn = repo.get("full_name")
+            if fn in connected_repos:
+                owner = repo.get("owner", {}).get("login", "")
+                if owner:
+                    _org_repo_counts[owner] = _org_repo_counts.get(owner, 0) + 1
+        
         for org_login in org_logins_in_graph:
             org_id = f"org_{org_login}"
             if org_id not in added_nodes:
                 org_doc = orgs_collection.find_one(
                     {"login": org_login},
-                    {"_id": 0, "name": 1, "avatar_url": 1,
-                     "quantum_focus_score": 1, "is_quantum_focused": 1}
+                    {"_id": 0, "name": 1, "avatar_url": 1, "description": 1, "location": 1,
+                     "is_verified": 1, "created_at": 1,
+                     "quantum_focus_score": 1, "is_quantum_focused": 1,
+                     "quantum_repositories_count": 1, "total_repositories_count": 1,
+                     "quantum_contributors_count": 1, "total_members_count": 1, "members_count": 1,
+                     "total_stars": 1, "top_languages": 1, "public_repos_count": 1}
                 )
                 nodes.append({
                     "id": org_id,
@@ -1921,8 +1951,21 @@ async def discover_collaboration(
                     "login": org_login,
                     "name": (org_doc.get("name") if org_doc else None) or org_login,
                     "avatar_url": org_doc.get("avatar_url") if org_doc else None,
+                    "description": org_doc.get("description") if org_doc else None,
+                    "location": org_doc.get("location") if org_doc else None,
+                    "is_verified": org_doc.get("is_verified", False) if org_doc else False,
+                    "created_at": org_doc.get("created_at") if org_doc else None,
                     "quantum_focus_score": org_doc.get("quantum_focus_score", 0) if org_doc else 0,
                     "is_quantum_focused": org_doc.get("is_quantum_focused", False) if org_doc else False,
+                    "quantum_repos_count": org_doc.get("quantum_repositories_count", 0) if org_doc else 0,
+                    "total_repos_count": org_doc.get("total_repositories_count") or org_doc.get("public_repos_count", 0) if org_doc else 0,
+                    "members_count": org_doc.get("total_members_count") or org_doc.get("members_count", 0) if org_doc else 0,
+                    "total_stars": org_doc.get("total_stars", 0) if org_doc else 0,
+                    "top_languages": (org_doc.get("top_languages") or [])[:5] if org_doc else [],
+                    # Graph-level stats (computed from current collaboration data)
+                    "graph_repos_count": _org_repo_counts.get(org_login, 0),
+                    "graph_contributors_count": len(_org_contrib_logins.get(org_login, set())),
+                    "graph_bridge_count": len(_org_bridge_logins.get(org_login, set())),
                 })
                 added_nodes.add(org_id)
                 
