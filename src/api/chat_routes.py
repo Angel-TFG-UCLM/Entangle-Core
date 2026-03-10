@@ -1,12 +1,13 @@
 """
 Rutas de la API para el chat con IA.
-Endpoint que permite al usuario hacer preguntas sobre los datos del ecosistema cuántico.
+Incluye endpoint clásico (POST) y streaming SSE para razonamiento en tiempo real.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 
-from ..ai.agent import chat
+from ..ai.agent import chat, chat_stream
 from ..core.logger import logger
 
 chat_router = APIRouter()
@@ -46,3 +47,37 @@ async def chat_endpoint(request: ChatRequest):
     except Exception as e:
         logger.error(f"Error en chat endpoint: {e}")
         raise HTTPException(status_code=500, detail="Error al procesar la consulta de IA.")
+
+
+@chat_router.post("/chat/stream")
+async def chat_stream_endpoint(request: ChatRequest, req: Request):
+    """
+    Endpoint de streaming SSE. Envía eventos en tiempo real:
+    - thinking: herramienta que está usando el agente
+    - tool_result: resumen del resultado de la herramienta
+    - reply: respuesta final
+    - error: si algo falla
+
+    El cliente puede cerrar la conexión (AbortController) para cancelar.
+    """
+    logger.info(f"💬 Chat stream request: {request.message[:100]}...")
+
+    async def event_generator():
+        for event in chat_stream(
+            user_message=request.message,
+            conversation_history=request.history,
+        ):
+            # Comprobar si el cliente se desconectó (cancelación)
+            if await req.is_disconnected():
+                logger.info("🛑 Cliente desconectó — cancelando razonamiento del agente")
+                break
+            yield f"data: {event}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

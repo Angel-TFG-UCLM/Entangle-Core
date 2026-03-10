@@ -39,7 +39,7 @@ class Config:
     AZURE_AI_ENDPOINT = os.getenv("AZURE_AI_ENDPOINT", "")  # ej: https://entangle-ai-resource.services.ai.azure.com
     AZURE_AI_PROJECT = os.getenv("AZURE_AI_PROJECT", "")  # ej: entangle-ai
     AZURE_AI_API_KEY = os.getenv("AZURE_AI_API_KEY", "")
-    AZURE_AI_DEPLOYMENT = os.getenv("AZURE_AI_DEPLOYMENT", "gpt-4o-mini")
+    AZURE_AI_DEPLOYMENT = os.getenv("AZURE_AI_DEPLOYMENT", "gpt-4o")
 
     # Frontend URL para CORS (Azure Static Web Apps)
     FRONTEND_URL = os.getenv("FRONTEND_URL", "")
