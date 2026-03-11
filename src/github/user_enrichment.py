@@ -9,8 +9,10 @@ MEJORAS PRINCIPALES:
 """
 
 import time
+import threading
+import concurrent.futures
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
@@ -23,13 +25,15 @@ class UserEnrichmentEngine:
     Una sola llamada GraphQL obtiene todos los datos necesarios.
     """
     
-    ENRICHMENT_VERSION = "2.0.0"
+    ENRICHMENT_VERSION = "3.0.0"
     
-    # Query GraphQL unificada que obtiene TODOS los datos necesarios
-    SUPER_QUERY = """
-    query GetUserComplete($login: String!) {
-      user(login: $login) {
-        # ==================== BÁSICOS ====================
+    # Tamaño de lote para queries GraphQL batched (10 usuarios por query)
+    # Conservador porque la super-query es compleja (~60 nodos por usuario)
+    GRAPHQL_BATCH_SIZE = 10
+    
+    # Fragment reutilizable con todos los campos de enriquecimiento
+    ENRICHMENT_FRAGMENT = """
+    fragment UserEnrichmentFields on User {
         id
         login
         name
@@ -44,16 +48,8 @@ class UserEnrichmentEngine:
         twitterUsername
         createdAt
         updatedAt
-        
-        # ==================== MÉTRICAS SOCIALES ====================
-        followers {
-          totalCount
-        }
-        following {
-          totalCount
-        }
-        
-        # ==================== REPOSITORIOS ====================
+        followers { totalCount }
+        following { totalCount }
         repositories(first: 10, orderBy: {field: PUSHED_AT, direction: DESC}, privacy: PUBLIC) {
           totalCount
           nodes {
@@ -64,9 +60,7 @@ class UserEnrichmentEngine:
             url
             stargazerCount
             forkCount
-            primaryLanguage {
-              name
-            }
+            primaryLanguage { name }
             isPrivate
             isFork
             isArchived
@@ -74,8 +68,6 @@ class UserEnrichmentEngine:
             updatedAt
           }
         }
-        
-        # ==================== REPOS PINNED ====================
         pinnedItems(first: 6, types: REPOSITORY) {
           nodes {
             ... on Repository {
@@ -86,9 +78,7 @@ class UserEnrichmentEngine:
               url
               stargazerCount
               forkCount
-              primaryLanguage {
-                name
-              }
+              primaryLanguage { name }
               isPrivate
               isFork
               isArchived
@@ -97,13 +87,7 @@ class UserEnrichmentEngine:
             }
           }
         }
-        
-        # ==================== STARRED REPOS ====================
-        starredRepositories {
-          totalCount
-        }
-        
-        # ==================== ORGANIZACIONES ====================
+        starredRepositories { totalCount }
         organizations(first: 20) {
           totalCount
           nodes {
@@ -115,8 +99,6 @@ class UserEnrichmentEngine:
             description
           }
         }
-        
-        # ==================== CONTRIBUCIONES ====================
         contributionsCollection {
           totalCommitContributions
           totalIssueContributions
@@ -125,22 +107,10 @@ class UserEnrichmentEngine:
           totalRepositoryContributions
           restrictedContributionsCount
         }
-        
-        # ==================== CONTADORES ====================
-        gists {
-          totalCount
-        }
-        packages {
-          totalCount
-        }
-        sponsorshipsAsMaintainer {
-          totalCount
-        }
-        sponsorshipsAsSponsor {
-          totalCount
-        }
-        
-        # ==================== SOCIAL ACCOUNTS ====================
+        gists { totalCount }
+        packages { totalCount }
+        sponsorshipsAsMaintainer { totalCount }
+        sponsorshipsAsSponsor { totalCount }
         socialAccounts(first: 10) {
           nodes {
             provider
@@ -148,15 +118,11 @@ class UserEnrichmentEngine:
             url
           }
         }
-        
-        # ==================== STATUS ====================
         status {
           emoji
           message
           expiresAt
         }
-        
-        # ==================== FLAGS ====================
         isHireable
         isBountyHunter
         isCampusExpert
@@ -164,9 +130,17 @@ class UserEnrichmentEngine:
         isEmployee
         isGitHubStar
         isSiteAdmin
-      }
     }
     """
+    
+    # Query individual que usa el fragment (para fallback single-user)
+    SUPER_QUERY = """
+    query GetUserComplete($login: String!) {
+      user(login: $login) {
+        ...UserEnrichmentFields
+      }
+    }
+    """ + ENRICHMENT_FRAGMENT
     
     def __init__(
         self,
@@ -174,7 +148,9 @@ class UserEnrichmentEngine:
         users_repository: MongoRepository,
         repos_repository: MongoRepository,
         batch_size: int = 100,  # ✅ OPTIMIZADO para vCore
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[Dict[str, Any]] = None,
+        progress_callback=None,
+        cancel_event=None
     ):
         """
         Inicializa el motor de enriquecimiento.
@@ -185,13 +161,23 @@ class UserEnrichmentEngine:
             repos_repository: Repositorio de repositorios
             batch_size: Tamaño del lote (optimizado para vCore)
             config: Configuración opcional
+            progress_callback: Callback opcional fn(items_processed, items_total, message)
         """
         self.github_token = github_token
         self.users_repository = users_repository
         self.repos_repository = repos_repository
         self.batch_size = batch_size
         self.config = config or {}
+        self.progress_callback = progress_callback
+        self.cancel_event = cancel_event
         self.graphql_client = GitHubGraphQLClient(github_token)
+        
+        # Lock para estadísticas thread-safe
+        self._stats_lock = threading.Lock()
+        
+        # Coordinación de rate limit entre hilos
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until = 0  # timestamp epoch hasta el que esperar
         
         # Estadísticas
         self.stats = {
@@ -252,6 +238,7 @@ class UserEnrichmentEngine:
         
         users = list(users_cursor)
         total_users = len(users)
+        self._total_items = total_users
         
         logger.info(f"📊 Total usuarios a enriquecer: {total_users}")
         
@@ -259,27 +246,76 @@ class UserEnrichmentEngine:
             logger.info("✅ No hay usuarios para enriquecer")
             return self._finalize_stats()
         
-        # Procesar en lotes
-        for i in range(0, total_users, self.batch_size):
-            batch = users[i:i + self.batch_size]
-            batch_num = i // self.batch_size + 1
-            total_batches = (total_users + self.batch_size - 1) // self.batch_size
+        # Procesar en lotes con queries GraphQL batched + ThreadPoolExecutor
+        # En vez de 1 query por usuario (N requests), hacemos 10 usuarios por query (N/10 requests)
+        # Y procesamos múltiples batches en paralelo con hilos
+        total_batches = (total_users + self.GRAPHQL_BATCH_SIZE - 1) // self.GRAPHQL_BATCH_SIZE
+        max_concurrent = self.config.get("enrichment", {}).get("max_concurrent_batches", 3)
+        logger.info(f"🚀 Procesando {total_users} usuarios con {max_concurrent} workers paralelos (batches de {self.GRAPHQL_BATCH_SIZE})")
+        
+        batches = []
+        for i in range(0, total_users, self.GRAPHQL_BATCH_SIZE):
+            batch = users[i:i + self.GRAPHQL_BATCH_SIZE]
+            batch_num = i // self.GRAPHQL_BATCH_SIZE + 1
+            batches.append((batch_num, batch))
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            futures = {}
+            for batch_num, batch in batches:
+                future = executor.submit(self._enrich_batch_with_retry, batch, batch_num, total_batches)
+                futures[future] = batch_num
             
-            logger.info(f"\n📦 Procesando lote {batch_num}/{total_batches} ({len(batch)} usuarios)")
-            
-            for user in batch:
-                self._enrich_single_user(user)
-                
-                # Sleep para respetar GitHub API Rate Limit
-                time.sleep(0.5)
-            
-            logger.info(f"✅ Lote {batch_num}/{total_batches} completado")
+            for future in concurrent.futures.as_completed(futures):
+                if self.cancel_event and self.cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    logger.warning("⚠️ Cancelación detectada en enrich_all_users")
+                    break
+                batch_num = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"❌ Error en lote {batch_num}/{total_batches}: {e}")
         
         return self._finalize_stats()
     
+    def _enrich_batch_with_retry(self, batch: List[Dict[str, Any]], batch_num: int, total_batches: int) -> None:
+        """
+        Procesa un batch con reintentos y coordinación de rate limit.
+        Diseñado para ejecución en ThreadPoolExecutor.
+        
+        Args:
+            batch: Lista de usuarios a procesar
+            batch_num: Número de batch actual
+            total_batches: Total de batches
+        """
+        # Esperar si hay rate limit activo de otro hilo
+        now = time.time()
+        wait_remaining = self._rate_limit_until - now
+        if wait_remaining > 0:
+            logger.debug(f"⏳ Lote {batch_num}: esperando rate limit activo ({wait_remaining:.0f}s)...")
+            time.sleep(wait_remaining)
+        
+        logger.info(f"\n📦 Lote GraphQL {batch_num}/{total_batches} ({len(batch)} usuarios en 1 query)")
+        
+        success = self._enrich_batch(batch)
+        
+        if not success:
+            # Rate limit: esperar al reset y reintentar este batch
+            logger.warning(f"⏸️ Lote {batch_num}: Rate limit detectado. Esperando reset...")
+            self._wait_for_rate_limit_reset()
+            # Reintentar el batch fallido
+            success = self._enrich_batch(batch)
+            if not success:
+                logger.error(f"❌ Lote {batch_num}: Rate limit persistente después de esperar reset.")
+                return
+        
+        logger.info(f"✅ Lote {batch_num}/{total_batches} completado")
+    
     def _enrich_single_user(self, user: Dict[str, Any]) -> bool:
         """
-        Enriquece un solo usuario. Incluye try-except para continuar en caso de error.
+        Enriquece un solo usuario con query individual (fallback).
+        Usado cuando la query batched falla para un usuario específico.
         
         Args:
             user: Documento de usuario de MongoDB
@@ -291,24 +327,169 @@ class UserEnrichmentEngine:
         
         if not login:
             logger.warning(f"⚠️  Usuario sin campo 'login' encontrado (ID: {user.get('_id')}). Saltando...")
-            self.stats["total_errors"] += 1
+            with self._stats_lock:
+                self.stats["total_errors"] += 1
+                self.stats["total_processed"] += 1
             return False
         
         try:
-            logger.info(f"\nEnriqueciendo usuario: {login}")
-            
-            # Limpiar arrays vacíos del usuario (legacy)
             self._clean_empty_arrays(user)
-            
-            # ==================== SUPER-QUERY: UNA SOLA LLAMADA ====================
             graphql_data = self._fetch_user_data(login)
             
             if not graphql_data:
                 logger.warning(f"⚠️  No se pudo obtener datos de {login}")
-                self.stats["total_errors"] += 1
+                with self._stats_lock:
+                    self.stats["total_errors"] += 1
+                    self.stats["total_processed"] += 1
                 return False
             
-            # ==================== PROCESAR DATOS ====================
+            return self._process_enrichment_data(user, graphql_data)
+            
+        except Exception as e:
+            logger.error(f"❌ Error enriqueciendo usuario {login}: {e}")
+            with self._stats_lock:
+                self.stats["total_errors"] += 1
+                self.stats["total_processed"] += 1
+            return False
+    
+    def _enrich_batch(self, users_batch: List[Dict[str, Any]]) -> bool:
+        """
+        Enriquece un lote de usuarios con UNA sola query GraphQL batched.
+        
+        Optimización: 10 usuarios por query en vez de 10 queries individuales.
+        Ahorra ~10x en tokens de GitHub API.
+        
+        Si la query batched falla, hace fallback a queries individuales
+        para garantizar que no se pierde información.
+        
+        Args:
+            users_batch: Lista de documentos de usuario de MongoDB
+            
+        Returns:
+            True si se procesó (con o sin errores individuales),
+            False si hubo rate limit (señal para abortar)
+        """
+        # Preparar usuarios válidos
+        valid_users = []
+        for user in users_batch:
+            login = user.get('login')
+            if not login:
+                logger.warning(f"⚠️  Usuario sin login (ID: {user.get('_id')}). Saltando...")
+                self.stats['total_errors'] += 1
+                self.stats['total_processed'] += 1
+                continue
+            self._clean_empty_arrays(user)
+            valid_users.append(user)
+        
+        if not valid_users:
+            return True
+        
+        logins = [u['login'] for u in valid_users]
+        
+        # Construir y ejecutar query batched
+        query, variables = self._build_enrichment_batch_query(logins)
+        
+        try:
+            result = self.graphql_client.execute_query(query, variables)
+            
+            if not result or 'data' not in result:
+                logger.warning("⚠️  Batch enrichment query sin datos - fallback individual")
+                for user in valid_users:
+                    self._enrich_single_user(user)
+                return True
+            
+            data = result['data']
+            
+            for i, user in enumerate(valid_users):
+                if self.cancel_event and self.cancel_event.is_set():
+                    break
+                alias_key = f"user{i}"
+                graphql_data = data.get(alias_key)
+                login = user.get('login')
+                
+                if not graphql_data:
+                    logger.debug(f"  ⚠️  {login}: sin datos en batch (cuenta eliminada?)")
+                    with self._stats_lock:
+                        self.stats['total_errors'] += 1
+                        self.stats['total_processed'] += 1
+                    continue
+                
+                try:
+                    self._process_enrichment_data(user, graphql_data)
+                except Exception as e:
+                    logger.error(f"❌ Error procesando {login}: {e}")
+                    with self._stats_lock:
+                        self.stats['total_errors'] += 1
+                        self.stats['total_processed'] += 1
+            
+            return True
+            
+        except Exception as e:
+            error_str = str(e)
+            if "RATE_LIMIT" in error_str or "rate limit" in error_str.lower() or "403" in error_str or "forbidden" in error_str.lower():
+                # Esperar al reset del rate limit y reintentar
+                logger.warning("⏸️  Rate limit/403 en batch enrichment - Esperando reset...")
+                self._wait_for_rate_limit_reset()
+                return True  # Señal para que el loop reintente
+            
+            # Fallback: procesar individualmente para no perder datos
+            logger.warning(f"⚠️  Error en batch query ({error_str[:80]}), fallback individual...")
+            for user in valid_users:
+                self._enrich_single_user(user)
+            return True
+    
+    def _build_enrichment_batch_query(self, logins: List[str]) -> tuple:
+        """
+        Construye una query GraphQL batched para enriquecer múltiples usuarios.
+        
+        Usa el ENRICHMENT_FRAGMENT para evitar repetir la definición de campos.
+        Cada usuario se consulta como un alias (user0, user1, ...).
+        
+        Args:
+            logins: Lista de logins a enriquecer
+            
+        Returns:
+            Tupla (query_string, variables_dict)
+        """
+        variables_decl = []
+        aliases = []
+        variables = {}
+        
+        for i, login in enumerate(logins):
+            var_name = f"login{i}"
+            variables_decl.append(f"${var_name}: String!")
+            aliases.append(f"    user{i}: user(login: ${var_name}) {{ ...UserEnrichmentFields }}")
+            variables[var_name] = login
+        
+        aliases_str = "\n".join(aliases)
+        vars_str = ", ".join(variables_decl)
+        
+        query = f"""
+        query EnrichUsersBatch({vars_str}) {{
+{aliases_str}
+        }}
+        {self.ENRICHMENT_FRAGMENT}
+        """
+        
+        return query, variables
+    
+    def _process_enrichment_data(self, user: Dict[str, Any], graphql_data: Dict[str, Any]) -> bool:
+        """
+        Procesa datos de enriquecimiento GraphQL y los guarda en MongoDB.
+        
+        Lógica extraída de _enrich_single_user para poder reutilizarla
+        tanto en queries individuales como batched sin perder información.
+        
+        Args:
+            user: Documento de usuario original de MongoDB
+            graphql_data: Datos de la respuesta GraphQL para este usuario
+            
+        Returns:
+            True si se procesó correctamente
+        """
+        login = user.get('login', 'unknown')
+        
+        try:
             updates = {}
             
             # Campos básicos
@@ -342,6 +523,11 @@ class UserEnrichmentEngine:
             if quantum_repos:
                 updates["quantum_repositories"] = quantum_repos
                 updates["is_quantum_contributor"] = True
+                # Contribuciones all-time a repos quantum (sum de extracted_from)
+                # Útil porque contributionsCollection de GitHub solo cubre el último año
+                updates["contributions_to_quantum_repos"] = sum(
+                    r.get("contributions", 0) for r in quantum_repos
+                )
             
             # Métricas sociales calculadas
             social_metrics = self._calculate_social_metrics(user, updates)
@@ -355,42 +541,109 @@ class UserEnrichmentEngine:
             # Timestamp de enriquecimiento
             updates["enriched_at"] = datetime.now()
             
-            # ==================== TRACKING DE ENRIQUECIMIENTO v3.0 ====================
-            
-            # LÓGICA DE COMPLETITUD REALISTA:
-            # Un usuario está COMPLETO si:
-            # 1. Hemos calculado con éxito el quantum_expertise_score (núcleo del TFG)
-            # 2. Tenemos la fecha enriched_at
-            # Ya NO reportamos campos opcionales (company, twitter) como missing.
-            
-            is_complete = True  # Siempre True si llegamos al final sin error
-            
+            # Tracking de enriquecimiento v3.0
             updates["enrichment_status"] = {
-                "is_complete": is_complete,
+                "is_complete": True,
                 "version": "3.0",
                 "last_check": datetime.now().isoformat(),
-                "fields_missing": []  # Ya no reportamos campos opcionales como missing
+                "fields_missing": []
             }
             
-            # ==================== GUARDAR EN BD ====================
-            
+            # Guardar en BD
             self.users_repository.collection.update_one(
                 {"_id": user.get("_id")},
                 {"$set": updates}
             )
             
-            self.stats["total_enriched"] += 1
-            logger.info(f"✅ Usuario {login} enriquecido correctamente")
+            with self._stats_lock:
+                self.stats["total_enriched"] += 1
+                self.stats["total_processed"] += 1
+            logger.debug(f"✅ {login} enriquecido")
+            
+            # Notificar progreso
+            if self.progress_callback:
+                try:
+                    total = getattr(self, '_total_items', 0)
+                    self.progress_callback(
+                        self.stats["total_processed"], total,
+                        f"Enriqueciendo usuarios: {self.stats['total_processed']}/{total}"
+                    )
+                except Exception:
+                    pass
             
             return True
             
         except Exception as e:
-            logger.error(f"❌ Error enriqueciendo usuario {login}: {e}")
-            self.stats["total_errors"] += 1
+            logger.error(f"❌ Error procesando enriquecimiento de {login}: {e}")
+            with self._stats_lock:
+                self.stats["total_errors"] += 1
+                self.stats["total_processed"] += 1
             return False
+    
+    def _check_rate_limit(self) -> None:
+        """
+        Verifica rate limit de GitHub y espera si es necesario.
+        Thread-safe: coordina con _rate_limit_until entre hilos.
+        """
+        # Primero comprobar si hay rate limit activo de otro hilo
+        now = time.time()
+        wait_remaining = self._rate_limit_until - now
+        if wait_remaining > 0:
+            logger.debug(f"⏳ Rate limit activo, esperando {wait_remaining:.0f}s...")
+            time.sleep(wait_remaining)
+            return
         
-        finally:
-            self.stats["total_processed"] += 1
+        try:
+            rate_info = self.graphql_client.get_rate_limit()
+            remaining = rate_info.get('remaining', 5000)
+            
+            if remaining < 100:
+                self._wait_for_rate_limit_reset()
+            elif remaining < 500:
+                logger.info(f"📊 Rate limit: {remaining} restantes")
+        except Exception as e:
+            logger.debug(f"No se pudo verificar rate limit: {e}")
+    
+    def _wait_for_rate_limit_reset(self) -> None:
+        """
+        Espera hasta que el rate limit de GitHub se resetee.
+        Thread-safe: coordina entre hilos con _rate_limit_lock.
+        El primer hilo que detecta el rate limit loguea; los demás esperan silenciosamente.
+        """
+        wait_seconds = 120  # Fallback conservador
+        try:
+            rate_info = self.graphql_client.get_rate_limit()
+            remaining = rate_info.get('remaining', 5000)
+            reset_at = rate_info.get('reset_at')
+            
+            if reset_at:
+                wait = (reset_at - datetime.now(timezone.utc)).total_seconds() + 5
+                if wait > 0:
+                    wait_seconds = wait
+            else:
+                # Consultar REST API para timestamp real
+                try:
+                    rest_info = self.graphql_client._get_rate_limit_rest()
+                    gql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
+                    if gql_reset > 0:
+                        wait_seconds = max(0, gql_reset - time.time()) + 5
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        
+        # Coordinación: primer hilo marca timestamp y loguea, otros esperan silenciosamente
+        with self._rate_limit_lock:
+            new_until = time.time() + wait_seconds
+            if new_until > self._rate_limit_until:
+                self._rate_limit_until = new_until
+                logger.warning(f"⏳ Rate limit detectado. Todos los hilos esperarán {wait_seconds:.0f}s hasta reset...")
+        
+        # Dormir hasta el timestamp coordinado
+        sleep_until = self._rate_limit_until - time.time()
+        if sleep_until > 0:
+            time.sleep(sleep_until)
+            logger.info("✅ Rate limit reseteado, continuando")
     
     def _fetch_user_data(self, login: str) -> Optional[Dict[str, Any]]:
         """

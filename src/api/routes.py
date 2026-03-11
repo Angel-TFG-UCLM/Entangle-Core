@@ -23,9 +23,40 @@ from ..core.logger import logger
 from ..core.config import config, ingestion_config
 from ..core.mongo_repository import MongoRepository
 from ..analysis.network_metrics import CollaborationNetworkAnalyzer
+import re as _re
 
 # Router principal
 router = APIRouter()
+
+
+# ============================================================================
+# SIBLING ORG DETECTION — module-level helper
+# ============================================================================
+def _are_sibling_orgs(login_a: str, login_b: str) -> bool:
+    """Detect sibling orgs (same parent entity). E.g. Qiskit ↔ qiskit-community."""
+    if not login_a or not login_b:
+        return False
+    la, lb = login_a.lower(), login_b.lower()
+    if la == lb:
+        return True
+    # PRONG 1 — Token-based: split by separators, match first token (≥4 chars).
+    # Require ONE name to be a single token (the brand itself) to avoid
+    # "quantum-X ↔ quantum-Y" false positives in this domain.
+    toks_a = [t for t in _re.split(r'[-_.\s]+', la) if t]
+    toks_b = [t for t in _re.split(r'[-_.\s]+', lb) if t]
+    if toks_a and toks_b and len(toks_a[0]) >= 4 and toks_a[0] == toks_b[0]:
+        if len(toks_a) == 1 or len(toks_b) == 1:
+            return True
+    # PRONG 2 — Prefix-based: shorter normalised name must be PREFIX of
+    # longer, ≥ 4 chars, and ratio ≤ 3.0 (rejects intel→intelligentquantum).
+    a = _re.sub(r'[-_\s.]+', '', la)
+    b = _re.sub(r'[-_\s.]+', '', lb)
+    if not a or not b:
+        return False
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 4 and long_.startswith(short) and len(long_) / len(short) <= 3.0:
+        return True
+    return False
 
 # Estado global para tareas en background
 background_tasks_status: Dict[str, Dict[str, Any]] = {}
@@ -111,7 +142,8 @@ async def get_dashboard_stats(
     language: Optional[str] = Query(default=None, description="Filtrar por lenguaje de programación"),
     repo: Optional[str] = Query(default=None, description="Filtrar por repositorio (full_name)"),
     collab_type: Optional[str] = Query(default=None, description="Tipo de colaborador: 'contributors' (con commits), 'reviewers' (solo mencionables), 'all'"),
-    include_bots: bool = Query(default=False, description="Incluir cuentas de bots en el análisis de colaboradores")
+    include_bots: bool = Query(default=False, description="Incluir cuentas de bots en el análisis de colaboradores"),
+    discipline: Optional[str] = Query(default=None, description="Filtrar colaboradores por disciplina (e.g. 'quantum_algorithms', 'hardware_engineering')")
 ):
     """
     Endpoint COMPLETO para dashboard con sistema de caché MongoDB.
@@ -144,7 +176,7 @@ async def get_dashboard_stats(
         
         # Detectar si hay filtros activos
         # include_bots=False es el default, solo cuenta como filtro si es True
-        has_filters = bool(org or language or repo or collab_type or include_bots)
+        has_filters = bool(org or language or repo or collab_type or include_bots or discipline)
         
         # 1. INTENTAR OBTENER CACHÉ (solo si no hay filtros y no se fuerza refresh)
         # Caché PERMANENTE: sin TTL, persiste hasta invalidación explícita
@@ -166,7 +198,7 @@ async def get_dashboard_stats(
         
         # Log de filtros activos
         if has_filters:
-            logger.info(f"📊 Calculando dashboard stats CON FILTROS: org={org}, language={language}, repo={repo}")
+            logger.info(f"📊 Calculando dashboard stats CON FILTROS: org={org}, language={language}, repo={repo}, discipline={discipline}")
         else:
             logger.info("📊 Calculando dashboard stats COMPLETO desde MongoDB...")
         
@@ -174,6 +206,49 @@ async def get_dashboard_stats(
         repos_collection = db.get_collection("repositories")
         users_collection = db.get_collection("users")
         orgs_collection = db.get_collection("organizations")
+        
+        # === Cargar node_metrics para features de disciplina ===
+        # Se usa para: 1) filtro de disciplina, 2) distribución filtrada por disciplina
+        _node_metrics_data = None   # Objeto completo de network_metrics
+        _node_metrics = {}          # Diccionario node_id → métricas
+        _login_to_discipline = {}   # Fallback: login → discipline (documento compacto)
+        if has_filters:
+            try:
+                import orjson as _orjson
+                cache_data = _network_metrics_cache.get("json_bytes")
+                if cache_data:
+                    _node_metrics_data = _orjson.loads(cache_data)
+                    _node_metrics = _node_metrics_data.get("node_metrics", {})
+                else:
+                    from ..core.chunked_cache import load_chunked
+                    _node_metrics_data = load_chunked(metrics_collection, "network_metrics")
+                    _node_metrics = _node_metrics_data.get("node_metrics", {}) if _node_metrics_data else {}
+            except Exception as nm_err:
+                logger.warning(f"⚠️ No se pudo cargar node_metrics: {nm_err}")
+            
+            # Fallback: si _node_metrics está vacío, cargar mapeo compacto user_disciplines
+            if not _node_metrics:
+                try:
+                    _disc_doc = metrics_collection.find_one({"_id": "user_disciplines"})
+                    if _disc_doc and _disc_doc.get("mapping"):
+                        _login_to_discipline = _disc_doc["mapping"]
+                        logger.info(f"📋 Fallback: cargado user_disciplines con {len(_login_to_discipline)} usuarios")
+                except Exception as disc_err:
+                    logger.warning(f"⚠️ No se pudo cargar user_disciplines fallback: {disc_err}")
+        
+        # === Construir set de logins por disciplina (si filtro activo) ===
+        discipline_logins = None
+        if discipline and (_node_metrics or _login_to_discipline):
+            discipline_logins = set()
+            if _node_metrics:
+                for node_id, m in _node_metrics.items():
+                    if node_id.startswith("user_") and m.get("discipline") == discipline:
+                        discipline_logins.add(node_id[5:])  # Strip "user_" prefix
+            else:
+                for login, disc in _login_to_discipline.items():
+                    if disc == discipline:
+                        discipline_logins.add(login)
+            logger.info(f"🔬 Filtro disciplina '{discipline}': {len(discipline_logins)} usuarios encontrados")
         
         # === Construir filtros base para MongoDB ===
         repo_filter = {}
@@ -358,7 +433,8 @@ async def get_dashboard_stats(
                 ])),
                 "byContributors": list(repos_collection.aggregate(lang_org_base + [
                     {"$sort": {"total_unique_contributors": -1}}, {"$limit": 10}
-                ]))
+                ])),
+                "bySharedUsers": []  # Se calcula después del bloque unificado
             }
         else:
             # Sin filtro de lenguaje: usar datos pre-calculados de la colección organizations
@@ -405,6 +481,110 @@ async def get_dashboard_stats(
                 ))),
                 "byContributors": list(orgs_collection.aggregate(make_org_pipeline("total_unique_contributors")))
             }
+        
+        # === CHART ORGS: Top 10 por usuarios compartidos (cross-org) ===
+        # Pipeline: repos → unwind collaborators → group by user + collect orgs →
+        # keep users in ≥2 orgs → unwind orgs → count per org
+        # NOTA: No aplicamos filtro de org aquí — el análisis cross-org necesita
+        # TODOS los repos para encontrar usuarios en ≥2 orgs (igual que byRepos/byStars
+        # que tampoco filtran por org). Sí aplicamos filtro de lenguaje si existe.
+        shared_users_repo_match = {"collaborators": {"$exists": True, "$ne": []}}
+        if language and repo_filter:
+            # Solo incluir filtro de lenguaje, no de org
+            lang_part = None
+            if "$and" in repo_filter:
+                # Formato: {"$and": [{"$or": org_filter}, {"$or": lang_filter}]}
+                for clause in repo_filter["$and"]:
+                    if "$or" in clause and any("primary_language" in str(cond) for cond in clause["$or"]):
+                        lang_part = clause
+                        break
+            elif "$or" in repo_filter and any("primary_language" in str(cond) for cond in repo_filter["$or"]):
+                lang_part = {"$or": repo_filter["$or"]}
+            if lang_part:
+                shared_users_repo_match.update(lang_part)
+        elif not org and repo_filter:
+            # Sin org (ej: solo repo filter), aplicar tal cual
+            shared_users_repo_match.update(repo_filter)
+        
+        shared_users_org_pipeline = [
+            {"$match": shared_users_repo_match},
+            {"$unwind": "$collaborators"},
+            {"$group": {
+                "_id": "$collaborators.login",
+                "orgs": {"$addToSet": {"$ifNull": ["$owner.login", "$organization.login"]}}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$project": {
+                "orgs": 1,
+                "orgs_count": {"$size": "$orgs"}
+            }},
+            {"$match": {"orgs_count": {"$gte": 2}}},
+        ]
+        # Step 1: fetch user→orgs from MongoDB
+        raw_cross_users = list(repos_collection.aggregate(shared_users_org_pipeline))
+
+        # Step 2: Python — collapse sibling orgs per user, recount
+        from collections import Counter as _Counter
+        org_shared_counter = _Counter()
+        for doc in raw_cross_users:
+            raw_orgs = [o for o in (doc.get("orgs") or []) if o]
+            # Remove sibling duplicates: keep only independent orgs
+            independent = []
+            for org_login in raw_orgs:
+                if not any(_are_sibling_orgs(org_login, kept) for kept in independent):
+                    independent.append(org_login)
+            if len(independent) >= 2:
+                for org_login in independent:
+                    org_shared_counter[org_login] += 1
+
+        # Step 3: top 10 → lookup org info
+        top_shared_logins = [login for login, _ in org_shared_counter.most_common(10)]
+        if top_shared_logins:
+            org_info_docs = {
+                d["login"]: d
+                for d in orgs_collection.find(
+                    {"login": {"$in": top_shared_logins}},
+                    {"_id": 0, "login": 1, "name": 1, "avatar_url": 1,
+                     "description": 1, "members_count": 1,
+                     "quantum_repositories_count": 1, "total_stars": 1,
+                     "quantum_focus_score": 1, "location": 1, "is_verified": 1,
+                     "created_at": 1, "website_url": 1, "twitter_username": 1,
+                     "email": 1, "quantum_contributors_count": 1,
+                     "total_repositories_count": 1, "total_members_count": 1,
+                     "total_unique_contributors": 1, "top_languages": 1,
+                     "is_quantum_focused": 1, "top_quantum_contributors": 1}
+                )
+            }
+            by_shared = []
+            for login in top_shared_logins:
+                info = org_info_docs.get(login, {})
+                by_shared.append({
+                    "login": login,
+                    "name": info.get("name") or login,
+                    "avatar_url": info.get("avatar_url"),
+                    "description": info.get("description"),
+                    "members_count": info.get("members_count", 0),
+                    "quantum_repositories_count": info.get("quantum_repositories_count", 0),
+                    "total_stars": info.get("total_stars", 0),
+                    "quantum_focus_score": info.get("quantum_focus_score", 0),
+                    "location": info.get("location"),
+                    "is_verified": info.get("is_verified", False),
+                    "created_at": info.get("created_at"),
+                    "website_url": info.get("website_url"),
+                    "twitter_username": info.get("twitter_username"),
+                    "email": info.get("email"),
+                    "quantum_contributors_count": info.get("quantum_contributors_count", 0),
+                    "total_repositories_count": info.get("total_repositories_count", 0),
+                    "total_members_count": info.get("total_members_count", 0),
+                    "total_unique_contributors": info.get("total_unique_contributors", 0),
+                    "top_languages": info.get("top_languages", []),
+                    "is_quantum_focused": info.get("is_quantum_focused", False),
+                    "top_quantum_contributors": (info.get("top_quantum_contributors") or [])[:5],
+                    "shared_users_count": org_shared_counter[login],
+                })
+            chart_orgs["bySharedUsers"] = by_shared
+        else:
+            chart_orgs["bySharedUsers"] = []
         
         # === CHART: TOP 10 REPOSITORIOS POR DIFERENTES MÉTRICAS ===
         repo_base_projection = {
@@ -459,6 +639,76 @@ async def get_dashboard_stats(
         # Top 10 por colaboradores
         chart_repos_collabs = list(repos_collection.aggregate(make_repo_pipeline("collaborators_count")))
         
+        # === CHART REPOS: Top 10 por colaboradores compartidos (cross-repo) ===
+        # Pipeline: repos → unwind collaborators → group by user + collect repos →
+        # keep users in ≥2 repos → unwind repos → count per repo → lookup details
+        shared_collabs_repo_match = {"collaborators": {"$exists": True, "$ne": []}}
+        if repo_filter:
+            shared_collabs_repo_match.update(repo_filter)
+        
+        shared_collabs_repo_pipeline = [
+            {"$match": shared_collabs_repo_match},
+            {"$unwind": "$collaborators"},
+            {"$group": {
+                "_id": "$collaborators.login",
+                "repos": {"$addToSet": "$full_name"}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$project": {
+                "repos": 1,
+                "repos_count": {"$size": "$repos"}
+            }},
+            {"$match": {"repos_count": {"$gte": 2}}},
+            {"$unwind": "$repos"},
+            {"$group": {
+                "_id": "$repos",
+                "shared_collaborators_count": {"$sum": 1}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$sort": {"shared_collaborators_count": -1}},
+            {"$limit": 10},
+            {"$lookup": {
+                "from": "repositories",
+                "localField": "_id",
+                "foreignField": "full_name",
+                "as": "repo_info"
+            }},
+            {"$project": {
+                "_id": 0,
+                "id": {"$arrayElemAt": ["$repo_info.id", 0]},
+                "name": {"$arrayElemAt": ["$repo_info.name", 0]},
+                "full_name": "$_id",
+                "description": {"$arrayElemAt": ["$repo_info.description", 0]},
+                "stargazer_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.stargazer_count", 0]}, 0]},
+                "fork_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.fork_count", 0]}, 0]},
+                "collaborators_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.collaborators_count", 0]}, 0]},
+                "primary_language": {"$arrayElemAt": ["$repo_info.primary_language", 0]},
+                "owner": {"$arrayElemAt": ["$repo_info.owner", 0]},
+                "url": {"$arrayElemAt": ["$repo_info.url", 0]},
+                "homepage_url": {"$arrayElemAt": ["$repo_info.homepage_url", 0]},
+                "repository_topics": {"$ifNull": [{"$arrayElemAt": ["$repo_info.repository_topics", 0]}, []]},
+                "created_at": {"$arrayElemAt": ["$repo_info.created_at", 0]},
+                "updated_at": {"$arrayElemAt": ["$repo_info.updated_at", 0]},
+                "pushed_at": {"$arrayElemAt": ["$repo_info.pushed_at", 0]},
+                "commits_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.commits_count", 0]}, 0]},
+                "issues_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.issues_count", 0]}, 0]},
+                "open_issues_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.open_issues_count", 0]}, 0]},
+                "pull_requests_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.pull_requests_count", 0]}, 0]},
+                "merged_pull_requests_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.merged_pull_requests_count", 0]}, 0]},
+                "open_pull_requests_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.open_pull_requests_count", 0]}, 0]},
+                "releases_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.releases_count", 0]}, 0]},
+                "latest_release": {"$arrayElemAt": ["$repo_info.latest_release", 0]},
+                "license_info": {"$arrayElemAt": ["$repo_info.license_info", 0]},
+                "is_fork": {"$ifNull": [{"$arrayElemAt": ["$repo_info.is_fork", 0]}, False]},
+                "is_archived": {"$ifNull": [{"$arrayElemAt": ["$repo_info.is_archived", 0]}, False]},
+                "watchers_count": {"$ifNull": [{"$arrayElemAt": ["$repo_info.watchers_count", 0]}, 0]},
+                "languages": {"$ifNull": [{"$slice": [{"$ifNull": [{"$arrayElemAt": ["$repo_info.languages", 0]}, []]}, 6]}, []]},
+                "default_branch_ref_name": {"$arrayElemAt": ["$repo_info.default_branch_ref_name", 0]},
+                "shared_collaborators_count": 1
+            }}
+        ]
+        chart_repos_shared = list(repos_collection.aggregate(shared_collabs_repo_pipeline))
+        
         # Helper para detectar si un login es un bot
         def is_bot(login: str) -> bool:
             if not login:
@@ -493,16 +743,25 @@ async def get_dashboard_stats(
                     collaborators = [c for c in collaborators if c.get("is_mentionable", False) and not c.get("has_commits", False)]
                 # collab_type == "all" o None -> no filtrar
                 
+                # Filtrar por disciplina si aplica
+                if discipline_logins is not None:
+                    collaborators = [c for c in collaborators if c.get("login") in discipline_logins]
+                
                 # Enriquecer con info de users
+                # collab_score = round(sqrt(contributions × repos × 100))
+                # En contexto de single repo: repos=1, así que el orden no cambia vs contributions
+                import math
                 chart_users = []
                 for collab in sorted(collaborators, key=lambda x: x.get("contributions", 0), reverse=True)[:10]:
                     user_info = users_collection.find_one({"login": collab.get("login")})
+                    c = collab.get("contributions", 0)
                     chart_users.append({
                         "login": collab.get("login"),
                         "name": user_info.get("name") if user_info else None,
                         "avatar_url": collab.get("avatar_url") or (user_info.get("avatar_url") if user_info else None),
                         "relevant_repos_count": 1,
-                        "total_contributions": collab.get("contributions", 0),
+                        "total_contributions": c,
+                        "collab_score": round(math.sqrt(c * 1 * 100)),
                         "has_commits": collab.get("has_commits", False),
                         "is_mentionable": collab.get("is_mentionable", False),
                         "total_commit_contributions": user_info.get("total_commit_contributions", 0) if user_info else 0,
@@ -523,6 +782,8 @@ async def get_dashboard_stats(
                         "website_url": user_info.get("website_url") if user_info else None,
                         "twitter_username": user_info.get("twitter_username") if user_info else None,
                         "is_hireable": user_info.get("is_hireable", False) if user_info else False,
+                        "is_enriched": user_info.get("enrichment_status", {}).get("is_complete", False) if user_info else False,
+                        "contributions_to_quantum_repos": collab.get("contributions", 0),
                     })
             else:
                 chart_users = []
@@ -579,7 +840,11 @@ async def get_dashboard_stats(
                     "is_mentionable": {"$max": {"$ifNull": ["$collaborators.is_mentionable", False]}}
                 }},
                 {"$match": {"_id": {"$ne": None}}},
-                {"$sort": {"total_contributions": -1, "repos_in_language": -1}},
+                # collab_score = round(sqrt(contributions × repos × 100))
+                {"$addFields": {
+                    "collab_score": {"$round": [{"$sqrt": {"$multiply": ["$total_contributions", "$repos_in_language", 100]}}, 0]}
+                }},
+                {"$sort": {"collab_score": -1, "total_contributions": -1}},
                 {"$limit": 10},
                 {"$lookup": {
                     "from": "users",
@@ -596,6 +861,7 @@ async def get_dashboard_stats(
                     "total_contributions": 1,
                     "has_commits": 1,
                     "is_mentionable": 1,
+                    "collab_score": 1,
                     "total_commit_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_commit_contributions", 0]}, 0]},
                     "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
                     "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
@@ -613,9 +879,17 @@ async def get_dashboard_stats(
                     "url": {"$arrayElemAt": ["$user_info.url", 0]},
                     "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
                     "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
-                    "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
+                    "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]},
+                    "is_enriched": {"$ifNull": [{"$arrayElemAt": ["$user_info.enrichment_status.is_complete", 0]}, False]},
+                    "contributions_to_quantum_repos": "$total_contributions"
                 }}
             ])
+            # Insertar filtro de disciplina antes del $sort si aplica
+            if discipline_logins is not None:
+                for i, stage in enumerate(top_users_pipeline):
+                    if "$sort" in stage:
+                        top_users_pipeline.insert(i, {"$match": {"_id": {"$in": list(discipline_logins)}}})
+                        break
             chart_users = list(repos_collection.aggregate(top_users_pipeline))
         else:
             # Sin filtro de lenguaje ni repo
@@ -660,7 +934,11 @@ async def get_dashboard_stats(
                         "is_mentionable": {"$max": {"$ifNull": ["$collaborators.is_mentionable", False]}}
                     }},
                     {"$match": {"_id": {"$ne": None}}},
-                    {"$sort": {"total_contributions": -1, "repos_count": -1}},
+                    # collab_score = round(sqrt(contributions × repos × 100))
+                    {"$addFields": {
+                        "collab_score": {"$round": [{"$sqrt": {"$multiply": ["$total_contributions", "$repos_count", 100]}}, 0]}
+                    }},
+                    {"$sort": {"collab_score": -1, "total_contributions": -1}},
                     {"$limit": 10},
                     {"$lookup": {
                         "from": "users",
@@ -677,6 +955,7 @@ async def get_dashboard_stats(
                         "total_contributions": 1,
                         "has_commits": 1,
                         "is_mentionable": 1,
+                        "collab_score": 1,
                         "total_commit_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_commit_contributions", 0]}, 0]},
                         "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
                         "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
@@ -694,15 +973,27 @@ async def get_dashboard_stats(
                         "url": {"$arrayElemAt": ["$user_info.url", 0]},
                         "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
                         "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
-                        "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]}
+                        "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]},
+                        "is_enriched": {"$ifNull": [{"$arrayElemAt": ["$user_info.enrichment_status.is_complete", 0]}, False]},
+                        "contributions_to_quantum_repos": "$total_contributions"
                     }}
                 ])
+                # Insertar filtro de disciplina antes del $sort si aplica
+                if discipline_logins is not None:
+                    for i, stage in enumerate(top_users_pipeline):
+                        if "$sort" in stage:
+                            top_users_pipeline.insert(i, {"$match": {"_id": {"$in": list(discipline_logins)}}})
+                            break
                 chart_users = list(repos_collection.aggregate(top_users_pipeline))
             else:
                 # Sin collab_type: usar datos pre-calculados de users collection
                 user_match = {"relevant_repos_count": {"$gt": 0}}
                 if user_filter:
                     user_match.update(user_filter)
+                
+                # Filtrar por disciplina directamente en el match inicial
+                if discipline_logins is not None:
+                    user_match["login"] = {"$in": list(discipline_logins)}
                 
                 top_users_pipeline = [
                     {"$match": user_match},
@@ -717,13 +1008,43 @@ async def get_dashboard_stats(
                         "total_pr_contributions": {"$ifNull": ["$total_pr_contributions", 0]},
                         "total_pr_review_contributions": {"$ifNull": ["$total_pr_review_contributions", 0]},
                         "total_issue_contributions": {"$ifNull": ["$total_issue_contributions", 0]},
+                        # contributionsCollection solo cubre el último año de GitHub.
+                        # Fallback: sumar contributions de extracted_from (all-time a repos trackeados)
                         "total_contributions": {
-                            "$add": [
-                                {"$ifNull": ["$total_commit_contributions", 0]},
-                                {"$ifNull": ["$total_pr_contributions", 0]},
-                                {"$ifNull": ["$total_pr_review_contributions", 0]},
-                                {"$ifNull": ["$total_issue_contributions", 0]}
-                            ]
+                            "$let": {
+                                "vars": {
+                                    "github_contribs": {
+                                        "$add": [
+                                            {"$ifNull": ["$total_commit_contributions", 0]},
+                                            {"$ifNull": ["$total_pr_contributions", 0]},
+                                            {"$ifNull": ["$total_pr_review_contributions", 0]},
+                                            {"$ifNull": ["$total_issue_contributions", 0]}
+                                        ]
+                                    },
+                                    "repo_contribs": {
+                                        "$reduce": {
+                                            "input": {"$ifNull": ["$extracted_from", []]},
+                                            "initialValue": 0,
+                                            "in": {"$add": ["$$value", {"$ifNull": ["$$this.contributions", 0]}]}
+                                        }
+                                    }
+                                },
+                                "in": {
+                                    "$cond": [
+                                        {"$gt": ["$$github_contribs", 0]},
+                                        "$$github_contribs",
+                                        "$$repo_contribs"
+                                    ]
+                                }
+                            }
+                        },
+                        # Contribuciones all-time a repos quantum (de extracted_from)
+                        "contributions_to_quantum_repos": {
+                            "$reduce": {
+                                "input": {"$ifNull": ["$extracted_from", []]},
+                                "initialValue": 0,
+                                "in": {"$add": ["$$value", {"$ifNull": ["$$this.contributions", 0]}]}
+                            }
                         },
                         "organizations": 1,
                         "bio": 1,
@@ -738,12 +1059,207 @@ async def get_dashboard_stats(
                         "url": 1,
                         "website_url": 1,
                         "twitter_username": 1,
-                        "is_hireable": {"$ifNull": ["$is_hireable", False]}
+                        "is_hireable": {"$ifNull": ["$is_hireable", False]},
+                        "is_enriched": {"$ifNull": ["$enrichment_status.is_complete", False]}
                     }},
-                    {"$sort": {"total_contributions": -1, "relevant_repos_count": -1}},
+                    # collab_score = round(sqrt(contributions × repos × 100))
+                    # Debe ser $addFields separado porque $total_contributions se computa en el $project anterior
+                    {"$addFields": {
+                        "collab_score": {"$round": [{"$sqrt": {"$multiply": ["$total_contributions", "$relevant_repos_count", 100]}}, 0]}
+                    }},
+                    {"$sort": {"collab_score": -1, "total_contributions": -1}},
                     {"$limit": 10}
                 ]
                 chart_users = list(users_collection.aggregate(top_users_pipeline))
+        
+        # === CHART USERS: Top 10 usuarios que colaboran en más repos (byRepos) ===
+        # Pipeline independiente: repos → unwind collaborators → group by user counting repos → top 10
+        multi_repo_user_match = {"collaborators": {"$exists": True, "$ne": []}}
+        if repo_filter:
+            multi_repo_user_match.update(repo_filter)
+        
+        multi_repo_user_pipeline = [
+            {"$match": multi_repo_user_match},
+            {"$unwind": "$collaborators"},
+            {"$group": {
+                "_id": "$collaborators.login",
+                "repos_count": {"$sum": 1},
+                "total_contributions": {"$sum": {"$ifNull": ["$collaborators.contributions", 0]}},
+                "has_commits": {"$max": {"$ifNull": ["$collaborators.has_commits", False]}},
+                "is_mentionable": {"$max": {"$ifNull": ["$collaborators.is_mentionable", False]}}
+            }},
+            {"$match": {"_id": {"$ne": None}}},
+            {"$sort": {"repos_count": -1, "total_contributions": -1}},
+            {"$limit": 30},
+            {"$lookup": {
+                "from": "users",
+                "localField": "_id",
+                "foreignField": "login",
+                "as": "user_info"
+            }},
+            {"$project": {
+                "_id": 0,
+                "login": "$_id",
+                "name": {"$arrayElemAt": ["$user_info.name", 0]},
+                "avatar_url": {"$arrayElemAt": ["$user_info.avatar_url", 0]},
+                "relevant_repos_count": "$repos_count",
+                "total_contributions": 1,
+                "has_commits": 1,
+                "is_mentionable": 1,
+                "total_commit_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_commit_contributions", 0]}, 0]},
+                "total_pr_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_contributions", 0]}, 0]},
+                "total_pr_review_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_pr_review_contributions", 0]}, 0]},
+                "total_issue_contributions": {"$ifNull": [{"$arrayElemAt": ["$user_info.total_issue_contributions", 0]}, 0]},
+                "organizations": {"$ifNull": [{"$arrayElemAt": ["$user_info.organizations", 0]}, []]},
+                "bio": {"$arrayElemAt": ["$user_info.bio", 0]},
+                "company": {"$arrayElemAt": ["$user_info.company", 0]},
+                "location": {"$arrayElemAt": ["$user_info.location", 0]},
+                "created_at": {"$arrayElemAt": ["$user_info.created_at", 0]},
+                "followers_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.followers_count", 0]}, 0]},
+                "following_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.following_count", 0]}, 0]},
+                "public_repos_count": {"$ifNull": [{"$arrayElemAt": ["$user_info.public_repos_count", 0]}, 0]},
+                "top_languages": {"$ifNull": [{"$arrayElemAt": ["$user_info.top_languages", 0]}, []]},
+                "quantum_expertise_score": {"$ifNull": [{"$arrayElemAt": ["$user_info.quantum_expertise_score", 0]}, 0]},
+                "url": {"$arrayElemAt": ["$user_info.url", 0]},
+                "website_url": {"$arrayElemAt": ["$user_info.website_url", 0]},
+                "twitter_username": {"$arrayElemAt": ["$user_info.twitter_username", 0]},
+                "is_hireable": {"$ifNull": [{"$arrayElemAt": ["$user_info.is_hireable", 0]}, False]},
+                "is_enriched": {"$ifNull": [{"$arrayElemAt": ["$user_info.enrichment_status.is_complete", 0]}, False]},
+                "contributions_to_quantum_repos": "$total_contributions"
+            }}
+        ]
+        # Insertar filtro de disciplina antes del $sort si aplica
+        if discipline_logins is not None:
+            for i, stage in enumerate(multi_repo_user_pipeline):
+                if "$sort" in stage:
+                    multi_repo_user_pipeline.insert(i, {"$match": {"_id": {"$in": list(discipline_logins)}}})
+                    break
+        # Filtrar bots si no se incluyen
+        chart_users_by_repos_raw = list(repos_collection.aggregate(multi_repo_user_pipeline))
+        if not include_bots:
+            chart_users_by_repos_raw = [u for u in chart_users_by_repos_raw if not is_bot(u.get("login", ""))]
+        chart_users_by_repos = chart_users_by_repos_raw[:10]
+        
+        # === DISTRIBUCIÓN DE DISCIPLINAS FILTRADA ===
+        # Paso 1: Obtener TODOS los logins filtrados (no depende de datos de disciplina)
+        # Paso 2: Si hay datos de disciplina, computar distribución en el backend
+        # Paso 3: Si no, devolver logins al frontend para cómputo client-side
+        filtered_discipline_dist = None
+        _filtered_collab_logins = None  # Fallback para frontend
+        
+        if has_filters:
+            _all_filtered_logins = set()
+            try:
+                if repo:
+                    # Collaborators from repo doc
+                    _rd = repos_collection.find_one({"full_name": repo})
+                    if _rd and _rd.get("collaborators"):
+                        _cc = _rd.get("collaborators", [])
+                        if not include_bots:
+                            _cc = [c for c in _cc if not is_bot(c.get("login", ""))]
+                        if collab_type == "contributors":
+                            _cc = [c for c in _cc if c.get("has_commits", False)]
+                        elif collab_type == "reviewers":
+                            _cc = [c for c in _cc if c.get("is_mentionable", False) and not c.get("has_commits", False)]
+                        if discipline_logins is not None:
+                            _cc = [c for c in _cc if c.get("login") in discipline_logins]
+                        _all_filtered_logins = {c.get("login") for c in _cc if c.get("login")}
+                elif language:
+                    # Lightweight pipeline: repos by language → all collaborator logins
+                    _lf = {"$or": [{"primary_language.name": language}, {"primary_language": language}]}
+                    if org:
+                        _lf = {"$and": [{"$or": _lf.pop("$or")}, {"$or": [{"owner.login": org}, {"organization.login": org}]}]}
+                    _pipe = [
+                        {"$match": _lf},
+                        {"$match": {"collaborators": {"$exists": True, "$ne": []}}},
+                        {"$unwind": "$collaborators"},
+                    ]
+                    if not include_bots:
+                        _pipe.append({"$match": {"collaborators.login": {"$not": {"$regex": "\\[bot\\]|^bot-|-bot$", "$options": "i"}}}})
+                    if collab_type == "contributors":
+                        _pipe.append({"$match": {"collaborators.has_commits": True}})
+                    elif collab_type == "reviewers":
+                        _pipe.append({"$match": {"collaborators.is_mentionable": True, "$or": [{"collaborators.has_commits": False}, {"collaborators.has_commits": {"$exists": False}}]}})
+                    _pipe.append({"$group": {"_id": "$collaborators.login"}})
+                    if discipline_logins is not None:
+                        _pipe.append({"$match": {"_id": {"$in": list(discipline_logins)}}})
+                    _all_filtered_logins = {r["_id"] for r in repos_collection.aggregate(_pipe) if r.get("_id")}
+                elif org or (collab_type and collab_type != "all") or not include_bots:
+                    # Lightweight pipeline from repos with org/collab filters
+                    _bm = {"collaborators": {"$exists": True, "$ne": []}}
+                    if org:
+                        _bm["$or"] = [{"owner.login": org}, {"organization.login": org}]
+                    _pipe = [{"$match": _bm}, {"$unwind": "$collaborators"}]
+                    if not include_bots:
+                        _pipe.append({"$match": {"collaborators.login": {"$not": {"$regex": "\\[bot\\]|^bot-|-bot$", "$options": "i"}}}})
+                    if collab_type == "contributors":
+                        _pipe.append({"$match": {"collaborators.has_commits": True}})
+                    elif collab_type == "reviewers":
+                        _pipe.append({"$match": {"collaborators.is_mentionable": True, "$or": [{"collaborators.has_commits": False}, {"collaborators.has_commits": {"$exists": False}}]}})
+                    _pipe.append({"$group": {"_id": "$collaborators.login"}})
+                    if discipline_logins is not None:
+                        _pipe.append({"$match": {"_id": {"$in": list(discipline_logins)}}})
+                    _all_filtered_logins = {r["_id"] for r in repos_collection.aggregate(_pipe) if r.get("_id")}
+                else:
+                    # Discipline-only or default filter → global users
+                    _um = {"relevant_repos_count": {"$gt": 0}}
+                    if discipline_logins is not None:
+                        _um["login"] = {"$in": list(discipline_logins)}
+                    _all_filtered_logins = {r["login"] for r in users_collection.find(_um, {"login": 1, "_id": 0})}
+            except Exception as _fl_err:
+                logger.warning(f"⚠️ Error computing filtered logins: {_fl_err}")
+            
+            # Paso 2: Computar distribución de disciplinas si tenemos datos
+            if _all_filtered_logins and (_node_metrics or _login_to_discipline):
+                try:
+                    _login_disc = {}
+                    if _node_metrics:
+                        for _nid, _nm in _node_metrics.items():
+                            if _nid.startswith("user_"):
+                                _d = _nm.get("discipline")
+                                if _d:
+                                    _login_disc[_nid[5:]] = _d
+                    else:
+                        _login_disc = dict(_login_to_discipline)
+                    
+                    if _login_disc:
+                        _dist = {}
+                        for _login in _all_filtered_logins:
+                            _d = _login_disc.get(_login)
+                            if _d:
+                                _dist[_d] = _dist.get(_d, 0) + 1
+                        
+                        _total = sum(_dist.values())
+                        _dist_pct = {k: round(v / _total * 100, 1) for k, v in _dist.items()} if _total > 0 else {}
+                        
+                        # Cross-discipline index: normalized Shannon entropy (0-100%)
+                        import math
+                        if _total > 0 and len(_dist) > 1:
+                            _entropy = -sum((v / _total) * math.log2(v / _total) for v in _dist.values() if v > 0)
+                            _max_entropy = math.log2(6)  # 6 discipline categories
+                            _cdi = round(_entropy / _max_entropy * 100, 1) if _max_entropy > 0 else 0
+                        else:
+                            _cdi = 0.0
+                        
+                        # Filter bridge profiles to only include users matching filters
+                        _existing_bridges = (_node_metrics_data or {}).get("discipline_analysis", {}).get("bridge_profiles", [])
+                        _filtered_bridges = [bp for bp in _existing_bridges if bp.get("login") in _all_filtered_logins]
+                        
+                        filtered_discipline_dist = {
+                            "distribution": _dist,
+                            "distribution_pct": _dist_pct,
+                            "total_classified": _total,
+                            "cross_discipline_index": _cdi,
+                            "bridge_profiles": _filtered_bridges[:20],
+                        }
+                        logger.info(f"📊 Distribución de disciplinas filtrada: {_total} usuarios, CDI={_cdi}%")
+                except Exception as _dd_err:
+                    logger.warning(f"⚠️ Error computing filtered discipline distribution: {_dd_err}")
+            
+            # Paso 3: Si no pudimos computar distribución pero sí logins, enviar al frontend
+            if not filtered_discipline_dist and _all_filtered_logins:
+                _filtered_collab_logins = list(_all_filtered_logins)
+                logger.info(f"📋 Enviando {len(_filtered_collab_logins)} logins filtrados para cómputo client-side")
         
         # === GRAFO: Nodos y enlaces pre-calculados ===
         # Top 15 orgs para el grafo
@@ -852,10 +1368,16 @@ async def get_dashboard_stats(
                 "repositories": {
                     "byStars": chart_repos_stars,
                     "byForks": chart_repos_forks,
-                    "byCollaborators": chart_repos_collabs
+                    "byCollaborators": chart_repos_collabs,
+                    "bySharedCollaborators": chart_repos_shared
                 },
-                "users": chart_users,
-                "languageDistribution": language_distribution
+                "users": {
+                    "byContributions": chart_users,
+                    "byRepos": chart_users_by_repos
+                },
+                "languageDistribution": language_distribution,
+                "disciplineDistribution": filtered_discipline_dist,
+                "filteredCollaboratorLogins": _filtered_collab_logins
             },
             "graph": {
                 "organizations": graph_orgs,
@@ -878,7 +1400,8 @@ async def get_dashboard_stats(
                     "language": language,
                     "repo": repo,
                     "collab_type": collab_type,
-                    "include_bots": include_bots
+                    "include_bots": include_bots,
+                    "discipline": discipline
                 } if has_filters else None
             }
         }
@@ -991,11 +1514,21 @@ async def refresh_dashboard_metrics():
 # ============================================================================
 
 @router.get("/collaboration/discover")
-async def discover_collaboration(force: bool = False):
+async def discover_collaboration(
+    force: bool = False,
+    year_from: Optional[int] = Query(default=None, description="Año inicio del rango temporal (incluido). Filtra repos por pushed_at."),
+    year_to: Optional[int] = Query(default=None, description="Año fin del rango temporal (incluido). Filtra repos por pushed_at.")
+):
     """
     Auto-descubre patrones de colaboración analizando TODA la base de datos.
     Usa caché en MongoDB (colección 'metrics', doc 'collaboration_graph')
     para servir resultados instantáneamente. Pasar ?force=true recalcula.
+    
+    Filtros temporales opcionales:
+    - year_from / year_to: filtra repos cuyo pushed_at caiga dentro del rango [year_from, year_to].
+      Si solo se indica year_from, se muestran repos con actividad desde ese año hasta hoy.
+      Si solo se indica year_to, se muestran repos con actividad hasta ese año (desde el inicio).
+      Cuando hay filtros temporales activos, la caché se omite para recalcular en tiempo real.
     
     Busca automáticamente:
     1. Bridge Users: Usuarios que contribuyen a 2+ repositorios
@@ -1009,6 +1542,7 @@ async def discover_collaboration(force: bool = False):
         - metrics: Estadísticas de colaboración
         - bridge_users: Top usuarios puente
         - connected_pairs: Pares de repos/orgs más conectados
+        - temporal_filter: Info del filtro temporal aplicado (si existe)
     """
     try:
         import orjson
@@ -1018,8 +1552,20 @@ async def discover_collaboration(force: bool = False):
         
         db.ensure_connection()
         
+        # ── Detectar filtro temporal ──
+        has_temporal_filter = year_from is not None or year_to is not None
+        temporal_info = None
+        if has_temporal_filter:
+            temporal_info = {
+                "year_from": year_from,
+                "year_to": year_to,
+                "label": f"{year_from or '∞'} – {year_to or '∞'}"
+            }
+            logger.info(f"[DISCOVER] Filtro temporal activo: {temporal_info['label']}")
+        
         # ── CACHÉ: intentar servir desde metrics (chunked para >2MB) ──
-        if not force:
+        # Caché solo cuando NO hay filtro temporal activo
+        if not force and not has_temporal_filter:
             metrics_collection = db.get_collection("metrics")
             cached = load_chunked(metrics_collection, "collaboration_graph")
             if cached:
@@ -1049,8 +1595,35 @@ async def discover_collaboration(force: bool = False):
         all_repos = list(repos_collection.find(
             {"collaborators": {"$exists": True, "$ne": []}},
             {"_id": 0, "name": 1, "full_name": 1, "owner": 1, "stargazer_count": 1,
-             "primary_language": 1, "collaborators": 1, "organization": 1}
+             "primary_language": 1, "collaborators": 1, "organization": 1,
+             "pushed_at": 1, "created_at": 1}
         ))
+        
+        # ── Aplicar filtro temporal por pushed_at ──
+        if has_temporal_filter:
+            from datetime import timezone
+            total_before = len(all_repos)
+            
+            def _repo_in_range(repo):
+                pushed = repo.get("pushed_at")
+                if not pushed:
+                    return False
+                # pushed_at puede ser datetime o string ISO
+                if isinstance(pushed, str):
+                    try:
+                        pushed = datetime.fromisoformat(pushed.replace("Z", "+00:00"))
+                    except (ValueError, TypeError):
+                        return False
+                # Comparar solo el año
+                repo_year = pushed.year
+                if year_from is not None and repo_year < year_from:
+                    return False
+                if year_to is not None and repo_year > year_to:
+                    return False
+                return True
+            
+            all_repos = [r for r in all_repos if _repo_in_range(r)]
+            logger.info(f"[DISCOVER] Filtro temporal: {total_before} → {len(all_repos)} repos (pushed_at en {year_from or '∞'}–{year_to or '∞'})")
         
         # Mapa: user_login → [repos donde contribuye]
         user_to_repos = {}
@@ -1146,8 +1719,22 @@ async def discover_collaboration(force: bool = False):
             if len(repo_orgs) >= 2:
                 user_repo_orgs[login] = list(repo_orgs)
         
-        # Combinar cross-org users
-        cross_org_users = set(user_to_orgs.keys()) | set(user_repo_orgs.keys())
+        # Combinar cross-org users (excluyendo los que solo conectan sibling orgs)
+        _raw_cross_org = set(user_to_orgs.keys()) | set(user_repo_orgs.keys())
+        cross_org_users = set()
+        for login in _raw_cross_org:
+            orgs_list = user_to_orgs.get(login, []) or user_repo_orgs.get(login, [])
+            # Verificar que al menos 2 orgs NO son sibling entre sí
+            has_independent = False
+            for i in range(len(orgs_list)):
+                for j in range(i + 1, len(orgs_list)):
+                    if not _are_sibling_orgs(orgs_list[i], orgs_list[j]):
+                        has_independent = True
+                        break
+                if has_independent:
+                    break
+            if has_independent:
+                cross_org_users.add(login)
         
         # ============================================================
         # PASO 5: Determinar si hay colaboración disponible
@@ -1167,7 +1754,8 @@ async def discover_collaboration(force: bool = False):
                     "cross_org_users": 0
                 },
                 "bridge_users": [],
-                "connected_pairs": []
+                "connected_pairs": [],
+                "temporal_filter": temporal_info
             }
         
         # ============================================================
@@ -1206,6 +1794,16 @@ async def discover_collaboration(force: bool = False):
                 node_id = f"repo_{full_name}"
                 if node_id not in added_nodes:
                     org_login = repo.get("owner", {}).get("login", "")
+                    # Año del último push para filtro temporal client-side
+                    _pushed = repo.get("pushed_at")
+                    _pyr = None
+                    if isinstance(_pushed, datetime):
+                        _pyr = _pushed.year
+                    elif isinstance(_pushed, str):
+                        try:
+                            _pyr = datetime.fromisoformat(_pushed.replace("Z", "+00:00")).year
+                        except (ValueError, TypeError):
+                            pass
                     nodes.append({
                         "id": node_id,
                         "type": "repo",
@@ -1213,7 +1811,8 @@ async def discover_collaboration(force: bool = False):
                         "full_name": full_name,
                         "stars": repo.get("stargazer_count", 0),
                         "language": repo.get("primary_language", {}).get("name") if isinstance(repo.get("primary_language"), dict) else repo.get("primary_language"),
-                        "org": org_login
+                        "org": org_login,
+                        "pushed_at_year": _pyr
                     })
                     added_nodes.add(node_id)
         
@@ -1317,12 +1916,43 @@ async def discover_collaboration(force: bool = False):
                 if org_login and org_login not in org_logins_in_graph:
                     org_logins_in_graph.add(org_login)
         
+        # Pre-compute per-org graph stats from the data we already have
+        _org_repo_counts = {}   # org_login → count of repos in graph
+        _org_contrib_logins = {}  # org_login → set of contributor logins
+        _org_bridge_logins = {}   # org_login → set of bridge user logins
+        for login, repos_list in user_to_repos.items():
+            for r in repos_list:
+                owner = r.get("owner")
+                if not owner or owner not in org_logins_in_graph:
+                    continue
+                fn = r.get("full_name")
+                if fn not in connected_repos:
+                    continue
+                if owner not in _org_contrib_logins:
+                    _org_contrib_logins[owner] = set()
+                _org_contrib_logins[owner].add(login)
+                if login in human_bridge_users:
+                    if owner not in _org_bridge_logins:
+                        _org_bridge_logins[owner] = set()
+                    _org_bridge_logins[owner].add(login)
+        for repo in all_repos:
+            fn = repo.get("full_name")
+            if fn in connected_repos:
+                owner = repo.get("owner", {}).get("login", "")
+                if owner:
+                    _org_repo_counts[owner] = _org_repo_counts.get(owner, 0) + 1
+        
         for org_login in org_logins_in_graph:
             org_id = f"org_{org_login}"
             if org_id not in added_nodes:
                 org_doc = orgs_collection.find_one(
                     {"login": org_login},
-                    {"_id": 0, "name": 1, "avatar_url": 1}
+                    {"_id": 0, "name": 1, "avatar_url": 1, "description": 1, "location": 1,
+                     "is_verified": 1, "created_at": 1,
+                     "quantum_focus_score": 1, "is_quantum_focused": 1,
+                     "quantum_repositories_count": 1, "total_repositories_count": 1,
+                     "quantum_contributors_count": 1, "total_members_count": 1, "members_count": 1,
+                     "total_stars": 1, "top_languages": 1, "public_repos_count": 1}
                 )
                 nodes.append({
                     "id": org_id,
@@ -1330,6 +1960,21 @@ async def discover_collaboration(force: bool = False):
                     "login": org_login,
                     "name": (org_doc.get("name") if org_doc else None) or org_login,
                     "avatar_url": org_doc.get("avatar_url") if org_doc else None,
+                    "description": org_doc.get("description") if org_doc else None,
+                    "location": org_doc.get("location") if org_doc else None,
+                    "is_verified": org_doc.get("is_verified", False) if org_doc else False,
+                    "created_at": org_doc.get("created_at") if org_doc else None,
+                    "quantum_focus_score": org_doc.get("quantum_focus_score", 0) if org_doc else 0,
+                    "is_quantum_focused": org_doc.get("is_quantum_focused", False) if org_doc else False,
+                    "quantum_repos_count": org_doc.get("quantum_repositories_count", 0) if org_doc else 0,
+                    "total_repos_count": org_doc.get("total_repositories_count") or org_doc.get("public_repos_count", 0) if org_doc else 0,
+                    "members_count": org_doc.get("total_members_count") or org_doc.get("members_count", 0) if org_doc else 0,
+                    "total_stars": org_doc.get("total_stars", 0) if org_doc else 0,
+                    "top_languages": (org_doc.get("top_languages") or [])[:5] if org_doc else [],
+                    # Graph-level stats (computed from current collaboration data)
+                    "graph_repos_count": _org_repo_counts.get(org_login, 0),
+                    "graph_contributors_count": len(_org_contrib_logins.get(org_login, set())),
+                    "graph_bridge_count": len(_org_bridge_logins.get(org_login, set())),
                 })
                 added_nodes.add(org_id)
                 
@@ -1365,10 +2010,15 @@ async def discover_collaboration(force: bool = False):
                         org_pair_bridges[key].add(login)
         
         # Solo emitir links con ≥ 3 bridge users compartidos para evitar ruido
+        # Excluir pares de orgs hermanas (misma entidad organizacional)
         entanglement_count = 0
+        sibling_pairs_skipped = 0
         for (org_a, org_b), shared_logins in org_pair_bridges.items():
             strength = len(shared_logins)
             if strength >= 3:
+                if _are_sibling_orgs(org_a, org_b):
+                    sibling_pairs_skipped += 1
+                    continue
                 links.append({
                     "source": f"org_{org_a}",
                     "target": f"org_{org_b}",
@@ -1377,7 +2027,9 @@ async def discover_collaboration(force: bool = False):
                 })
                 entanglement_count += 1
         
-        logger.info(f"[DISCOVER] Entrelazamientos org↔org: {entanglement_count} (threshold ≥3 bridge users)")
+        if sibling_pairs_skipped > 0:
+            logger.info(f"[DISCOVER] Sibling org pairs excluidos: {sibling_pairs_skipped}")
+        logger.info(f"[DISCOVER] Entrelazamientos org↔org genuinos: {entanglement_count} (threshold ≥3 bridge users)")
         
         # ============================================================
         # PASO 8: Construir resumen textual
@@ -1400,6 +2052,12 @@ async def discover_collaboration(force: bool = False):
         user_nodes_in_graph = [n for n in nodes if n["type"] == "user"]
         bridge_nodes_in_graph = [n for n in user_nodes_in_graph if n.get("isBridge")]
         
+        # ── Calcular rango temporal disponible (min/max pushed_at_year) ──
+        repo_nodes_years = [n.get("pushed_at_year") for n in nodes if n.get("type") == "repo" and n.get("pushed_at_year")]
+        temporal_range = None
+        if repo_nodes_years:
+            temporal_range = {"min": min(repo_nodes_years), "max": max(repo_nodes_years)}
+        
         result = {
             "available": True,
             "summary": summary,
@@ -1417,21 +2075,27 @@ async def discover_collaboration(force: bool = False):
                 "collaboration_density": density
             },
             "bridge_users": enriched_bridge_list,
-            "connected_pairs": connected_repo_pairs[:20]
+            "connected_pairs": connected_repo_pairs[:20],
+            "temporal_filter": temporal_info,
+            "temporal_range": temporal_range
         }
         
         # ── GUARDAR EN CACHÉ MongoDB (chunked para >2MB) ──
-        try:
-            metrics_collection = db.get_collection("metrics")
-            save_chunked(
-                metrics_collection,
-                "collaboration_graph",
-                result,
-                large_fields=["graph.nodes", "graph.links", "bridge_users"]
-            )
-            logger.info(f"[DISCOVER] Grafo guardado en caché chunked ({len(nodes)} nodos, {len(links)} links)")
-        except Exception as cache_err:
-            logger.warning(f"[DISCOVER] No se pudo cachear el grafo: {cache_err}")
+        # Solo cachear cuando NO hay filtro temporal (el grafo completo)
+        if not has_temporal_filter:
+            try:
+                metrics_collection = db.get_collection("metrics")
+                save_chunked(
+                    metrics_collection,
+                    "collaboration_graph",
+                    result,
+                    large_fields=["graph.nodes", "graph.links", "bridge_users"]
+                )
+                logger.info(f"[DISCOVER] Grafo guardado en caché chunked ({len(nodes)} nodos, {len(links)} links)")
+            except Exception as cache_err:
+                logger.warning(f"[DISCOVER] No se pudo cachear el grafo: {cache_err}")
+        else:
+            logger.info(f"[DISCOVER] Filtro temporal activo → caché omitida ({len(nodes)} nodos, {len(links)} links)")
         
         return Response(content=orjson.dumps(result), media_type="application/json")
         
@@ -1911,13 +2575,18 @@ _network_metrics_cache = {"json_bytes": None, "computed_at": None, "analyzer": N
 _children_cache = {}
 
 @router.get("/collaboration/network-metrics")
-async def get_network_metrics(force_refresh: bool = Query(default=False)):
+async def get_network_metrics(
+    force_refresh: bool = Query(default=False),
+    year_from: Optional[int] = Query(default=None, description="Año inicio del rango temporal (incluido)"),
+    year_to: Optional[int] = Query(default=None, description="Año fin del rango temporal (incluido)")
+):
     """
     Computa métricas de red de colaboración optimizadas para el frontend.
     Devuelve solo: node_metrics (compacto), communities, global_metrics.
     Omite edge_metrics, searchable_nodes, bus_factors (no usados por UI).
     Caché PERMANENTE: memoria + MongoDB chunked. Sin TTL. Usa orjson.
     Invalidación solo vía POST /dashboard/refresh-metrics o tras ingesta/enriquecimiento.
+    Con filtros temporales, la caché se omite y se recalcula en tiempo real.
     """
     try:
         import orjson
@@ -1925,9 +2594,11 @@ async def get_network_metrics(force_refresh: bool = Query(default=False)):
         from ..core.db import db
         from ..core.chunked_cache import load_chunked, save_chunked
         
-        # ── 1. Caché en memoria (más rápido, sin TTL) ──
+        has_temporal_filter = year_from is not None or year_to is not None
+        
+        # ── 1. Caché en memoria (más rápido, sin TTL) ── solo sin filtro temporal
         cache = _network_metrics_cache
-        if not force_refresh and cache["json_bytes"] and cache["computed_at"]:
+        if not force_refresh and not has_temporal_filter and cache["json_bytes"] and cache["computed_at"]:
             logger.info("[NetworkMetrics] Devolviendo desde caché en memoria (permanente)")
             return Response(
                 content=cache["json_bytes"],
@@ -1937,8 +2608,8 @@ async def get_network_metrics(force_refresh: bool = Query(default=False)):
         db.ensure_connection()
         metrics_collection = db.get_collection("metrics")
         
-        # ── 2. Caché en MongoDB chunked (sobrevive restarts, sin TTL) ──
-        if not force_refresh:
+        # ── 2. Caché en MongoDB chunked (sobrevive restarts, sin TTL) ── solo sin filtro temporal
+        if not force_refresh and not has_temporal_filter:
             cached_result = load_chunked(metrics_collection, "network_metrics")
             if cached_result:
                 json_bytes = orjson.dumps(cached_result)
@@ -1949,14 +2620,20 @@ async def get_network_metrics(force_refresh: bool = Query(default=False)):
                 return Response(content=json_bytes, media_type="application/json")
         
         # ── 3. Computar desde cero ──
-        logger.info("[NetworkMetrics] Construyendo grafo y computando métricas...")
+        if has_temporal_filter:
+            logger.info(f"[NetworkMetrics] Construyendo grafo CON FILTRO TEMPORAL ({year_from or '∞'}–{year_to or '∞'})...")
+        else:
+            logger.info("[NetworkMetrics] Construyendo grafo y computando métricas...")
         repos_col = db.get_collection("repositories")
         users_col = db.get_collection("users")
         orgs_col = db.get_collection("organizations")
         
         analyzer = CollaborationNetworkAnalyzer()
-        analyzer.build_from_mongodb(repos_col, users_col, orgs_col)
-        full = analyzer.get_full_analysis()
+        analyzer.build_from_mongodb(repos_col, users_col, orgs_col, year_from=year_from, year_to=year_to)
+        full = analyzer.get_full_analysis(
+            users_collection=users_col,
+            repos_collection=repos_col
+        )
         
         # Construir respuesta compacta - solo lo que el frontend necesita
         compact_node_metrics = {}
@@ -1981,6 +2658,15 @@ async def get_network_metrics(force_refresh: bool = Query(default=False)):
                         {"login": c["login"], "percentage": c.get("percentage", 0)}
                         for c in tc[:3]
                     ]
+            # Discipline data for users
+            if "discipline" in m:
+                entry["discipline"] = m["discipline"]
+                entry["discipline_color"] = m.get("discipline_color", "#888888")
+                entry["discipline_label"] = m.get("discipline_label", "")
+                entry["discipline_confidence"] = m.get("discipline_confidence", 0)
+                # Multidisciplinary users: include top discipline colors for cycling animation
+                if m.get("discipline_top_colors"):
+                    entry["discipline_top_colors"] = m["discipline_top_colors"]
             compact_node_metrics[node_id] = entry
         
         # Comunidades compactas
@@ -2000,29 +2686,53 @@ async def get_network_metrics(force_refresh: bool = Query(default=False)):
             "global_metrics": full.get("global_metrics", {}),
         }
         
+        # Add discipline analysis if available
+        if "discipline_analysis" in full:
+            result["discipline_analysis"] = full["discipline_analysis"]
+        
         # Serializar con orjson (~10x más rápido que json.dumps)
         json_bytes = orjson.dumps(result)
         
-        # Guardar en caché en memoria
-        _network_metrics_cache["json_bytes"] = json_bytes
-        _network_metrics_cache["computed_at"] = datetime.utcnow()
-        _network_metrics_cache["analyzer"] = analyzer
+        # Guardar en caché en memoria (solo sin filtro temporal)
+        if not has_temporal_filter:
+            _network_metrics_cache["json_bytes"] = json_bytes
+            _network_metrics_cache["computed_at"] = datetime.utcnow()
+            _network_metrics_cache["analyzer"] = analyzer
         
-        # Guardar en MongoDB chunked (persistente, sobrevive restarts)
-        try:
-            save_chunked(
-                metrics_collection,
-                "network_metrics",
-                result,
-                large_fields=["node_metrics"]
-            )
-        except Exception as mongo_err:
-            logger.warning(f"[NetworkMetrics] No se pudo persistir a MongoDB: {mongo_err}")
+        # Guardar en MongoDB chunked (persistente, sobrevive restarts) — solo sin filtro temporal
+        if not has_temporal_filter:
+            try:
+                save_chunked(
+                    metrics_collection,
+                    "network_metrics",
+                    result,
+                    large_fields=["node_metrics"]
+                )
+            except Exception as mongo_err:
+                logger.warning(f"[NetworkMetrics] No se pudo persistir a MongoDB: {mongo_err}")
+            
+            # Guardar mapeo compacto login→discipline (documento pequeño, siempre persiste)
+            # Usado como fallback por dashboard/stats cuando _node_metrics no está disponible
+            try:
+                _disc_mapping = {}
+                for _nid, _nm in compact_node_metrics.items():
+                    if _nid.startswith("user_") and _nm.get("discipline"):
+                        _disc_mapping[_nid[5:]] = _nm["discipline"]
+                if _disc_mapping:
+                    metrics_collection.replace_one(
+                        {"_id": "user_disciplines"},
+                        {"_id": "user_disciplines", "mapping": _disc_mapping, "_cached_at": datetime.utcnow()},
+                        upsert=True
+                    )
+                    logger.info(f"[NetworkMetrics] Guardado mapeo user_disciplines: {len(_disc_mapping)} usuarios")
+            except Exception as disc_err:
+                logger.warning(f"[NetworkMetrics] No se pudo guardar user_disciplines: {disc_err}")
         
+        cache_label = "sin cachear (filtro temporal)" if has_temporal_filter else "cacheado en memoria + MongoDB"
         logger.info(
             f"[NetworkMetrics] Respuesta: {len(compact_node_metrics)} nodos, "
             f"{len(compact_communities)} comunidades, "
-            f"{len(json_bytes) / 1024:.0f} KB (cacheado en memoria + MongoDB)"
+            f"{len(json_bytes) / 1024:.0f} KB ({cache_label})"
         )
         return Response(content=json_bytes, media_type="application/json")
         
@@ -2306,6 +3016,79 @@ async def get_user_by_id(user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/users/profile/{login}")
+async def get_user_profile(login: str):
+    """
+    Obtiene el perfil completo de un usuario por login.
+    Devuelve los mismos campos que el chart de usuarios para consistencia.
+    Usado cuando el usuario no está en el top 10 del dashboard.
+    """
+    try:
+        from ..core.db import db
+
+        user_collection = db.get_collection("users")
+        user = user_collection.find_one(
+            {"login": login},
+            {
+                "_id": 0,
+                "id": 1,
+                "login": 1,
+                "name": 1,
+                "avatar_url": 1,
+                "relevant_repos_count": 1,
+                "total_commit_contributions": 1,
+                "total_pr_contributions": 1,
+                "total_pr_review_contributions": 1,
+                "total_issue_contributions": 1,
+                "organizations": 1,
+                "bio": 1,
+                "company": 1,
+                "location": 1,
+                "created_at": 1,
+                "followers_count": 1,
+                "following_count": 1,
+                "public_repos_count": 1,
+                "top_languages": 1,
+                "quantum_expertise_score": 1,
+                "url": 1,
+                "website_url": 1,
+                "twitter_username": 1,
+                "is_hireable": 1,
+                "extracted_from": 1,
+                "enrichment_status": 1,
+                "has_commits": 1,
+                "is_mentionable": 1,
+            }
+        )
+
+        if not user:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        # Calcular total_contributions con fallback a extracted_from
+        github_contribs = (
+            (user.get("total_commit_contributions") or 0)
+            + (user.get("total_pr_contributions") or 0)
+            + (user.get("total_pr_review_contributions") or 0)
+            + (user.get("total_issue_contributions") or 0)
+        )
+        extracted_from = user.get("extracted_from", [])
+        repo_contribs = sum(e.get("contributions", 0) for e in extracted_from)
+        user["total_contributions"] = github_contribs if github_contribs > 0 else repo_contribs
+        user["contributions_to_quantum_repos"] = repo_contribs
+        user["is_enriched"] = user.get("enrichment_status", {}).get("is_complete", False)
+
+        # Limpiar campos internos pesados
+        user.pop("extracted_from", None)
+        user.pop("enrichment_status", None)
+
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error al obtener perfil de usuario {login}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/organizations")
 async def list_organizations(
     skip: int = Query(default=0, ge=0, description="Número de documentos a saltar"),
@@ -2363,16 +3146,25 @@ async def get_organization_by_id(org_id: str):
 async def ingest_repositories(
     background_tasks: BackgroundTasks,
     max_results: Optional[int] = Query(None, description="Máximo de repositorios a ingerir"),
-    incremental: bool = Query(False, description="Modo incremental (solo actualizar cambios)"),
-    use_segmentation: bool = Query(True, description="Usar segmentación dinámica para más de 1000 repos")
+    incremental: bool = Query(False, description="Modo incremental (solo repos nuevos/actualizados desde última ingesta)"),
+    from_scratch: bool = Query(False, description="Modo desde cero (limpia colección y reingesta todo, elimina datos zombi)"),
+    use_segmentation: bool = Query(True, description="Usar segmentación dinámica para más de 1000 repos"),
+    max_workers: int = Query(4, description="Workers paralelos para búsquedas segmentadas (1-8)")
 ):
     """
     Ejecuta la ingesta de repositorios usando la configuración de ingestion_config.json.
     
+    Modos de ingesta:
+    - incremental=True: Solo busca repos actualizados desde la última ingesta (usa pushed:>DATE)
+    - from_scratch=True: Limpia la colección y reingesta todo (elimina datos zombi)
+    - Ambos False: Ingesta completa sin limpiar (upsert sobre datos existentes)
+    
     Args:
         max_results: Límite opcional de repositorios a ingerir
-        incremental: Si True, solo actualiza documentos modificados
+        incremental: Si True, solo busca repos nuevos/actualizados
+        from_scratch: Si True, limpia colección antes de ingestar
         use_segmentation: Si True, usa segmentación para superar límite de 1000 resultados
+        max_workers: Workers paralelos para segmentos (1-8)
         
     Returns:
         Estado inicial de la tarea y task_id para consultar progreso
@@ -2381,10 +3173,12 @@ async def ingest_repositories(
         task_id = f"repo_ingestion_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         # Inicializar estado de la tarea
+        mode = "from_scratch" if from_scratch else ("incremental" if incremental else "full")
         background_tasks_status[task_id] = {
             "status": "running",
             "started_at": datetime.now().isoformat(),
-            "progress": "Inicializando ingesta de repositorios...",
+            "progress": f"Inicializando ingesta de repositorios (modo: {mode})...",
+            "mode": mode,
             "stats": None,
             "error": None
         }
@@ -2395,7 +3189,9 @@ async def ingest_repositories(
             task_id,
             max_results,
             incremental,
-            use_segmentation
+            use_segmentation,
+            from_scratch,
+            max_workers
         )
         
         logger.info(f"✅ Tarea de ingesta de repositorios iniciada: {task_id}")
@@ -2416,15 +3212,21 @@ async def ingest_repositories(
 async def ingest_users(
     background_tasks: BackgroundTasks,
     max_repos: Optional[int] = Query(None, description="Máximo de repositorios a procesar"),
-    batch_size: int = Query(50, description="Tamaño del lote para procesamiento")
+    batch_size: int = Query(50, description="Tamaño del lote para procesamiento"),
+    from_scratch: bool = Query(False, description="Modo desde cero (limpia colección de usuarios y reingesta)")
 ):
     """
     Ejecuta la ingesta de usuarios desde los repositorios ya ingestados.
     Extrae usuarios del campo 'collaborators' de cada repositorio.
     
+    Modos:
+    - from_scratch=False (default): Solo añade usuarios nuevos (incremental)
+    - from_scratch=True: Limpia colección y reextrae todos los usuarios
+    
     Args:
         max_repos: Límite opcional de repositorios a procesar
         batch_size: Tamaño del lote para procesamiento
+        from_scratch: Si True, limpia colección antes de ingestar
         
     Returns:
         Estado inicial de la tarea y task_id para consultar progreso
@@ -2432,10 +3234,12 @@ async def ingest_users(
     try:
         task_id = f"user_ingestion_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
+        mode = "from_scratch" if from_scratch else "incremental"
         background_tasks_status[task_id] = {
             "status": "running",
             "started_at": datetime.now().isoformat(),
-            "progress": "Inicializando ingesta de usuarios...",
+            "progress": f"Inicializando ingesta de usuarios (modo: {mode})...",
+            "mode": mode,
             "stats": None,
             "error": None
         }
@@ -2444,7 +3248,8 @@ async def ingest_users(
             _run_user_ingestion,
             task_id,
             max_repos,
-            batch_size
+            batch_size,
+            from_scratch
         )
         
         logger.info(f"✅ Tarea de ingesta de usuarios iniciada: {task_id}")
@@ -2573,15 +3378,21 @@ async def enrich_users(
 async def ingest_organizations(
     background_tasks: BackgroundTasks,
     force_update: bool = Query(False, description="Actualizar organizaciones ya existentes"),
-    batch_size: int = Query(5, description="Tamaño del lote para procesamiento")
+    batch_size: int = Query(5, description="Tamaño del lote para procesamiento"),
+    from_scratch: bool = Query(False, description="Modo desde cero (limpia colección de organizaciones y reingesta)")
 ):
     """
     Ejecuta la ingesta de organizaciones desde usuarios existentes.
     Estrategia Bottom-Up: descubre organizaciones desde los usuarios ya ingestados.
     
+    Modos:
+    - from_scratch=False (default): Solo añade organizaciones nuevas (incremental)
+    - from_scratch=True: Limpia colección y reingesta todas las organizaciones
+    
     Args:
         force_update: Si True, actualiza organizaciones existentes
         batch_size: Tamaño del lote para procesamiento (default 5 para Rate Limit)
+        from_scratch: Si True, limpia colección antes de ingestar
         
     Returns:
         Estado inicial de la tarea y task_id para consultar progreso
@@ -2589,10 +3400,12 @@ async def ingest_organizations(
     try:
         task_id = f"org_ingestion_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
+        mode = "from_scratch" if from_scratch else "incremental"
         background_tasks_status[task_id] = {
             "status": "running",
             "started_at": datetime.now().isoformat(),
-            "progress": "Inicializando ingesta de organizaciones...",
+            "progress": f"Inicializando ingesta de organizaciones (modo: {mode})...",
+            "mode": mode,
             "stats": None,
             "error": None
         }
@@ -2601,7 +3414,8 @@ async def ingest_organizations(
             _run_organization_ingestion,
             task_id,
             force_update,
-            batch_size
+            batch_size,
+            from_scratch
         )
         
         logger.info(f"✅ Tarea de ingesta de organizaciones iniciada: {task_id}")
@@ -2722,26 +3536,30 @@ def _run_repository_ingestion(
     task_id: str,
     max_results: Optional[int],
     incremental: bool,
-    use_segmentation: bool
+    use_segmentation: bool,
+    from_scratch: bool = False,
+    max_workers: int = 4
 ):
     """Ejecuta la ingesta de repositorios en background."""
     try:
-        background_tasks_status[task_id]["progress"] = "Creando motor de ingesta..."
+        mode = "from_scratch" if from_scratch else "incremental"
+        background_tasks_status[task_id]["progress"] = f"Creando motor de ingesta (modo: {mode})..."
         
-        # 1. Creamos el motor
-        engine = IngestionEngine(incremental=incremental)
+        # 1. Creamos el motor con soporte de modos
+        engine = IngestionEngine(
+            incremental=incremental,
+            from_scratch=from_scratch,
+            max_workers=max_workers
+        )
         
         # 2. Forzamos la configuración de segmentación según lo que pidió el usuario
-        # (Esto asegura que el motor use segmentación si use_segmentation=True)
         if use_segmentation:
-            # Inyectamos la preferencia en la configuración del motor
             if hasattr(engine.config, '_config_data'):
                 engine.config._config_data['enable_segmentation'] = True
         
-        background_tasks_status[task_id]["progress"] = "Ejecutando ingesta..."
+        background_tasks_status[task_id]["progress"] = f"Ejecutando ingesta (modo: {mode})..."
         
         # 3. LLAMADA ÚNICA Y CORRECTA
-        # El método run() ya decide internamente si usa segmentación o no
         stats = engine.run(max_results=max_results)
         
         background_tasks_status[task_id]["status"] = "completed"
@@ -2766,11 +3584,13 @@ def _run_repository_ingestion(
 def _run_user_ingestion(
     task_id: str,
     max_repos: Optional[int],
-    batch_size: int
+    batch_size: int,
+    from_scratch: bool = False
 ):
     """Ejecuta la ingesta de usuarios en background."""
     try:
-        background_tasks_status[task_id]["progress"] = "Creando motor de ingesta de usuarios..."
+        mode = "from_scratch" if from_scratch else "incremental"
+        background_tasks_status[task_id]["progress"] = f"Creando motor de ingesta de usuarios (modo: {mode})..."
         
         github_client = GitHubGraphQLClient()
         repos_repo = MongoRepository("repositories")
@@ -2780,10 +3600,11 @@ def _run_user_ingestion(
             github_client=github_client,
             repos_repository=repos_repo,
             users_repository=users_repo,
-            batch_size=batch_size
+            batch_size=batch_size,
+            from_scratch=from_scratch
         )
         
-        background_tasks_status[task_id]["progress"] = "Ejecutando ingesta de usuarios..."
+        background_tasks_status[task_id]["progress"] = f"Ejecutando ingesta de usuarios (modo: {mode})..."
         
         stats = engine.run(max_repos=max_repos)
         
@@ -2902,11 +3723,13 @@ def _run_user_enrichment(
 def _run_organization_ingestion(
     task_id: str,
     force_update: bool,
-    batch_size: int
+    batch_size: int,
+    from_scratch: bool = False
 ):
     """Ejecuta la ingesta de organizaciones en background."""
     try:
-        background_tasks_status[task_id]["progress"] = "Creando motor de ingesta de organizaciones..."
+        mode = "from_scratch" if from_scratch else "incremental"
+        background_tasks_status[task_id]["progress"] = f"Creando motor de ingesta de organizaciones (modo: {mode})..."
         
         users_repo = MongoRepository("users")
         orgs_repo = MongoRepository("organizations", unique_fields=["id"])
@@ -2915,10 +3738,11 @@ def _run_organization_ingestion(
             github_token=config.GITHUB_TOKEN,
             users_repository=users_repo,
             organizations_repository=orgs_repo,
-            batch_size=batch_size
+            batch_size=batch_size,
+            from_scratch=from_scratch
         )
         
-        background_tasks_status[task_id]["progress"] = "Ejecutando ingesta de organizaciones..."
+        background_tasks_status[task_id]["progress"] = f"Ejecutando ingesta de organizaciones (modo: {mode})..."
         
         stats = engine.run(force_update=force_update)
         
@@ -2994,9 +3818,17 @@ def _run_organization_enrichment(
 
 
 @router.post("/pipeline/run-all")
-async def run_full_pipeline(background_tasks: BackgroundTasks):
+async def run_full_pipeline(
+    background_tasks: BackgroundTasks,
+    mode: str = Query("incremental", description="Modo de ingesta: 'incremental' (solo datos nuevos) o 'from_scratch' (limpia todo y reingesta)"),
+    max_workers: int = Query(4, ge=1, le=8, description="Workers paralelos para búsqueda segmentada de repositorios")
+):
     """
-    Ejecuta el pipeline completo de ingesta y enriquecimiento. Este es el que debes ejecutar si quieres una ingesta completa desde 0
+    Ejecuta el pipeline completo de ingesta y enriquecimiento.
+    
+    Modos:
+    - mode='incremental' (default): Solo ingesta datos nuevos desde la última ejecución
+    - mode='from_scratch': Limpia todas las colecciones y reingesta desde cero
     
     Ejecuta directamente todas las operaciones en orden (con logs visibles en Azure):
     1. Ingesta de Repositorios
@@ -3010,26 +3842,32 @@ async def run_full_pipeline(background_tasks: BackgroundTasks):
     """
     import uuid
     
+    if mode not in ("incremental", "from_scratch"):
+        raise HTTPException(status_code=400, detail="mode debe ser 'incremental' o 'from_scratch'")
+    
+    from_scratch = mode == "from_scratch"
     task_id = f"full-pipeline-{uuid.uuid4()}"
     
     background_tasks_status[task_id] = {
         "task_id": task_id,
         "task_type": "full_pipeline",
         "status": "running",
-        "progress": "Iniciando pipeline completo...",
+        "mode": mode,
+        "progress": f"Iniciando pipeline completo (modo: {mode})...",
         "started_at": datetime.now().isoformat()
     }
     
-    background_tasks.add_task(_run_full_pipeline_direct, task_id)
+    background_tasks.add_task(_run_full_pipeline_direct, task_id, from_scratch, max_workers)
     
     return {
         "task_id": task_id,
         "status": "started",
-        "message": "Pipeline completo iniciado. Usa GET /pipeline/status/{task_id} para ver el estado."
+        "mode": mode,
+        "message": f"Pipeline completo iniciado en modo '{mode}'. Usa GET /pipeline/status/{{task_id}} para ver el estado."
     }
 
 
-def _run_full_pipeline_direct(task_id: str):
+def _run_full_pipeline_direct(task_id: str, from_scratch: bool = False, max_workers: int = 4):
     """Ejecuta el pipeline completo llamando directamente a las funciones (logs visibles en Azure)."""
     from dataclasses import dataclass
     from typing import List
@@ -3114,11 +3952,18 @@ def _run_full_pipeline_direct(task_id: str):
         if not github_token:
             raise ValueError("GITHUB_TOKEN no configurado en variables de entorno")
         
+        mode_label = "desde cero" if from_scratch else "incremental"
+        logger.info(f"📋 Modo: {mode_label} | Workers: {max_workers}")
+        
         # 1. Ingesta de Repositorios
-        background_tasks_status[task_id]["progress"] = "1/6 - Ingesta de Repositorios"
+        background_tasks_status[task_id]["progress"] = f"1/6 - Ingesta de Repositorios ({mode_label})"
         result = run_operation(
             "1. Ingesta de Repositorios",
-            lambda: IngestionEngine(incremental=False).run(max_results=None, save_to_json=False)
+            lambda: IngestionEngine(
+                incremental=not from_scratch,
+                from_scratch=from_scratch,
+                max_workers=max_workers
+            ).run(max_results=None, save_to_json=False)
         )
         results.append(result)
         
@@ -3137,10 +3982,10 @@ def _run_full_pipeline_direct(task_id: str):
         results.append(result)
         
         # 3. Ingesta de Usuarios
-        background_tasks_status[task_id]["progress"] = "3/6 - Ingesta de Usuarios"
+        background_tasks_status[task_id]["progress"] = f"3/6 - Ingesta de Usuarios ({mode_label})"
         result = run_operation(
             "3. Ingesta de Usuarios",
-            run_user_ingestion
+            lambda: run_user_ingestion(from_scratch=from_scratch)
         )
         results.append(result)
         
@@ -3163,7 +4008,7 @@ def _run_full_pipeline_direct(task_id: str):
         results.append(result)
         
         # 5. Ingesta de Organizaciones
-        background_tasks_status[task_id]["progress"] = "5/6 - Ingesta de Organizaciones"
+        background_tasks_status[task_id]["progress"] = f"5/6 - Ingesta de Organizaciones ({mode_label})"
         orgs_repo = MongoRepository("organizations")
         
         result = run_operation(
@@ -3172,8 +4017,9 @@ def _run_full_pipeline_direct(task_id: str):
                 github_token=github_token,
                 users_repository=users_repo,
                 organizations_repository=orgs_repo,
-                batch_size=100  # ✅ OPTIMIZADO para vCore M30
-            ).run(force_update=False)
+                batch_size=100,
+                from_scratch=from_scratch
+            ).run(force_update=from_scratch)  # force_update=True cuando es desde cero
         )
         results.append(result)
         

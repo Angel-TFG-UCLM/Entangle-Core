@@ -35,6 +35,12 @@ class Config:
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     
+    # Azure AI Foundry
+    AZURE_AI_ENDPOINT = os.getenv("AZURE_AI_ENDPOINT", "")  # ej: https://entangle-ai-resource.services.ai.azure.com
+    AZURE_AI_PROJECT = os.getenv("AZURE_AI_PROJECT", "")  # ej: entangle-ai
+    AZURE_AI_API_KEY = os.getenv("AZURE_AI_API_KEY", "")
+    AZURE_AI_DEPLOYMENT = os.getenv("AZURE_AI_DEPLOYMENT", "gpt-4o")
+
     # Frontend URL para CORS (Azure Static Web Apps)
     FRONTEND_URL = os.getenv("FRONTEND_URL", "")
     
@@ -154,6 +160,15 @@ class IngestionConfig:
     def keywords(self) -> List[str]:
         """Lista de palabras clave para identificar repositorios cuánticos."""
         return self._config_data.get("keywords", [])
+    
+    @property
+    def search_keywords(self) -> List[str]:
+        """
+        Lista de keywords para búsqueda en GitHub Search API.
+        Cada keyword genera una búsqueda segmentada independiente.
+        Por defecto usa solo la primera keyword del config si no se especifica.
+        """
+        return self._config_data.get("search_keywords", self.keywords[:1])
     
     @property
     def languages(self) -> List[str]:
