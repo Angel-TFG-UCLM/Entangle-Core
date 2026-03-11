@@ -34,9 +34,7 @@ param azureAiProject string = 'entangle-ai'
 @description('Nombre del deployment del modelo (ej: gpt-4o)')
 param azureAiDeployment string = 'gpt-4o'
 
-@secure()
-@description('API Key del servicio Azure AI Foundry')
-param azureAiApiKey string = ''
+// Azure AI usa Managed Identity (DefaultAzureCredential) — no requiere API Key
 
 // ============= VARIABLES =============
 var abbrs = loadJsonContent('./abbreviations.json')
@@ -145,10 +143,6 @@ module api './core/host/container-app.bicep' = {
         name: 'AZURE_AI_DEPLOYMENT'
         value: azureAiDeployment
       }
-      {
-        name: 'AZURE_AI_API_KEY'
-        secretRef: 'azure-ai-api-key'
-      }
     ]
     secrets: [
       {
@@ -158,10 +152,6 @@ module api './core/host/container-app.bicep' = {
       {
         name: 'github-token'
         value: !empty(githubToken) ? githubToken : 'placeholder-configure-after-deploy'
-      }
-      {
-        name: 'azure-ai-api-key'
-        value: !empty(azureAiApiKey) ? azureAiApiKey : 'placeholder-configure-after-deploy'
       }
     ]
   }
