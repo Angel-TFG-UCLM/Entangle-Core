@@ -2,10 +2,17 @@
 Script para ejecutar la ingesta de usuarios desde repositorios.
 
 Extrae usuarios del campo 'collaborators' de repositorios ya ingestados.
+
+Uso:
+    python scripts/run_user_ingestion.py [--mode incremental|from_scratch]
+    
+    O mediante variable de entorno:
+    INGESTION_MODE=from_scratch python scripts/run_user_ingestion.py
 """
 
 import sys
 import os
+import argparse
 
 # Agregar el directorio raíz al path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,9 +25,19 @@ from src.core.logger import logger
 
 def main():
     """Ejecuta la ingesta de usuarios."""
+    # CLI arguments
+    parser = argparse.ArgumentParser(description='Ingesta de usuarios quantum')
+    parser.add_argument('--mode', choices=['incremental', 'from_scratch'],
+                       default=None, help='Modo de ingesta')
+    args = parser.parse_args()
+    
+    # Prioridad: CLI > env var > default
+    mode = args.mode or os.getenv('INGESTION_MODE', 'incremental')
+    from_scratch = mode == 'from_scratch'
     
     logger.info("=" * 80)
     logger.info("INICIANDO INGESTA DE USUARIOS")
+    logger.info(f"MODO: {mode.upper()}")
     logger.info("=" * 80)
     
     # Cargar variables de entorno
@@ -51,7 +68,7 @@ def main():
     try:
         # Ejecutar ingesta
         logger.info("\n🔄 Ejecutando ingesta de usuarios...")
-        stats = run_user_ingestion()
+        stats = run_user_ingestion(from_scratch=from_scratch)
         
         # Mostrar estadísticas finales
         logger.info("\n" + "=" * 80)
