@@ -2,24 +2,31 @@
 Integración con Azure AI Foundry — Arquitectura Router-Worker.
 
 El flujo es:
-  1. ROUTER  → clasifica intención ("DATA" / "UI") con gpt-4o, max_tokens 10
+  1. ROUTER  → clasifica intención ("DATA" / "DASHBOARD" / "UNIVERSE") con gpt-4o, max_tokens 10
   2. WORKER  → despacha al prompt especializado:
-       • DATA_ANALYST  (tools + temperature 0)
-       • UI_EXPERT     (sin tools + temperature 0.5)
+       • DATA_ANALYST      (tools + temperature 0)
+       • UI_DASHBOARD      (sin tools + temperature 0.5)
+       • UI_UNIVERSE       (sin tools + temperature 0.5)
 
 Soporta streaming SSE para enviar pasos de razonamiento en tiempo real.
 """
 import json
+import re
 import threading
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 from azure.identity import DefaultAzureCredential
 
 from ..core.config import config
 from ..core.logger import logger
-from .prompts import DATA_ANALYST_PROMPT, ROUTER_PROMPT, UI_EXPERT_PROMPT
+from .prompts import (
+    DATA_ANALYST_PROMPT,
+    ROUTER_PROMPT,
+    UI_DASHBOARD_PROMPT,
+    UI_UNIVERSE_PROMPT,
+)
 from .tool_functions import TOOL_FUNCTIONS
 
 # Token cache con thread-safety
@@ -236,9 +243,59 @@ def _build_api_url() -> str:
     )
 
 
+# ── Regex para extraer acciones embebidas en la respuesta del agente ──
+_ACTION_PATTERN = re.compile(
+    r'\[ACTION:(\w+)(?::(\{.*?\}))?\]',
+    re.DOTALL,
+)
+
+# Patrón para limpiar code fences que envuelvan marcadores de acción
+# El modelo a veces mete los marcadores dentro de ```...``` por costumbre
+_CODE_FENCE_ACTION = re.compile(
+    r'```[^\n]*\n*\s*(\[ACTION:[^\]]+\])\s*\n*```',
+    re.DOTALL,
+)
+
+
+def _extract_actions(reply: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Extrae directivas de acción embebidas en la respuesta del agente.
+
+    Formato soportado:
+      [ACTION:OPEN_UNIVERSE]
+      [ACTION:OPEN_UNIVERSE:{"autoTour":true}]
+      [ACTION:CREATE_VIEW:{"orgs":["qiskit","IBM"]}]
+
+    También detecta marcadores envueltos en code fences (```...```).
+
+    Retorna:
+      (cleaned_reply, actions_list)
+      donde cleaned_reply es el texto sin los marcadores
+      y actions_list es [{"action": "OPEN_UNIVERSE", "data": {...}}, ...]
+    """
+    # Paso 0: Desenvolver code fences que contengan marcadores de acción
+    text = _CODE_FENCE_ACTION.sub(r'\1', reply)
+
+    actions: List[Dict[str, Any]] = []
+    for match in _ACTION_PATTERN.finditer(text):
+        action_type = match.group(1)
+        raw_data = match.group(2)
+        try:
+            action_data = json.loads(raw_data) if raw_data else {}
+        except (json.JSONDecodeError, TypeError):
+            action_data = {}
+        actions.append({"action": action_type, "data": action_data})
+
+    # Eliminar los marcadores del texto
+    cleaned = _ACTION_PATTERN.sub('', text).strip()
+    # Limpiar líneas vacías duplicadas que queden
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned, actions
+
+
 def _route_intent(user_message: str) -> str:
     """
-    Clasifica la intención del usuario como "DATA" o "UI".
+    Clasifica la intención del usuario como "DATA", "DASHBOARD" o "UNIVERSE".
     Usa el mismo modelo (gpt-4o) con max_tokens=10, sin tools.
     Fallback → "DATA" (es más seguro: el data analyst puede hacer tool calls).
     """
@@ -259,7 +316,7 @@ def _route_intent(user_message: str) -> str:
             .strip()
             .upper()
         )
-        intent = raw if raw in ("DATA", "UI") else "DATA"
+        intent = raw if raw in ("DATA", "DASHBOARD", "UNIVERSE") else "DATA"
         logger.info(f"🧭 Router: \"{user_message[:60]}\" → {intent} (raw={raw})")
         return intent
     except Exception as e:
@@ -308,28 +365,32 @@ def chat(
 ) -> Dict[str, Any]:
     """
     Arquitectura Router-Worker:
-      1. Router clasifica → "DATA" o "UI"
+      1. Router clasifica → "DATA", "DASHBOARD" o "UNIVERSE"
       2. Worker especializado procesa la petición
     """
     endpoint = config.AZURE_AI_ENDPOINT
     if not endpoint:
-        return {"reply": "El servicio de IA no está configurado.", "history": [], "tools_used": []}
+        return {"reply": "El servicio de IA no está configurado.", "history": [], "tools_used": [], "actions": []}
 
     # ── Paso 1: Enrutar ──
     intent = _route_intent(user_message)
 
     # ── Paso 2: Despachar al worker ──
-    if intent == "UI":
-        return _chat_ui_worker(user_message, conversation_history)
+    if intent == "UNIVERSE":
+        return _chat_universe_worker(user_message, conversation_history)
+    if intent == "DASHBOARD":
+        return _chat_dashboard_worker(user_message, conversation_history)
     return _chat_data_worker(user_message, conversation_history)
 
 
-def _chat_ui_worker(
+def _chat_ui_generic(
+    system_prompt: str,
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
+    label: str = "UI",
 ) -> Dict[str, Any]:
-    """Worker UI: sin tools, temperature 0.5, responde sobre la plataforma."""
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": UI_EXPERT_PROMPT}]
+    """Worker UI genérico: sin tools, temperature 0.5. Extrae acciones si las hay."""
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     if conversation_history:
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
@@ -339,15 +400,37 @@ def _chat_ui_worker(
     try:
         data = _api_call_with_retry(_build_api_url(), payload)
     except requests.exceptions.Timeout:
-        return {"reply": "Lo siento, el servicio tardó demasiado en responder.", "history": [], "tools_used": []}
+        return {"reply": "Lo siento, el servicio tardó demasiado en responder.", "history": [], "tools_used": [], "actions": []}
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error en UI worker: {e}")
-        return {"reply": "Error al conectar con el servicio de IA.", "history": [], "tools_used": []}
+        logger.error(f"Error en {label} worker: {e}")
+        return {"reply": "Error al conectar con el servicio de IA.", "history": [], "tools_used": [], "actions": []}
 
-    reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No pude generar una respuesta.")
+    raw_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No pude generar una respuesta.")
+
+    # Extraer acciones embebidas
+    reply, actions = _extract_actions(raw_reply)
+    if actions:
+        logger.info(f"🎬 {label} worker emitió {len(actions)} acción(es): {[a['action'] for a in actions]}")
+
     messages.append({"role": "assistant", "content": reply})
     clean_history = [m for m in messages if m.get("role") != "system"]
-    return {"reply": reply, "history": clean_history, "tools_used": []}
+    return {"reply": reply, "history": clean_history, "tools_used": [], "actions": actions}
+
+
+def _chat_dashboard_worker(
+    user_message: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Worker DASHBOARD: responde sobre el dashboard, metodología y UI 2D."""
+    return _chat_ui_generic(UI_DASHBOARD_PROMPT, user_message, conversation_history, "DASHBOARD")
+
+
+def _chat_universe_worker(
+    user_message: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Worker UNIVERSE: responde sobre el Universo 3D."""
+    return _chat_ui_generic(UI_UNIVERSE_PROMPT, user_message, conversation_history, "UNIVERSE")
 
 
 def _chat_data_worker(
@@ -375,13 +458,13 @@ def _chat_data_worker(
             data = _api_call_with_retry(_build_api_url(), payload)
         except requests.exceptions.Timeout:
             logger.error("Timeout al llamar al agente de IA")
-            return {"reply": "Lo siento, el servicio tardó demasiado en responder.", "history": [], "tools_used": tools_used}
+            return {"reply": "Lo siento, el servicio tardó demasiado en responder.", "history": [], "tools_used": tools_used, "actions": []}
         except requests.exceptions.RequestException as e:
             logger.error(f"Error llamando al agente de IA: {e}")
             status = getattr(getattr(e, 'response', None), 'status_code', None)
             if status == 429:
-                return {"reply": "El servicio está temporalmente saturado. Espera unos segundos.", "history": [], "tools_used": tools_used}
-            return {"reply": "Error al conectar con el servicio de IA.", "history": [], "tools_used": tools_used}
+                return {"reply": "El servicio está temporalmente saturado. Espera unos segundos.", "history": [], "tools_used": tools_used, "actions": []}
+            return {"reply": "Error al conectar con el servicio de IA.", "history": [], "tools_used": tools_used, "actions": []}
 
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
@@ -412,12 +495,13 @@ def _chat_data_worker(
         tools_display = list(dict.fromkeys(
             TOOL_DISPLAY_NAMES.get(t, t) for t in tools_used
         ))
-        return {"reply": reply, "history": clean_history, "tools_used": tools_display}
+        return {"reply": reply, "history": clean_history, "tools_used": tools_display, "actions": []}
 
     return {
         "reply": "Se alcanzó el límite de procesamiento. Por favor, reformula tu pregunta.",
         "history": [],
         "tools_used": tools_used,
+        "actions": [],
     }
 
 
@@ -445,7 +529,7 @@ def chat_stream(
     Versión streaming — arquitectura Router-Worker.
     Emite eventos SSE:
       - {"type": "status",      "message": "..."}
-      - {"type": "routing",     "intent": "DATA"|"UI"}
+      - {"type": "routing",     "intent": "DATA"|"DASHBOARD"|"UNIVERSE"}
       - {"type": "thinking",    "description": "...", "round": N}
       - {"type": "tool_result", "summary": "..."}
       - {"type": "reply",       "content": "...", "history": [...], "tools_used": [...]}
@@ -464,25 +548,30 @@ def chat_stream(
     yield json.dumps({"type": "routing", "intent": intent})
 
     # Status post-routing: informar al usuario qué agente se activó
-    if intent == "UI":
-        yield json.dumps({"type": "status", "message": "Conectando con el Asistente UI…"})
-        yield from _stream_ui_worker(user_message, conversation_history)
+    if intent == "UNIVERSE":
+        yield json.dumps({"type": "status", "message": "Conectando con el Experto Universo…"})
+        yield from _stream_ui_generic(UI_UNIVERSE_PROMPT, user_message, conversation_history, "Experto Universo")
+    elif intent == "DASHBOARD":
+        yield json.dumps({"type": "status", "message": "Conectando con el Experto Dashboard…"})
+        yield from _stream_ui_generic(UI_DASHBOARD_PROMPT, user_message, conversation_history, "Experto Dashboard")
     else:
         yield json.dumps({"type": "status", "message": "Conectando con el Analista de datos…"})
         yield from _stream_data_worker(user_message, conversation_history)
 
 
-def _stream_ui_worker(
+def _stream_ui_generic(
+    system_prompt: str,
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
+    label: str = "UI",
 ) -> Generator[str, None, None]:
-    """Worker UI streaming: sin tools, temperature 0.5."""
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": UI_EXPERT_PROMPT}]
+    """Worker UI streaming genérico: sin tools, temperature 0.5. Extrae acciones."""
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     if conversation_history:
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
-    yield json.dumps({"type": "status", "message": "Asistente UI redactando respuesta…"})
+    yield json.dumps({"type": "status", "message": f"{label} redactando respuesta…"})
 
     payload = {"messages": messages, "temperature": 0.5}
 
@@ -492,11 +581,25 @@ def _stream_ui_worker(
         yield json.dumps({"type": "error", "content": "El servicio tardó demasiado en responder."})
         return
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error en UI worker: {e}")
+        logger.error(f"Error en {label} worker: {e}")
         yield json.dumps({"type": "error", "content": "Error al conectar con el servicio de IA."})
         return
 
-    reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No pude generar una respuesta.")
+    raw_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No pude generar una respuesta.")
+
+    # Extraer acciones embebidas
+    reply, actions = _extract_actions(raw_reply)
+    if actions:
+        logger.info(f"🎬 {label} worker emitió {len(actions)} acción(es): {[a['action'] for a in actions]}")
+
+    # Emitir cada acción como un evento SSE antes del reply
+    for action in actions:
+        yield json.dumps({
+            "type": "action",
+            "action": action["action"],
+            "data": action.get("data", {}),
+        })
+
     messages.append({"role": "assistant", "content": reply})
     clean_history = [m for m in messages if m.get("role") != "system"]
 

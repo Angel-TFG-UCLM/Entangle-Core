@@ -30,6 +30,7 @@ class ChatResponse(BaseModel):
     reply: str
     history: List[Dict[str, Any]]
     tools_used: List[str]
+    actions: List[Dict[str, Any]] = Field(default_factory=list, description="Acciones a ejecutar en el frontend")
 
 
 @chat_router.post("/chat", response_model=ChatResponse)
