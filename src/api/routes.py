@@ -357,13 +357,39 @@ async def get_dashboard_stats(
         # Top language para KPI
         top_language = language_distribution[0]["name"] if language_distribution else "N/A"
         
+        # === Fecha de última ingesta ===
+        last_ingestion_date = None
+        metadata_keys = {
+            "repositories": "repositories_last_ingestion",
+            "users": "users_last_ingestion",
+            "organizations": "organizations_last_ingestion",
+        }
+        try:
+            for col_name in ["repositories", "users", "organizations"]:
+                col = db.get_collection(col_name)
+                # Buscar ingested_at en documentos
+                last_doc = col.find_one({"ingested_at": {"$exists": True}}, sort=[("ingested_at", -1)])
+                dt = last_doc.get("ingested_at") if last_doc else None
+                # Fallback: ingestion_metadata
+                if not dt:
+                    meta_col = db.get_collection("ingestion_metadata")
+                    meta_doc = meta_col.find_one({"type": metadata_keys.get(col_name)})
+                    dt = meta_doc.get("date") if meta_doc else None
+                if dt:
+                    dt_str = dt.isoformat() if isinstance(dt, datetime) else str(dt)
+                    if last_ingestion_date is None or dt_str > last_ingestion_date:
+                        last_ingestion_date = dt_str
+        except Exception:
+            pass
+        
         kpis = {
             "totalRepos": total_repos,
             "totalUsers": total_users,
             "totalOrgs": total_orgs,
             "avgStars": avg_stars,
             "avgExpertise": avg_expertise,
-            "topLanguage": top_language
+            "topLanguage": top_language,
+            "lastIngestionDate": last_ingestion_date
         }
         
         # === CHART: TOP 10 ORGANIZACIONES (por métrica seleccionada) ===

@@ -51,7 +51,7 @@ DISCIPLINE_LABELS = {
     "quantum_software":  "Quantum Software",
     "quantum_physics":   "Quantum Physics",
     "quantum_hardware":  "Quantum Hardware",
-    "classical_tooling": "Classical Tooling",
+    "classical_tooling": "Development Tooling",
     "education_research":"Education & Research",
     "multidisciplinary": "Multidisciplinar",
 }
