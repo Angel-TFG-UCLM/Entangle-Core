@@ -1611,11 +1611,22 @@ async def discover_collaboration(
             if not login:
                 return False
             ll = login.lower()
+            # Explicit known bots/service accounts
+            KNOWN_BOTS = {
+                "dependabot", "renovate", "greenkeeper", "snyk-bot", "codecov",
+                "sonarcloud", "claude", "actions-user", "github-actions",
+                "copilot", "deepsource-autofix", "imgbot", "allcontributors",
+                "pre-commit-ci", "netlify", "vercel", "railway", "render",
+                "mergify", "kodiakhq", "whitesource-bolt", "mend-bolt-for-github",
+                "depfu", "pyup-bot", "fossabot", "semantic-release-bot",
+                "github-pages", "web-flow",
+            }
             return (
                 "[bot]" in ll or
                 ll.endswith("-bot") or
+                (ll.endswith("bot") and len(ll) > 3) or
                 ll.startswith("bot-") or
-                ll in ["dependabot", "renovate", "greenkeeper", "snyk-bot", "codecov", "sonarcloud"]
+                ll in KNOWN_BOTS
             )
         
         all_repos = list(repos_collection.find(
@@ -1679,8 +1690,11 @@ async def discover_collaboration(
             repo_to_users[full_name] = collabs
         
         # ============================================================
-        # PASO 2: Identificar Bridge Users (usuarios en 2+ repos)
+        # PASO 2: Usuarios multi-repo (2+ repos) para conectividad del grafo
         # ============================================================
+        # Nota: contribuir a 2+ repos NO convierte a alguien en bridge user.
+        # El flag isBridge se asigna en el Paso 6f solo a cross-org users
+        # (usuarios que contribuyen a repos de 2+ orgs independientes).
         bridge_users = {}
         for login, repos_list in user_to_repos.items():
             if len(repos_list) >= 2:
@@ -1745,10 +1759,12 @@ async def discover_collaboration(
             if len(repo_orgs) >= 2:
                 user_repo_orgs[login] = list(repo_orgs)
         
-        # Combinar cross-org users (excluyendo los que solo conectan sibling orgs)
+        # Combinar cross-org users (excluyendo bots y los que solo conectan sibling orgs)
         _raw_cross_org = set(user_to_orgs.keys()) | set(user_repo_orgs.keys())
         cross_org_users = set()
         for login in _raw_cross_org:
+            if _is_bot_login(login):
+                continue
             orgs_list = user_to_orgs.get(login, []) or user_repo_orgs.get(login, [])
             # Verificar que al menos 2 orgs NO son sibling entre sí
             has_independent = False
@@ -1863,6 +1879,11 @@ async def discover_collaboration(
                 user_is_bot = bool(user_info["is_bot"])
             else:
                 user_is_bot = _is_bot_login(login)
+            # Orgs conectadas (de repos donde contribuye)
+            connected_orgs = list(set(
+                r.get("owner") for r in (repos_list or [])
+                if r.get("owner")
+            ))
             return {
                 "id": f"user_{login}",
                 "type": "user",
@@ -1870,16 +1891,19 @@ async def discover_collaboration(
                 "name": (user_info.get("name") if user_info else None) or login,
                 "avatar_url": user_info.get("avatar_url") if user_info else None,
                 "repos_count": len(repos_list) if repos_list else 1,
+                "orgs_count": len(connected_orgs),
+                "connected_orgs": connected_orgs,
                 "isBridge": is_bridge,
                 "isBot": user_is_bot,
                 "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0
             }
         
-        # 6f) Añadir nodos de bridge users + links a sus repos
+        # 6f) Añadir nodos de multi-repo users + links a sus repos
+        # Solo los cross-org users se marcan como isBridge (verdaderos puentes)
         enriched_bridge_list = []
         for login, repos_list in top_bridge_users:
             user_id = f"user_{login}"
-            user_node = _make_user_node(login, repos_list, True)
+            user_node = _make_user_node(login, repos_list, login in cross_org_users)
             
             if user_id not in added_nodes:
                 nodes.append(user_node)
@@ -1902,6 +1926,8 @@ async def discover_collaboration(
                 "quantum_expertise_score": user_node.get("quantum_expertise_score", 0),
                 "repos": [r["full_name"] for r in repos_list],
                 "repos_count": len(repos_list),
+                "orgs_count": user_node.get("orgs_count", 0),
+                "connected_orgs": user_node.get("connected_orgs", []),
                 "cross_org": login in cross_org_users
             })
         
@@ -2061,8 +2087,8 @@ async def discover_collaboration(
         # PASO 8: Construir resumen textual
         # ============================================================
         summary_parts = []
-        if len(bridge_users) > 0:
-            summary_parts.append(f"{len(bridge_users)} usuarios puente entre {len(connected_repos)} repositorios")
+        if len(cross_org_users) > 0:
+            summary_parts.append(f"{len(cross_org_users)} bridge users (cross-org) entre {len(connected_repos)} repositorios")
         if len(connected_repo_pairs) > 0:
             summary_parts.append(f"{len(connected_repo_pairs)} pares de repos conectados")
         if len(cross_org_users) > 0:
@@ -2093,7 +2119,8 @@ async def discover_collaboration(
                 "total_users_mapped": len(user_to_repos),
                 "bridge_users_count": len(bridge_nodes_in_graph),
                 "normal_users_count": normal_user_count,
-                "total_bridge_users_found": len(human_bridge_users),
+                "multi_repo_users": len(human_bridge_users),
+                "total_bridge_users_found": len(bridge_nodes_in_graph),
                 "connected_repo_pairs": len(connected_repo_pairs),
                 "cross_org_users": len(cross_org_users),
                 "graph_nodes": len(nodes),
