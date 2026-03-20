@@ -2145,6 +2145,24 @@ async def discover_collaboration(
                     large_fields=["graph.nodes", "graph.links", "bridge_users"]
                 )
                 logger.info(f"[DISCOVER] Grafo guardado en caché chunked ({len(nodes)} nodos, {len(links)} links)")
+
+                # Guardar resumen compacto de top cross-org bridge users
+                # para que el agente de IA pueda consultarlo fácilmente
+                cross_org_bridge_list = [
+                    bu for bu in enriched_bridge_list if bu.get("cross_org")
+                ]
+                cross_org_bridge_list.sort(key=lambda x: (x.get("orgs_count", 0), x.get("repos_count", 0)), reverse=True)
+                metrics_collection.replace_one(
+                    {"_id": "cross_org_bridges"},
+                    {
+                        "_id": "cross_org_bridges",
+                        "total_cross_org_users": len(cross_org_users),
+                        "top_cross_org_bridges": cross_org_bridge_list[:30],
+                        "updated_at": datetime.utcnow().isoformat(),
+                    },
+                    upsert=True,
+                )
+                logger.info(f"[DISCOVER] Resumen cross-org bridges guardado ({len(cross_org_bridge_list)} usuarios)")
             except Exception as cache_err:
                 logger.warning(f"[DISCOVER] No se pudo cachear el grafo: {cache_err}")
         else:
@@ -2167,6 +2185,8 @@ async def invalidate_collaboration_cache():
         db.ensure_connection()
         metrics_collection = db.get_collection("metrics")
         deleted_count = delete_chunked(metrics_collection, "collaboration_graph")
+        # También eliminar el resumen de cross-org bridges
+        metrics_collection.delete_one({"_id": "cross_org_bridges"})
         deleted = deleted_count > 0
         logger.info(f"[DISCOVER] Caché invalidada: {'eliminada' if deleted else 'no existía'} ({deleted_count} docs)")
         return {"invalidated": deleted, "message": f"Caché del grafo eliminada ({deleted_count} docs)" if deleted else "No había caché"}

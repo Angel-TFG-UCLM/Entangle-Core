@@ -586,7 +586,7 @@ def _stream_ui_generic(
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
-    yield json.dumps({"type": "status", "message": f"{label} redactando respuesta…"})
+    yield json.dumps({"type": "status", "message": f"{label} redactando respuesta…", "status_key": "drafting"})
 
     payload = {"messages": messages, "temperature": 0.5}
 
@@ -642,9 +642,9 @@ def _stream_data_worker(
     for round_num in range(max_rounds):
         if round_num > 0:
             if tools_used:
-                yield json.dumps({"type": "status", "message": "Analista procesando datos obtenidos…"})
+                yield json.dumps({"type": "status", "message": "Analista procesando datos obtenidos…", "status_key": "analystProcessing"})
             else:
-                yield json.dumps({"type": "status", "message": "Analista preparando consulta…"})
+                yield json.dumps({"type": "status", "message": "Analista preparando consulta…", "status_key": "analystPreparing"})
 
         payload = {
             "messages": messages,
@@ -702,6 +702,9 @@ def _stream_data_worker(
                 yield json.dumps({
                     "type": "thinking",
                     "description": description,
+                    "tool_key": fn_name,
+                    "collection_key": col_raw,
+                    "has_filter": bool(fn_args.get("filter")),
                     "round": round_num + 1,
                 })
 
@@ -710,11 +713,12 @@ def _stream_data_worker(
                 tools_used.append(fn_name)
 
                 # Emitir resumen breve del resultado
+                result_count = None
                 try:
                     result_data = json.loads(result)
-                    count = result_data.get("count", result_data.get("total", None))
-                    if count is not None:
-                        summary = f"{count} resultados obtenidos"
+                    result_count = result_data.get("count", result_data.get("total", None))
+                    if result_count is not None:
+                        summary = f"{result_count} resultados obtenidos"
                     else:
                         summary = "Datos recibidos"
                 except (json.JSONDecodeError, AttributeError):
@@ -723,6 +727,7 @@ def _stream_data_worker(
                 yield json.dumps({
                     "type": "tool_result",
                     "summary": summary,
+                    "count": result_count,
                 })
 
                 messages.append({
