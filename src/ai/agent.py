@@ -152,13 +152,26 @@ def _api_call_with_retry(url: str, payload: dict) -> dict:
     y errores transitorios (5xx). Respeta el header Retry-After.
     """
     last_error = None
+    msg_count = len(payload.get("messages", []))
+    has_tools = bool(payload.get("tools"))
+    tool_choice = payload.get("tool_choice", "none")
     for attempt in range(_MAX_RETRIES + 1):
         try:
+            t0 = time.time()
+            logger.info(
+                f"🌐 API call attempt={attempt} msgs={msg_count} "
+                f"tools={has_tools} tool_choice={tool_choice}"
+            )
             response = requests.post(
                 url,
                 headers=_get_auth_headers(),
                 json=payload,
                 timeout=120,
+            )
+            elapsed = time.time() - t0
+            logger.info(
+                f"🌐 API response: status={response.status_code} "
+                f"elapsed={elapsed:.1f}s content_length={len(response.content)}"
             )
             # Si no es 429 ni 5xx, procesamos normalmente
             if response.status_code == 429 or response.status_code >= 500:
@@ -179,7 +192,9 @@ def _api_call_with_retry(url: str, payload: dict) -> dict:
             return response.json()
 
         except requests.exceptions.Timeout:
-            raise  # No reintentar timeouts
+            elapsed = time.time() - t0
+            logger.error(f"⏰ API TIMEOUT after {elapsed:.1f}s (attempt {attempt})")
+            raise
         except requests.exceptions.ConnectionError as e:
             if attempt < _MAX_RETRIES:
                 wait = _BASE_BACKOFF * (2 ** attempt)

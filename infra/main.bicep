@@ -25,6 +25,17 @@ param githubToken string = ''
 @description('URL del Frontend para configurar CORS (ej: https://mi-frontend.azurestaticapps.net)')
 param frontendUrl string = ''
 
+@description('Endpoint del servicio Azure AI Foundry')
+param azureAiEndpoint string = 'https://entangle-ai-resource.services.ai.azure.com'
+
+@description('Nombre del proyecto en Azure AI Foundry')
+param azureAiProject string = 'entangle-ai'
+
+@description('Nombre del deployment del modelo (ej: gpt-4o)')
+param azureAiDeployment string = 'gpt-4o'
+
+// Azure AI usa Managed Identity (DefaultAzureCredential) — no requiere API Key
+
 // ============= VARIABLES =============
 var abbrs = loadJsonContent('./abbreviations.json')
 var resourceToken = toLower(uniqueString(subscription().id, environmentName, location))
@@ -119,6 +130,18 @@ module api './core/host/container-app.bicep' = {
       {
         name: 'GITHUB_TOKEN'
         secretRef: 'github-token'
+      }
+      {
+        name: 'AZURE_AI_ENDPOINT'
+        value: azureAiEndpoint
+      }
+      {
+        name: 'AZURE_AI_PROJECT'
+        value: azureAiProject
+      }
+      {
+        name: 'AZURE_AI_DEPLOYMENT'
+        value: azureAiDeployment
       }
     ]
     secrets: [

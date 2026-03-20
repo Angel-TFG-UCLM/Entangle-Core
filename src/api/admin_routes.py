@@ -432,13 +432,28 @@ async def get_db_stats(token: str = Query(..., description="Token de sesión adm
         database = db.get_database()
         
         collections_info = {}
+        # Mapeo colección → clave en ingestion_metadata
+        metadata_keys = {
+            "repositories": "repositories_last_ingestion",
+            "users": "users_last_ingestion",
+            "organizations": "organizations_last_ingestion",
+        }
         for col_name in ["repositories", "users", "organizations"]:
             col = database[col_name]
             count = col.count_documents({})
             
-            # Obtener última fecha de actualización
-            last_doc = col.find_one({}, sort=[("_ingested_at", -1)])
-            last_updated = last_doc.get("_ingested_at") if last_doc else None
+            # Obtener última fecha de actualización desde los documentos
+            last_updated = None
+            last_doc = col.find_one({"ingested_at": {"$exists": True}}, sort=[("ingested_at", -1)])
+            if last_doc and last_doc.get("ingested_at"):
+                last_updated = last_doc["ingested_at"]
+            
+            # Fallback: buscar en ingestion_metadata
+            if not last_updated:
+                meta_col = database.get_collection("ingestion_metadata")
+                meta_doc = meta_col.find_one({"type": metadata_keys.get(col_name)})
+                if meta_doc and meta_doc.get("date"):
+                    last_updated = meta_doc["date"]
             
             collections_info[col_name] = {
                 "count": count,

@@ -357,13 +357,39 @@ async def get_dashboard_stats(
         # Top language para KPI
         top_language = language_distribution[0]["name"] if language_distribution else "N/A"
         
+        # === Fecha de última ingesta ===
+        last_ingestion_date = None
+        metadata_keys = {
+            "repositories": "repositories_last_ingestion",
+            "users": "users_last_ingestion",
+            "organizations": "organizations_last_ingestion",
+        }
+        try:
+            for col_name in ["repositories", "users", "organizations"]:
+                col = db.get_collection(col_name)
+                # Buscar ingested_at en documentos
+                last_doc = col.find_one({"ingested_at": {"$exists": True}}, sort=[("ingested_at", -1)])
+                dt = last_doc.get("ingested_at") if last_doc else None
+                # Fallback: ingestion_metadata
+                if not dt:
+                    meta_col = db.get_collection("ingestion_metadata")
+                    meta_doc = meta_col.find_one({"type": metadata_keys.get(col_name)})
+                    dt = meta_doc.get("date") if meta_doc else None
+                if dt:
+                    dt_str = dt.isoformat() if isinstance(dt, datetime) else str(dt)
+                    if last_ingestion_date is None or dt_str > last_ingestion_date:
+                        last_ingestion_date = dt_str
+        except Exception:
+            pass
+        
         kpis = {
             "totalRepos": total_repos,
             "totalUsers": total_users,
             "totalOrgs": total_orgs,
             "avgStars": avg_stars,
             "avgExpertise": avg_expertise,
-            "topLanguage": top_language
+            "topLanguage": top_language,
+            "lastIngestionDate": last_ingestion_date
         }
         
         # === CHART: TOP 10 ORGANIZACIONES (por métrica seleccionada) ===
@@ -1471,12 +1497,21 @@ def invalidate_all_caches():
         {"_id": {"$regex": "^collab_analysis_"}}
     ).deleted_count
     
+    # Cachés de datos de vistas personalizadas
+    views_deleted = metrics.delete_many(
+        {"_id": {"$regex": "^view_data_"}}
+    ).deleted_count
+    
+    # Caché in-memory de hijos de favoritos
+    _children_cache.clear()
+    
     summary = {
         "collaboration_graph_chunks": graph_deleted,
         "network_metrics_chunks": nm_deleted,
         "dashboard_stats": stats_deleted,
         "simple_counts": counts_deleted,
         "collaboration_analyses": analyze_deleted,
+        "view_data_caches": views_deleted,
     }
     
     logger.info(f"[INVALIDATE_ALL] Todas las cachés invalidadas: {summary}")
@@ -1576,11 +1611,22 @@ async def discover_collaboration(
             if not login:
                 return False
             ll = login.lower()
+            # Explicit known bots/service accounts
+            KNOWN_BOTS = {
+                "dependabot", "renovate", "greenkeeper", "snyk-bot", "codecov",
+                "sonarcloud", "claude", "actions-user", "github-actions",
+                "copilot", "deepsource-autofix", "imgbot", "allcontributors",
+                "pre-commit-ci", "netlify", "vercel", "railway", "render",
+                "mergify", "kodiakhq", "whitesource-bolt", "mend-bolt-for-github",
+                "depfu", "pyup-bot", "fossabot", "semantic-release-bot",
+                "github-pages", "web-flow",
+            }
             return (
                 "[bot]" in ll or
                 ll.endswith("-bot") or
+                (ll.endswith("bot") and len(ll) > 3) or
                 ll.startswith("bot-") or
-                ll in ["dependabot", "renovate", "greenkeeper", "snyk-bot", "codecov", "sonarcloud"]
+                ll in KNOWN_BOTS
             )
         
         all_repos = list(repos_collection.find(
@@ -1644,8 +1690,11 @@ async def discover_collaboration(
             repo_to_users[full_name] = collabs
         
         # ============================================================
-        # PASO 2: Identificar Bridge Users (usuarios en 2+ repos)
+        # PASO 2: Usuarios multi-repo (2+ repos) para conectividad del grafo
         # ============================================================
+        # Nota: contribuir a 2+ repos NO convierte a alguien en bridge user.
+        # El flag isBridge se asigna en el Paso 6f solo a cross-org users
+        # (usuarios que contribuyen a repos de 2+ orgs independientes).
         bridge_users = {}
         for login, repos_list in user_to_repos.items():
             if len(repos_list) >= 2:
@@ -1710,10 +1759,12 @@ async def discover_collaboration(
             if len(repo_orgs) >= 2:
                 user_repo_orgs[login] = list(repo_orgs)
         
-        # Combinar cross-org users (excluyendo los que solo conectan sibling orgs)
+        # Combinar cross-org users (excluyendo bots y los que solo conectan sibling orgs)
         _raw_cross_org = set(user_to_orgs.keys()) | set(user_repo_orgs.keys())
         cross_org_users = set()
         for login in _raw_cross_org:
+            if _is_bot_login(login):
+                continue
             orgs_list = user_to_orgs.get(login, []) or user_repo_orgs.get(login, [])
             # Verificar que al menos 2 orgs NO son sibling entre sí
             has_independent = False
@@ -1828,6 +1879,11 @@ async def discover_collaboration(
                 user_is_bot = bool(user_info["is_bot"])
             else:
                 user_is_bot = _is_bot_login(login)
+            # Orgs conectadas (de repos donde contribuye)
+            connected_orgs = list(set(
+                r.get("owner") for r in (repos_list or [])
+                if r.get("owner")
+            ))
             return {
                 "id": f"user_{login}",
                 "type": "user",
@@ -1835,16 +1891,19 @@ async def discover_collaboration(
                 "name": (user_info.get("name") if user_info else None) or login,
                 "avatar_url": user_info.get("avatar_url") if user_info else None,
                 "repos_count": len(repos_list) if repos_list else 1,
+                "orgs_count": len(connected_orgs),
+                "connected_orgs": connected_orgs,
                 "isBridge": is_bridge,
                 "isBot": user_is_bot,
                 "quantum_expertise_score": user_info.get("quantum_expertise_score", 0) if user_info else 0
             }
         
-        # 6f) Añadir nodos de bridge users + links a sus repos
+        # 6f) Añadir nodos de multi-repo users + links a sus repos
+        # Solo los cross-org users se marcan como isBridge (verdaderos puentes)
         enriched_bridge_list = []
         for login, repos_list in top_bridge_users:
             user_id = f"user_{login}"
-            user_node = _make_user_node(login, repos_list, True)
+            user_node = _make_user_node(login, repos_list, login in cross_org_users)
             
             if user_id not in added_nodes:
                 nodes.append(user_node)
@@ -1867,6 +1926,8 @@ async def discover_collaboration(
                 "quantum_expertise_score": user_node.get("quantum_expertise_score", 0),
                 "repos": [r["full_name"] for r in repos_list],
                 "repos_count": len(repos_list),
+                "orgs_count": user_node.get("orgs_count", 0),
+                "connected_orgs": user_node.get("connected_orgs", []),
                 "cross_org": login in cross_org_users
             })
         
@@ -2026,8 +2087,8 @@ async def discover_collaboration(
         # PASO 8: Construir resumen textual
         # ============================================================
         summary_parts = []
-        if len(bridge_users) > 0:
-            summary_parts.append(f"{len(bridge_users)} usuarios puente entre {len(connected_repos)} repositorios")
+        if len(cross_org_users) > 0:
+            summary_parts.append(f"{len(cross_org_users)} bridge users (cross-org) entre {len(connected_repos)} repositorios")
         if len(connected_repo_pairs) > 0:
             summary_parts.append(f"{len(connected_repo_pairs)} pares de repos conectados")
         if len(cross_org_users) > 0:
@@ -2058,7 +2119,8 @@ async def discover_collaboration(
                 "total_users_mapped": len(user_to_repos),
                 "bridge_users_count": len(bridge_nodes_in_graph),
                 "normal_users_count": normal_user_count,
-                "total_bridge_users_found": len(human_bridge_users),
+                "multi_repo_users": len(human_bridge_users),
+                "total_bridge_users_found": len(bridge_nodes_in_graph),
                 "connected_repo_pairs": len(connected_repo_pairs),
                 "cross_org_users": len(cross_org_users),
                 "graph_nodes": len(nodes),
@@ -2560,6 +2622,10 @@ async def get_user_collaboration_network(user_login: str):
 # Almacena tanto el dict como los bytes JSON serializados con orjson
 # Fallback: si la caché en memoria está vacía, intenta cargar desde MongoDB (chunked)
 _network_metrics_cache = {"json_bytes": None, "computed_at": None, "analyzer": None}
+
+# Caché in-memory de hijos de favoritos (entity_id → response dict)
+# Evita queries repetidas al expandir/colapsar nodos en el panel de favoritos
+_children_cache = {}
 
 @router.get("/collaboration/network-metrics")
 async def get_network_metrics(
@@ -4335,6 +4401,9 @@ async def get_view_data(view_id: str, body: Dict[str, Any] = None):
     """
     Obtiene datos del dashboard filtrados para una vista personalizada.
     Calcula KPIs, charts y tables solo para las entidades de la vista.
+    
+    Caché PERMANENTE en colección 'metrics' (clave: view_data_{view_id}).
+    Se invalida junto con el resto de cachés vía refresh-metrics.
     """
     try:
         from ..core.db import db
@@ -4354,6 +4423,16 @@ async def get_view_data(view_id: str, body: Dict[str, Any] = None):
         
         if not entity_ids:
             raise HTTPException(status_code=404, detail="Vista no encontrada o sin entidades")
+        
+        # ── CACHÉ: intentar servir desde metrics ──
+        metrics_collection = db.get_collection("metrics")
+        cache_key = f"view_data_{view_id}"
+        cached = metrics_collection.find_one({"_id": cache_key})
+        if cached:
+            cached.pop("_id", None)
+            cached.pop("_cached_at", None)
+            logger.info(f"[VIEW] Cache HIT para vista '{view_id}'")
+            return cached
         
         # Separar IDs por tipo (prefijo: user_, repo_, org_)
         user_ids = []
@@ -4579,6 +4658,18 @@ async def get_view_data(view_id: str, body: Dict[str, Any] = None):
             }
         }
         
+        # ── Guardar en caché permanente ──
+        try:
+            cache_doc = {**response, "_id": cache_key, "_cached_at": datetime.now().isoformat()}
+            metrics_collection.update_one(
+                {"_id": cache_key},
+                {"$set": cache_doc},
+                upsert=True
+            )
+            logger.info(f"[VIEW] Datos de vista '{view_id}' cacheados en metrics")
+        except Exception as cache_err:
+            logger.warning(f"[VIEW] No se pudo cachear vista '{view_id}': {cache_err}")
+        
         return response
     except HTTPException:
         raise
@@ -4598,7 +4689,14 @@ async def get_favorite_children(entity_id: str):
     - org_<login> → sus repos (con colaboradores resumidos)
     - repo_<full_name> → sus colaboradores (con flag bridge)
     Herencia unidireccional: org → repo → user
+    
+    Caché in-memory: los resultados se guardan hasta invalidación global.
     """
+    # ── Caché in-memory ──
+    if entity_id in _children_cache:
+        logger.info(f"[CHILDREN] Cache HIT in-memory para '{entity_id}'")
+        return _children_cache[entity_id]
+    
     try:
         from ..core.db import db
         db.ensure_connection()
@@ -4634,12 +4732,14 @@ async def get_favorite_children(entity_id: str):
                     "has_children": len(collabs) > 0,
                 })
 
-            return {
+            result = {
                 "parent_id": entity_id,
                 "children": sorted(children,
                     key=lambda x: int(x["subtitle"].split("⭐ ")[1].split(" ·")[0]) if "⭐" in x["subtitle"] else 0,
                     reverse=True),
             }
+            _children_cache[entity_id] = result
+            return result
 
         elif entity_id.startswith("repo_"):
             repo_full_name = entity_id[5:]
@@ -4698,13 +4798,17 @@ async def get_favorite_children(entity_id: str):
             # Bridge users primero, luego por contribuciones
             children.sort(key=lambda x: (0 if x["is_bridge"] else 1, -x["contributions"]))
 
-            return {
+            result = {
                 "parent_id": entity_id,
                 "children": children,
             }
+            _children_cache[entity_id] = result
+            return result
 
         else:
-            return {"parent_id": entity_id, "children": []}
+            result = {"parent_id": entity_id, "children": []}
+            _children_cache[entity_id] = result
+            return result
 
     except Exception as e:
         logger.error(f"Error obteniendo hijos de {entity_id}: {e}")
