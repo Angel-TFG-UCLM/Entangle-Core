@@ -1,5 +1,5 @@
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 """
@@ -159,7 +159,7 @@ class Repository(BaseModel):
     updated_at: Optional[datetime] = Field(None, alias="updatedAt")
     pushed_at: Optional[datetime] = Field(None, alias="pushedAt")
     last_commit_date: Optional[datetime] = Field(None, alias="lastCommitDate")
-    ingested_at: datetime = Field(default_factory=datetime.utcnow)
+    ingested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     # ==================== LENGUAJE PRINCIPAL ====================
     primary_language: Optional[str] = Field(None, alias="primaryLanguage")  # Solo nombre
@@ -246,7 +246,7 @@ class Repository(BaseModel):
     @classmethod
     def set_ingested_at(cls, v):
         """Establece la fecha de ingesta si no está presente."""
-        return v or datetime.utcnow()
+        return v or datetime.now(timezone.utc)
     
     @field_validator('primary_language', mode='before')
     @classmethod

@@ -37,31 +37,20 @@ from .user import (
 __all__ = [
     # Repository
     "Repository",
-    "Language",
-    "LanguageEdge",
-    "License",
-    "Topic",
-    "RepositoryTopic",
-    "Owner",
-    "Collaborator",
-    "Commit",
-    "Issue",
-    "PullRequest",
-    "Release",
-    "Vulnerability",
-    "DependencyGraphManifest",
-    
+    "LanguageInfo",
+    "LicenseInfo",
+    "OwnerInfo",
+    "CollaboratorInfo",
+    "CommitInfo",
+    "IssueInfo",
+    "PullRequestInfo",
+    "ReleaseInfo",
+
     # Organization v1.0
     "Organization",
-    
+
     # User v3.0
     "User",
     "UserRepository",
     "UserOrganization",
-    
-    # Relation
-    "Relation",
-    "RelationType",
-    "ContributionMetrics",
-    "TimeSeriesData",
 ]

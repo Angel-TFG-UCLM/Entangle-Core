@@ -3,7 +3,7 @@ Definición de rutas/endpoints de la API.
 """
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from typing import Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..github.extract import (
     extract_organization,
@@ -20,7 +20,7 @@ from ..github.user_enrichment import UserEnrichmentEngine
 from ..github.organization_enrichment import OrganizationEnrichmentEngine
 from ..github.graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
-from ..core.config import config, ingestion_config
+from ..core.config import config
 from ..core.mongo_repository import MongoRepository
 from ..analysis.network_metrics import CollaborationNetworkAnalyzer
 import re as _re
@@ -54,9 +54,7 @@ def _are_sibling_orgs(login_a: str, login_b: str) -> bool:
     if not a or not b:
         return False
     short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    if len(short) >= 4 and long_.startswith(short) and len(long_) / len(short) <= 3.0:
-        return True
-    return False
+    return bool(len(short) >= 4 and long_.startswith(short) and len(long_) / len(short) <= 3.0)
 
 # Estado global para tareas en background
 background_tasks_status: Dict[str, Dict[str, Any]] = {}
@@ -167,7 +165,6 @@ async def get_dashboard_stats(
     """
     try:
         from ..core.db import db
-        from datetime import timedelta
         
         # Asegurar conexión activa
         db.ensure_connection()
@@ -187,7 +184,7 @@ async def get_dashboard_stats(
             
             if cached_stats:
                 updated_at = cached_stats.get("updated_at", current_time)
-                logger.info(f"📊 Cache HIT - Dashboard stats servido desde caché permanente")
+                logger.info("📊 Cache HIT - Dashboard stats servido desde caché permanente")
                 
                 response_data = cached_stats.get("data", {})
                 response_data["metadata"] = {
@@ -1448,7 +1445,7 @@ async def get_dashboard_stats(
             
             logger.info("✅ Dashboard stats COMPLETO calculado y guardado en caché permanente")
         else:
-            logger.info(f"✅ Dashboard stats CON FILTROS calculado (no cacheado)")
+            logger.info("✅ Dashboard stats CON FILTROS calculado (no cacheado)")
         
         return response_data
         
@@ -1638,7 +1635,6 @@ async def discover_collaboration(
         
         # ── Aplicar filtro temporal por pushed_at ──
         if has_temporal_filter:
-            from datetime import timezone
             total_before = len(all_repos)
             
             def _repo_in_range(repo):
@@ -1655,9 +1651,7 @@ async def discover_collaboration(
                 repo_year = pushed.year
                 if year_from is not None and repo_year < year_from:
                     return False
-                if year_to is not None and repo_year > year_to:
-                    return False
-                return True
+                return not (year_to is not None and repo_year > year_to)
             
             all_repos = [r for r in all_repos if _repo_in_range(r)]
             logger.info(f"[DISCOVER] Filtro temporal: {total_before} → {len(all_repos)} repos (pushed_at en {year_from or '∞'}–{year_to or '∞'})")
@@ -1812,7 +1806,7 @@ async def discover_collaboration(
             login: repos_list for login, repos_list in bridge_users.items()
             if not _is_bot_login(login)
         }
-        bot_bridge_users = {
+        {
             login: repos_list for login, repos_list in bridge_users.items()
             if _is_bot_login(login)
         }
@@ -2158,7 +2152,7 @@ async def discover_collaboration(
                         "_id": "cross_org_bridges",
                         "total_cross_org_users": len(cross_org_users),
                         "top_cross_org_bridges": cross_org_bridge_list[:30],
-                        "updated_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
                     },
                     upsert=True,
                 )
@@ -2196,8 +2190,8 @@ async def invalidate_collaboration_cache():
 
 @router.post("/collaboration/analyze")
 async def analyze_collaboration(
-    repos: Optional[list] = Query(default=None, description="Lista de repositorios (full_name) a analizar"),
-    orgs: Optional[list] = Query(default=None, description="Lista de organizaciones (login) a analizar"),
+    repos: Optional[list] = Query(default=None, description="Lista de repositorios (full_name) a analizar"),  # noqa: B008
+    orgs: Optional[list] = Query(default=None, description="Lista de organizaciones (login) a analizar"),  # noqa: B008
     user: Optional[str] = Query(default=None, description="Usuario específico para ver sus colaboraciones")
 ):
     """
@@ -2228,10 +2222,10 @@ async def analyze_collaboration(
             cache_key = f"collab_analysis_user_{user}"
         elif repos and len(repos) >= 2:
             sorted_repos = sorted(repos)
-            cache_key = f"collab_analysis_repos_{hashlib.md5('|'.join(sorted_repos).encode()).hexdigest()}"
+            cache_key = f"collab_analysis_repos_{hashlib.md5('|'.join(sorted_repos).encode(), usedforsecurity=False).hexdigest()}"
         elif orgs and len(orgs) >= 2:
             sorted_orgs = sorted(orgs)
-            cache_key = f"collab_analysis_orgs_{hashlib.md5('|'.join(sorted_orgs).encode()).hexdigest()}"
+            cache_key = f"collab_analysis_orgs_{hashlib.md5('|'.join(sorted_orgs).encode(), usedforsecurity=False).hexdigest()}"
         else:
             cache_key = None
         
@@ -2688,7 +2682,7 @@ async def get_network_metrics(
                 json_bytes = orjson.dumps(cached_result)
                 # Poblar caché en memoria
                 _network_metrics_cache["json_bytes"] = json_bytes
-                _network_metrics_cache["computed_at"] = datetime.utcnow()
+                _network_metrics_cache["computed_at"] = datetime.now(timezone.utc)
                 logger.info(f"[NetworkMetrics] Restaurado desde caché MongoDB chunked permanente ({len(json_bytes) / 1024:.0f} KB)")
                 return Response(content=json_bytes, media_type="application/json")
         
@@ -2769,7 +2763,7 @@ async def get_network_metrics(
         # Guardar en caché en memoria (solo sin filtro temporal)
         if not has_temporal_filter:
             _network_metrics_cache["json_bytes"] = json_bytes
-            _network_metrics_cache["computed_at"] = datetime.utcnow()
+            _network_metrics_cache["computed_at"] = datetime.now(timezone.utc)
             _network_metrics_cache["analyzer"] = analyzer
         
         # Guardar en MongoDB chunked (persistente, sobrevive restarts) — solo sin filtro temporal
@@ -2794,7 +2788,7 @@ async def get_network_metrics(
                 if _disc_mapping:
                     metrics_collection.replace_one(
                         {"_id": "user_disciplines"},
-                        {"_id": "user_disciplines", "mapping": _disc_mapping, "_cached_at": datetime.utcnow()},
+                        {"_id": "user_disciplines", "mapping": _disc_mapping, "_cached_at": datetime.now(timezone.utc)},
                         upsert=True
                     )
                     logger.info(f"[NetworkMetrics] Guardado mapeo user_disciplines: {len(_disc_mapping)} usuarios")
@@ -3945,7 +3939,6 @@ def _run_full_pipeline_direct(task_id: str, from_scratch: bool = False, max_work
     from dataclasses import dataclass
     from typing import List
     import traceback
-    from ..core.db import get_database
     from ..github.user_ingestion import run_user_ingestion
     
     @dataclass
@@ -4191,7 +4184,8 @@ def _run_full_pipeline_script(task_id: str):
             [sys.executable, script_path],
             capture_output=True,
             text=True,
-            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            check=False
         )
         
         if result.returncode == 0:
@@ -4881,7 +4875,6 @@ async def get_entity_detail(entity_id: str):
 
             total_quantum_contributions = 0
             relevant_repos_count = 0
-            is_owner_count = 0
             for r in repo_results:
                 contribs = r.get("user_contributions", 0) or 0
                 total_quantum_contributions += contribs

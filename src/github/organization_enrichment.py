@@ -15,9 +15,8 @@ import time
 import threading
 import concurrent.futures
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pymongo import UpdateOne
-from pymongo.errors import OperationFailure
 
 from .graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
@@ -363,7 +362,7 @@ class OrganizationEnrichmentEngine:
             response = self.graphql_client.execute_query(query, variables)
             
             if "errors" in response and "data" not in response:
-                logger.warning(f"⚠️ Error total en batch query, procesando individualmente")
+                logger.warning("⚠️ Error total en batch query, procesando individualmente")
                 self._enrich_batch_individual_fallback(orgs_batch)
                 return
             
@@ -582,7 +581,7 @@ query GetOrgEnrichmentBatch({var_defs}) {{
                     if len(repo_names) > 3:
                         logger.info(f"      ... y {len(repo_names) - 3} repos más")
         else:
-            logger.info(f"   ⚠️  No relevante - Sin repos quantum ingestados")
+            logger.info("   ⚠️  No relevante - Sin repos quantum ingestados")
     
     def _enrich_batch_individual_fallback(self, orgs_batch: List[Dict[str, Any]]) -> None:
         """Fallback: enriquece cada organización individualmente."""
@@ -639,7 +638,7 @@ query GetOrgEnrichmentBatch({var_defs}) {{
         wait_seconds = 120  # Fallback conservador
         try:
             rate_limit = self.graphql_client.get_rate_limit()
-            remaining = rate_limit.get("remaining", 5000)
+            rate_limit.get("remaining", 5000)
             reset_at = rate_limit.get("resetAt", "")
             
             if reset_at:

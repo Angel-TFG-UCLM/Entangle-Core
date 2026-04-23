@@ -6,7 +6,7 @@ para garantizar que los datos finales sean representativos, activos y realmente
 relacionados con software cuántico.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import logging
 import re
@@ -61,10 +61,7 @@ def _has_strong_keywords(text: str, keywords: List[str]) -> bool:
     Returns:
         True si encuentra al menos una keyword, False si no
     """
-    for keyword in keywords:
-        if keyword.lower() in text:
-            return True
-    return False
+    return any(keyword.lower() in text for keyword in keywords)
 
 
 # ============================================================================
@@ -612,7 +609,7 @@ class RepositoryFilters:
         
         # 2. Verificar contra patrones regex en texto buscable
         searchable_text = _get_searchable_text(repo)
-        name = repo.get("name", "").lower()
+        repo.get("name", "").lower()
         
         for pattern in NON_QC_BLACKLIST_PATTERNS:
             if re.search(pattern, searchable_text, re.IGNORECASE):
@@ -648,7 +645,7 @@ class RepositoryFilters:
             True si es relevante para QC, False si parece un FP
         """
         searchable_text = _get_searchable_text(repo)
-        name = (repo.get("name") or "").lower()
+        (repo.get("name") or "").lower()
         description = (repo.get("description") or "").lower()
         
         # Si no contiene "quantum" en absoluto, no aplicar este filtro

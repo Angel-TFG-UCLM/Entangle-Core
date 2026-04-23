@@ -14,15 +14,13 @@ import threading
 import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-from dataclasses import dataclass, field
 
-from fastapi import APIRouter, HTTPException, Query, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..core.db import db
 from ..core.logger import logger
-from ..core.config import config, ingestion_config
+from ..core.config import config
 from ..core.mongo_repository import MongoRepository
 from ..github.repositories_ingestion import IngestionEngine
 from ..github.user_ingestion import UserIngestionEngine
@@ -839,8 +837,6 @@ def _run_enrichment_operation(operation_id: str, request: OperationRequest, canc
 def _run_pipeline_operation(operation_id: str, request: OperationRequest, cancel_event: threading.Event):
     """Ejecuta el pipeline completo (6 fases) con progreso granular."""
     import os
-    import traceback
-    from ..github.user_ingestion import run_user_ingestion
     
     from_scratch = request.mode == "from_scratch"
     mode_label = "desde cero" if from_scratch else "incremental"
@@ -869,10 +865,7 @@ def _run_pipeline_operation(operation_id: str, request: OperationRequest, cancel
         """Crea un callback que mapea el progreso interno del engine al progreso global del pipeline."""
         phase_label = phase_names[phase_index]
         def cb(processed, total, message):
-            if total > 0:
-                sub_pct = processed / total
-            else:
-                sub_pct = 0
+            sub_pct = processed / total if total > 0 else 0
             global_items = int((phase_index + sub_pct) * 100)
             _update_progress(
                 operation_id,
