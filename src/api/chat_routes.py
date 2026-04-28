@@ -79,8 +79,8 @@ async def chat_stream_endpoint(request: ChatRequest, req: Request):
         finally:
             loop.call_soon_threadsafe(q.put_nowait, None)  # sentinel
 
-    # Lanzar productor en thread pool
-    asyncio.ensure_future(loop.run_in_executor(None, _produce))
+    # Lanzar productor en thread pool (guardamos referencia para evitar GC prematuro)
+    _producer_task = asyncio.ensure_future(loop.run_in_executor(None, _produce))
 
     async def event_generator():
         while True:

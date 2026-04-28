@@ -71,6 +71,10 @@ if config.FRONTEND_URL:
     cors_origins.append(config.FRONTEND_URL)
     logger.info(f"CORS habilitado para frontend: {config.FRONTEND_URL}")
 
+# GZip: comprimir respuestas grandes (>1KB). Reduce ~22MB de JSON del grafo a ~2-3MB.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# CORS debe añadirse último para que se ejecute primero (LIFO)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -78,9 +82,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
-
-# GZip: comprimir respuestas grandes (>1KB). Reduce ~22MB de JSON del grafo a ~2-3MB.
-app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Incluir rutas
 app.include_router(router, prefix="/api/v1", tags=["api"])

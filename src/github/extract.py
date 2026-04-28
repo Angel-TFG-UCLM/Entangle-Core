@@ -1,7 +1,7 @@
 """
 Funciones de extracción de datos de GitHub.
 """
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
 
 from .graphql_client import github_client
 from .queries import (

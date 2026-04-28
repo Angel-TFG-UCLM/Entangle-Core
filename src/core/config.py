@@ -270,9 +270,6 @@ def load_ingestion_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     Returns:
         Diccionario con toda la configuración
     """
-    if config_path:
-        config_instance = IngestionConfig(config_path)
-    else:
-        config_instance = ingestion_config
+    config_instance = IngestionConfig(config_path) if config_path else ingestion_config
     
     return config_instance.get_all_config()

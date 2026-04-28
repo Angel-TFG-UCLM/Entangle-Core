@@ -87,9 +87,7 @@ def _are_sibling_orgs(login_a: str, login_b: str) -> bool:
     if not a or not b:
         return False
     short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    if len(short) >= 4 and long_.startswith(short) and len(long_) / len(short) <= 3.0:
-        return True
-    return False
+    return bool(len(short) >= 4 and long_.startswith(short) and len(long_) / len(short) <= 3.0)
 
 
 class CollaborationNetworkAnalyzer:
@@ -151,9 +149,7 @@ class CollaborationNetworkAnalyzer:
                 y = pushed.year
                 if year_from is not None and y < year_from:
                     return False
-                if year_to is not None and y > year_to:
-                    return False
-                return True
+                return not (year_to is not None and y > year_to)
             all_repos = [r for r in all_repos if _in_range(r)]
             logger.info(f"[NetworkAnalyzer] Temporal filter: {total_before} → {len(all_repos)} repos")
 
@@ -282,7 +278,7 @@ class CollaborationNetworkAnalyzer:
                 self.G, weight='weight', k=k, seed=42
             )
         except Exception:
-            betweenness = {node: 0 for node in self.G.nodes}
+            betweenness = dict.fromkeys(self.G.nodes, 0)
 
         # Degree centrality
         degree = nx.degree_centrality(self.G)
@@ -776,8 +772,7 @@ class CollaborationNetworkAnalyzer:
             # Build subgraph excluding bots (but keep source/target even if bots)
             non_bot_nodes = [
                 n for n in self.G.nodes
-                if not self.G.nodes[n].get("is_bot", False)
-                or n == source_id or n == target_id
+                if n in (source_id, target_id) or not self.G.nodes[n].get("is_bot", False)
             ]
             G_no_bots = self.G.subgraph(non_bot_nodes)
 

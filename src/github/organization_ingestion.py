@@ -11,10 +11,9 @@ OPTIMIZACIONES v3.0:
 import time
 import threading
 import concurrent.futures
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from pymongo import UpdateOne
-from pymongo.errors import OperationFailure
 
 from .graphql_client import GitHubGraphQLClient
 from ..core.logger import logger
@@ -331,7 +330,7 @@ class OrganizationIngestionEngine:
         if new_orgs:
             self._process_orgs_batched(new_orgs, existing_map, force_update=False)
         
-        logger.info(f"✅ Procesamiento completado")
+        logger.info("✅ Procesamiento completado")
     
     def _get_existing_orgs(self, logins: List[str]) -> Dict[str, Dict[str, Any]]:
         """
@@ -697,10 +696,7 @@ class OrganizationIngestionEngine:
                         try:
                             rest_info = self.graphql_client._get_rate_limit_rest()
                             gql_reset = rest_info.get('resources', {}).get('graphql', {}).get('reset', 0)
-                            if gql_reset > 0:
-                                wait = max(0, gql_reset - now) + 5
-                            else:
-                                wait = 120
+                            wait = max(0, gql_reset - now) + 5 if gql_reset > 0 else 120
                         except Exception:
                             wait = 120
                         self._rate_limit_until = now + wait

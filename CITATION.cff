@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Entangle Core: analytics engine for the open-source quantum computing ecosystem"
+abstract: >-
+  Entangle Core is the backend and data pipeline of the Entangle project,
+  a research-grade platform that ingests, enriches and analyses the global
+  open-source quantum computing ecosystem on GitHub, exposing the results
+  through a typed REST API.
+type: software
+authors:
+  - family-names: "Lara Martín"
+    given-names: "Ángel Luis"
+    affiliation: "University of Castilla-La Mancha (UCLM)"
+repository-code: "https://github.com/Angel-TFG-UCLM/Entangle-Core"
+url: "https://github.com/Angel-TFG-UCLM/Entangle-Core"
+license: MIT
+keywords:
+  - quantum-computing
+  - open-source-analytics
+  - github-api
+  - fastapi
+  - mongodb
+  - network-analysis
+  - community-detection
+  - research
+year: 2026

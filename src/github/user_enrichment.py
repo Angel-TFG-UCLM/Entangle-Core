@@ -613,7 +613,7 @@ class UserEnrichmentEngine:
         wait_seconds = 120  # Fallback conservador
         try:
             rate_info = self.graphql_client.get_rate_limit()
-            remaining = rate_info.get('remaining', 5000)
+            rate_info.get('remaining', 5000)
             reset_at = rate_info.get('reset_at')
             
             if reset_at:
@@ -675,7 +675,7 @@ class UserEnrichmentEngine:
         if empty_arrays:
             self.users_repository.collection.update_one(
                 {"_id": user.get("_id")},
-                {"$set": {k: None for k in empty_arrays}}
+                {"$set": dict.fromkeys(empty_arrays)}
             )
     
     def _extract_basic_fields(self, data: Dict[str, Any], updates: Dict[str, Any]) -> None:
