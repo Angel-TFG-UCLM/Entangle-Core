@@ -8,14 +8,56 @@
     "location": {
       "value": "${AZURE_LOCATION}"
     },
-    "mongoUri": {
-      "value": "${MONGO_URI}"
+    "databaseLocation": {
+      "value": "${AZURE_DATABASE_LOCATION=northeurope}"
+    },
+    "aiLocation": {
+      "value": "${AZURE_AI_LOCATION=swedencentral}"
+    },
+    "staticWebAppLocation": {
+      "value": "${AZURE_SWA_LOCATION=westeurope}"
     },
     "githubToken": {
       "value": "${GITHUB_TOKEN}"
     },
-    "frontendUrl": {
-      "value": "${FRONTEND_URL}"
+    "mongoAdminUsername": {
+      "value": "${MONGO_ADMIN_USERNAME=entangleadmin}"
+    },
+    "mongoAdminPassword": {
+      "value": "${MONGO_ADMIN_PASSWORD}"
+    },
+    "mongoComputeTier": {
+      "value": "${MONGO_COMPUTE_TIER=M30}"
+    },
+    "mongoStorageGb": {
+      "value": "${MONGO_STORAGE_GB=256}"
+    },
+    "aiModelName": {
+      "value": "${AI_MODEL_NAME=gpt-4o}"
+    },
+    "aiModelVersion": {
+      "value": "${AI_MODEL_VERSION=2024-08-06}"
+    },
+    "aiDeploymentName": {
+      "value": "${AI_DEPLOYMENT_NAME=gpt-4o}"
+    },
+    "aiDeploymentCapacity": {
+      "value": "${AI_DEPLOYMENT_CAPACITY=169}"
+    },
+    "apiCpu": {
+      "value": "${API_CPU=0.5}"
+    },
+    "apiMemory": {
+      "value": "${API_MEMORY=1.0Gi}"
+    },
+    "apiMinReplicas": {
+      "value": "${API_MIN_REPLICAS=0}"
+    },
+    "apiMaxReplicas": {
+      "value": "${API_MAX_REPLICAS=1}"
+    },
+    "deployStaging": {
+      "value": "${DEPLOY_STAGING=true}"
     }
   }
 }
