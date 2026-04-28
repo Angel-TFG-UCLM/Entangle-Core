@@ -3,5 +3,8 @@
   "appManagedEnvironments": "cae-",
   "containerRegistryRegistries": "cr",
   "operationalInsightsWorkspaces": "log-",
-  "resourcesResourceGroups": "rg-"
+  "resourcesResourceGroups": "rg-",
+  "documentDBMongoClusters": "mongo-",
+  "cognitiveServicesAccounts": "ai-",
+  "webStaticSites": "stapp-"
 }
