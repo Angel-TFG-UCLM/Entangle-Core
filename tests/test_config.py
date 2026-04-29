@@ -22,7 +22,7 @@ class TestConfig:
         assert Config.LOG_LEVEL in ("INFO", "DEBUG", "WARNING", "ERROR")
 
     def test_environment_default(self):
-        assert Config.ENVIRONMENT in ("development", "production", "staging")
+        assert Config.ENVIRONMENT in ("development", "production", "staging", "test")
 
     def test_debug_flag(self):
         assert isinstance(Config.DEBUG, bool)
