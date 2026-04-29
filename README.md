@@ -2,6 +2,8 @@
 
 <sub>🇬🇧 <b>English</b>  ·  <a href="./README.es.md">🇪🇸 Español</a></sub>
 
+<img src="docs/assets/logo.png" alt="Entangle logo" width="160" />
+
 # Entangle&nbsp;Core
 
 **Analytics engine for the open-source quantum computing ecosystem on GitHub.**
@@ -75,7 +77,9 @@ It crawls public repositories, organizations and developers matching a curated t
 
 ## Architecture
 
-> Architecture diagram and pipeline documentation available in [docs/](./docs).
+<p align="center">
+  <img src="docs/assets/architecture-overview.png" alt="High-level architecture" width="820" />
+</p>
 
 ---
 

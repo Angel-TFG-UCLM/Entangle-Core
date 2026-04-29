@@ -2,6 +2,8 @@
 
 <sub><a href="./README.md">🇬🇧 English</a>  ·  🇪🇸 <b>Español</b></sub>
 
+<img src="docs/assets/logo.png" alt="Logo de Entangle" width="160" />
+
 # Entangle&nbsp;Core
 
 **Motor de análisis del ecosistema de computación cuántica de código abierto en GitHub.**
@@ -75,7 +77,9 @@ Rastrea repositorios, organizaciones y desarrolladores públicos que coinciden c
 
 ## Arquitectura
 
-> Diagrama de arquitectura y documentación del pipeline disponible en [docs/](./docs).
+<p align="center">
+  <img src="docs/assets/architecture-overview-es.png" alt="Arquitectura de alto nivel" width="820" />
+</p>
 
 ---
 
