@@ -16,6 +16,9 @@ Ingestion, enrichment, network analysis and AI-powered insights, served through 
 [![Azure Container Apps](https://img.shields.io/badge/Azure-Container%20Apps-0078D4?logo=microsoftazure&logoColor=white)](https://azure.microsoft.com/products/container-apps)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](./Dockerfile)
 [![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest&logoColor=white)](./tests)
+[![Coverage](https://img.shields.io/badge/coverage-61%25-brightgreen?logo=codecov&logoColor=white)](#testing)
+[![Quality Gate](https://img.shields.io/badge/quality%20gate-passed-brightgreen?logo=sonarqube&logoColor=white)](#quality--code-analysis)
+[![Maintainability](https://img.shields.io/badge/maintainability-A-brightgreen?logo=sonarqube&logoColor=white)](#quality--code-analysis)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 [**Open app**](https://blue-rock-0771cc403.1.azurestaticapps.net) ·
@@ -47,6 +50,7 @@ It crawls public repositories, organizations and developers matching a curated t
 - [Running the pipeline](#running-the-pipeline)
 - [API reference](#api-reference)
 - [Testing](#testing)
+- [Quality & Code Analysis](#quality--code-analysis)
 - [Deployment](#deployment)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
@@ -243,6 +247,51 @@ pytest --cov=src --cov-report=term-missing --cov-report=xml
 ```
 
 Coverage reports are written to `coverage.xml` and consumed by CI.
+
+---
+
+## Quality & Code Analysis
+
+Code is analysed with **SonarQube Community Edition** (self-hosted in Docker) against a custom Quality Gate called **«Entangle»**, defined in the project's Bachelor's Thesis report. The gate enforces nine conditions:
+
+| Metric | Operator | Threshold |
+|---|---|---|
+| Reliability Rating | ≤ | C |
+| Security Rating | ≤ | A |
+| Maintainability Rating | ≤ | B |
+| Coverage | ≥ | 60 % |
+| Duplicated Lines Density | ≤ | 5 % |
+| Duplication on New Code | ≤ | 3 % |
+| New Issues | ≤ | 0 |
+| Security Hotspots Reviewed | ≥ | 80 % |
+| Vulnerabilities | ≤ | 0 |
+
+**Latest results for `entangle-backend`**:
+
+| Metric | Value |
+|---|---|
+| Lines of code | 14 687 |
+| Files | 35 |
+| **Quality Gate** | ✅ **PASSED** |
+| Coverage | **61.0 %** |
+| Duplicated lines | **2.1 %** |
+| Bugs | 0 |
+| Vulnerabilities | 0 |
+| Security Hotspots reviewed | 100 % |
+| Code Smells | 294 |
+| Technical Debt | 72 h |
+| Reliability / Security / Maintainability | **A / A / A** |
+
+A second analysis runs automatically on every push via SonarQube Cloud (free plan) at <https://sonarcloud.io/project/overview?id=Angel-TFG-UCLM_Entangle-Core>. The cloud free plan applies the built-in *Sonar way* gate; the custom **«Entangle»** gate is enforced locally.
+
+To reproduce the local analysis:
+
+```powershell
+$env:SONAR_LOCAL_TOKEN = "squ_xxxxxxxxxxxx"
+./scripts/Run-LocalSonar.ps1
+```
+
+See [`LOCAL_SONAR.md`](../LOCAL_SONAR.md) for full setup instructions.
 
 ---
 

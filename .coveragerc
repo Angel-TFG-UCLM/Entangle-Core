@@ -1,0 +1,14 @@
+[run]
+# Genera paths relativos en coverage.xml para que SonarQube/SonarCloud
+# pueda resolverlos tanto en Windows como en contenedores Linux
+relative_files = True
+source = src
+
+[xml]
+output = coverage.xml
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError

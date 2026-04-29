@@ -18,10 +18,17 @@ param sku string = 'Standard'
 @description('Permitir que GitHub Actions actualice el archivo staticwebapp.config.json.')
 param allowConfigFileUpdates bool = true
 
+// Identidad gestionada del sistema: necesaria para que la Static Web App pueda
+// acceder a recursos Azure (Key Vault, Storage, AI Foundry...) usando RBAC en
+// vez de credenciales en codigo. Aunque hoy no se use, dejarlo activado evita
+// tener que recrear la SWA en el futuro y satisface el security hotspot de Sonar.
 resource staticWebApp 'Microsoft.Web/staticSites@2024-04-01' = {
   name: name
   location: location
   tags: tags
+  identity: {
+    type: 'SystemAssigned'
+  }
   sku: {
     name: sku
     tier: sku

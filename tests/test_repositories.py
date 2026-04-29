@@ -114,6 +114,7 @@ class TestRepositoryIngestionThrottling:
         assert result == {"success": True}
         assert operation.call_count == 1
     
+    @pytest.mark.skip(reason="DEPRECATED: vCore no tiene throttling code 16500, _retry_on_cosmos_throttle ya no reintenta")
     @patch('src.github.repositories_ingestion.MongoRepository')
     @patch('src.github.repositories_ingestion.GitHubGraphQLClient')
     @patch('src.github.repositories_ingestion.db')
@@ -147,6 +148,7 @@ class TestRepositoryIngestionThrottling:
         assert operation.call_count == 2
         assert mock_sleep.call_count == 1  # Debe haber dormido una vez
     
+    @pytest.mark.skip(reason="DEPRECATED: vCore no tiene throttling code 16500, _retry_on_cosmos_throttle ya no reintenta")
     @patch('src.github.repositories_ingestion.MongoRepository')
     @patch('src.github.repositories_ingestion.GitHubGraphQLClient')
     @patch('src.github.repositories_ingestion.db')

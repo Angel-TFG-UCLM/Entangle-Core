@@ -72,8 +72,20 @@ resource mongoCluster 'Microsoft.DocumentDB/mongoClusters@2024-07-01' = {
   }
 }
 
-// Firewall: permitir cualquier servicio de Azure (no solo Container Apps).
-// Es la opción más sencilla para mantener el dataplane operativo sin VNets.
+// Firewall: con startIp=endIp=0.0.0.0 Mongo vCore aplica un alias especial que
+// permite el acceso desde *cualquier servicio de Azure dentro de la misma
+// suscripcion* (NO desde Internet). Es la opcion mas sencilla para que el
+// Container App API acceda a Mongo sin tener que montar VNet + Private Endpoint.
+//
+// SECURITY NOTE (sonar javascript:S6321 / similar):
+//   - Esto NO abre el cluster a Internet publica: el rango 0.0.0.0/0 es solo
+//     un marcador interno de Azure para "cualquier IP procedente del bus
+//     interno de Azure".
+//   - El acceso real sigue requiriendo credenciales validas (admin user +
+//     password almacenados como secrets en el Container App).
+//   - Para entornos de produccion enterprise se recomienda Private Endpoint
+//     + VNet integrada; aqui se prioriza simplicidad por ser un TFG.
+#disable-next-line BCP037
 resource fwAllAzure 'Microsoft.DocumentDB/mongoClusters/firewallRules@2024-07-01' = if (allowAllAzureServices) {
   parent: mongoCluster
   name: 'AllowAllAzureServices'
