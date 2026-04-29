@@ -196,7 +196,7 @@ def classify_user(
             "discipline_signals": [str, ...]
         }
     """
-    scores: Dict[str, float] = {d: 0.0 for d in DISCIPLINES}
+    scores: Dict[str, float] = dict.fromkeys(DISCIPLINES, 0.0)
     signals: Dict[str, List[str]] = {d: [] for d in DISCIPLINES}
 
     bio = (user_doc.get("bio") or "").lower()
@@ -298,7 +298,6 @@ def classify_user(
         if second_score / top_score >= 0.35:
             # Multidisciplinary user!
             # Confidence = how evenly spread (higher = more balanced)
-            top2_sum = top_score + second_score
             balance = second_score / top_score  # 0.35..1.0
             confidence = min(0.4 + balance * 0.6, 1.0)  # 0.61..1.0
             # Collect the top discipline colors for frontend cycling
@@ -439,7 +438,7 @@ def classify_all_users(
 
     # ── 5. Classify each user ──
     node_disciplines: Dict[str, Dict] = {}
-    discipline_counts: Dict[str, int] = {d: 0 for d in DISCIPLINES}
+    discipline_counts: Dict[str, int] = dict.fromkeys(DISCIPLINES, 0)
 
     for login in user_logins:
         user_doc = user_docs.get(login, {"login": login})
@@ -469,12 +468,12 @@ def classify_all_users(
     # Optimized O(R × D²): for each repo, count contributors per discipline,
     # then compute pairwise counts arithmetically instead of iterating C² pairs.
     # D=5 disciplines, so inner loop is only 5×5=25 iterations per repo.
-    mixing_matrix = {d: {d2: 0 for d2 in DISCIPLINES} for d in DISCIPLINES}
+    mixing_matrix = {d: dict.fromkeys(DISCIPLINES, 0) for d in DISCIPLINES}
     cross_edges = 0
     total_edges = 0
 
     # Build repo → discipline counts (not individual contributors)
-    repo_disc_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {d: 0 for d in DISCIPLINES})
+    repo_disc_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: dict.fromkeys(DISCIPLINES, 0))
     for login in user_logins:
         node_id = f"user_{login}"
         disc = node_disciplines.get(node_id, {}).get("discipline")
@@ -597,7 +596,7 @@ def _find_bridge_profiles(
 
 def _classify_repo_discipline(text: str, language: Optional[str]) -> str:
     """Quick discipline classification for a repo based on topics+description text."""
-    scores = {d: 0 for d in DISCIPLINES}
+    scores = dict.fromkeys(DISCIPLINES, 0)
 
     for disc, keywords in _TOPIC_SIGNALS.items():
         for kw in keywords:
@@ -619,9 +618,9 @@ def _classify_repo_discipline(text: str, language: Optional[str]) -> str:
 def _empty_analysis() -> Dict[str, Any]:
     """Return empty analysis structure."""
     return {
-        "distribution": {d: 0 for d in DISCIPLINES},
-        "distribution_pct": {d: 0.0 for d in DISCIPLINES},
-        "mixing_matrix": {d: {d2: 0 for d2 in DISCIPLINES} for d in DISCIPLINES},
+        "distribution": dict.fromkeys(DISCIPLINES, 0),
+        "distribution_pct": dict.fromkeys(DISCIPLINES, 0.0),
+        "mixing_matrix": {d: dict.fromkeys(DISCIPLINES, 0) for d in DISCIPLINES},
         "cross_discipline_index": 0.0,
         "total_classified": 0,
         "bridge_profiles": [],

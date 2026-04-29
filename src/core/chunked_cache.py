@@ -171,10 +171,7 @@ def load_chunked(collection, cache_id):
                 assembled.extend(chunk_doc["items"])
 
         # Restaurar tipo original
-        if kind == "dict":
-            value = {k: v for k, v in assembled}
-        else:
-            value = assembled
+        value = {k: v for k, v in assembled} if kind == "dict" else assembled
 
         _set_nested(meta, field_path, value)
 

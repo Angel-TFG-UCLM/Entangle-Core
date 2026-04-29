@@ -8,7 +8,6 @@ from pymongo import MongoClient
 from pymongo.database import Database as PyMongoDatabase
 from pymongo.collection import Collection
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
-import warnings
 
 # DEPRECATED: Ya no es necesario con Azure Cosmos DB for MongoDB (vCore)
 # warnings.filterwarnings("ignore", message="You appear to be connected to a CosmosDB cluster")
@@ -67,7 +66,7 @@ class Database:
             self._is_connected = True
             
             logger.info(f"✅ Conexión exitosa a la base de datos: {config.MONGO_DB_NAME}")
-            logger.info(f"🚀 Configuración optimizada para vCore: maxPoolSize=100, retryWrites=True")
+            logger.info("🚀 Configuración optimizada para vCore: maxPoolSize=100, retryWrites=True")
             
         except ConnectionFailure as e:
             logger.error(f"❌ Error al conectar a MongoDB: {e}")

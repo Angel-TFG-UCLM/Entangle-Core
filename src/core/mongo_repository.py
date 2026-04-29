@@ -2,7 +2,7 @@
 Capa de persistencia genérica para MongoDB.
 Proporciona operaciones CRUD reutilizables para todas las colecciones.
 """
-from typing import Dict, List, Optional, Any, Type, Union
+from typing import Dict, List, Optional, Any, Union
 from datetime import datetime, UTC
 from pymongo.collection import Collection
 from pymongo.results import InsertOneResult, InsertManyResult, UpdateResult, DeleteResult
@@ -264,7 +264,7 @@ class MongoRepository:
         """
         try:
             # Asegurar que update tenga operadores de MongoDB
-            if not any(key.startswith('$') for key in update.keys()):
+            if not any(key.startswith('$') for key in update):
                 update = {"$set": update}
             
             result: UpdateResult = self.collection.update_one(query, update, upsert=upsert)
@@ -307,7 +307,7 @@ class MongoRepository:
         """
         try:
             # Asegurar que update tenga operadores
-            if not any(key.startswith('$') for key in update.keys()):
+            if not any(key.startswith('$') for key in update):
                 update = {"$set": update}
             
             result: UpdateResult = self.collection.update_many(query, update, upsert=upsert)

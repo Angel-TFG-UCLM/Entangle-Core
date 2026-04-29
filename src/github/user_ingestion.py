@@ -153,12 +153,12 @@ class UserIngestionEngine:
         logger.info("\n" + "=" * 80)
         logger.info("✅ INGESTA DE USUARIOS COMPLETADA")
         logger.info("=" * 80)
-        logger.info(f"\n📊 Estadísticas:")
+        logger.info("\n📊 Estadísticas:")
         logger.info(f"  • Repositorios procesados: {self.stats['repos_processed']}")
         logger.info(f"  • Usuarios únicos encontrados: {self.stats['unique_users']}")
         logger.info(f"  • Usuarios nuevos insertados: {self.stats['users_inserted']}")
         logger.info(f"  • Usuarios ya existentes: {self.stats['users_existing']}")
-        logger.info(f"\nClasificación:")
+        logger.info("\nClasificación:")
         logger.info(f"  • Usuarios reales: {self.stats['real_users']} ({self.stats['real_users']/self.stats['unique_users']*100:.1f}%)")
         logger.info(f"  • Bots detectados: {self.stats['bots_detected']} ({self.stats['bots_detected']/self.stats['unique_users']*100:.1f}%)")
         logger.info(f"\n⚠️  Errores: {self.stats['total_errors']}")
@@ -330,7 +330,7 @@ class UserIngestionEngine:
             users_dict: Diccionario de usuarios {user_id: {login, extracted_from}}
         """
         users_list = list(users_dict.values())
-        total = len(users_list)
+        len(users_list)
         
         # 1. Bulk check: verificar qué usuarios ya existen en DB (1 query)
         logger.info("📊 Verificando usuarios existentes en DB (bulk check)...")
@@ -381,7 +381,7 @@ class UserIngestionEngine:
                     # Notificar progreso
                     if self.progress_callback:
                         try:
-                            processed = self.stats.get('users_inserted', 0) + self.stats.get('total_errors', 0)
+                            self.stats.get('users_inserted', 0) + self.stats.get('total_errors', 0)
                             self.progress_callback(
                                 batch_num, total_batches,
                                 f"Ingesta usuarios: lote {batch_num}/{total_batches} ({self.stats.get('users_inserted', 0)} insertados)"
@@ -697,7 +697,7 @@ class UserIngestionEngine:
         wait_seconds = 120  # Fallback conservador
         try:
             rate_info = self.github_client.get_rate_limit()
-            remaining = rate_info.get('remaining', 5000)
+            rate_info.get('remaining', 5000)
             reset_at = rate_info.get('reset_at')
             
             if reset_at:

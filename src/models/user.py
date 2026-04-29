@@ -4,8 +4,8 @@ Incluye SOLO los campos esenciales que realmente usamos.
 Validadores automáticos convierten None a [] para evitar errores.
 """
 from typing import Optional, List, Dict, Any
-from datetime import datetime
-from pydantic import BaseModel, Field, validator, root_validator
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field, validator
 
 
 def _truncate_text(text: Optional[str], max_length: int = 500, suffix: str = "... [TRUNCATED]") -> Optional[str]:
@@ -90,7 +90,7 @@ class User(BaseModel):
     # ==================== FECHAS ====================
     created_at: Optional[datetime] = Field(None, alias="createdAt")
     updated_at: Optional[datetime] = Field(None, alias="updatedAt")
-    ingested_at: datetime = Field(default_factory=datetime.utcnow)
+    ingested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     # ==================== CONTADORES SOCIALES ====================
     followers_count: int = Field(0, alias="followersCount")
@@ -142,7 +142,7 @@ class User(BaseModel):
     @validator('ingested_at', pre=True, always=True)
     def set_ingested_at(cls, v):
         """Establece la fecha de ingesta si no está presente."""
-        return v or datetime.utcnow()
+        return v or datetime.now(timezone.utc)
     
     class Config:
         populate_by_name = True

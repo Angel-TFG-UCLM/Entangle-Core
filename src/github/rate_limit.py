@@ -3,7 +3,7 @@ Control de rate limit y reintentos automáticos para la API de GitHub.
 """
 import time
 from datetime import datetime
-from typing import Callable, Any, Optional
+from typing import Callable, Any
 from functools import wraps
 
 from .graphql_client import github_client

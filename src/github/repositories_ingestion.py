@@ -18,19 +18,18 @@ Modos de ingesta:
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from pydantic import ValidationError
-from pymongo.errors import OperationFailure
 
 from .graphql_client import GitHubGraphQLClient
 from .filters import RepositoryFilters
 from ..core.config import IngestionConfig, ingestion_config
 from ..core.logger import logger
-from ..core.db import db, get_database
+from ..core.db import db
 from ..core.mongo_repository import MongoRepository
-from ..models import Repository, Organization, User  # , Relation  # DESHABILITADO: Para futura implementación de análisis de grafos
+from ..models import Repository  # , Relation  # DESHABILITADO: Para futura implementación de análisis de grafos
 
 
 class IngestionEngine:
@@ -471,7 +470,7 @@ class IngestionEngine:
         # Obtener keywords de búsqueda (cada una genera su propio set de segmentos)
         search_keywords = self.config.search_keywords
         
-        logger.info(f"🎯 Segmentación configurada:")
+        logger.info("🎯 Segmentación configurada:")
         logger.info(f"  • Keywords de búsqueda: {search_keywords}")
         logger.info(f"  • Rangos de estrellas: {len(star_ranges)}")
         logger.info(f"  • Años de creación: {len(created_years)}")
@@ -508,7 +507,7 @@ class IngestionEngine:
         
         result = list(all_repositories.values())
         
-        logger.info(f"\n✅ Búsqueda segmentada completada:")
+        logger.info("\n✅ Búsqueda segmentada completada:")
         logger.info(f"  • Repositorios únicos obtenidos: {len(result)}")
         if incremental_since:
             logger.info(f"  • Modo: incremental (desde {incremental_since.strftime('%Y-%m-%d')})")
@@ -862,7 +861,7 @@ class IngestionEngine:
             try:
                 # Bulk upsert (deprecado: retry automático legacy de Cosmos DB RU)
                 result = self._retry_on_cosmos_throttle(
-                    lambda: self.repo_db.bulk_upsert(
+                    lambda batch=batch: self.repo_db.bulk_upsert(
                         documents=batch,
                         unique_field="id"
                     )
@@ -894,7 +893,7 @@ class IngestionEngine:
                 for repo in batch:
                     try:
                         upsert_result = self._retry_on_cosmos_throttle(
-                            lambda: self.repo_db.upsert_one(
+                            lambda repo=repo: self.repo_db.upsert_one(
                                 query={"id": repo.id},
                                 document=repo.dict(),
                                 update_timestamp=True
@@ -1278,8 +1277,8 @@ class IngestionEngine:
         if self.incremental and db_context:
             is_up_to_date = (self.stats["total_found"] == 0)
             if is_up_to_date:
-                logger.info(f"\n✅ BASE DE DATOS AL DÍA - No se encontraron repositorios nuevos/actualizados")
-            logger.info(f"\n🗄️  Estado de la Base de Datos:")
+                logger.info("\n✅ BASE DE DATOS AL DÍA - No se encontraron repositorios nuevos/actualizados")
+            logger.info("\n🗄️  Estado de la Base de Datos:")
             logger.info(f"  • Repositorios totales en BD: {db_context.get('total_repos_in_db', '?')}")
             logger.info(f"  • Enriquecidos completamente: {db_context.get('enriched_repos', '?')}")
             logger.info(f"  • Pendientes de enriquecimiento: {db_context.get('pending_enrichment', '?')}")
@@ -1287,34 +1286,34 @@ class IngestionEngine:
             logger.info(f"  • Organizaciones en BD: {db_context.get('total_organizations', '?')}")
             logger.info(f"  • Última ingesta: {db_context.get('last_ingestion_date', 'N/A')}")
         
-        logger.info(f"\n🔍 Extracción:")
+        logger.info("\n🔍 Extracción:")
         logger.info(f"  • Repos nuevos/actualizados encontrados: {report['summary']['total_found']}")
         logger.info(f"  • Tiempo: {report['timing']['extraction']}")
         
         if self.stats["total_found"] > 0:
-            logger.info(f"\n🔍 Filtrado:")
+            logger.info("\n🔍 Filtrado:")
             logger.info(f"  • Repositorios válidos: {report['summary']['total_filtered']}")
             logger.info(f"  • Tasa de aceptación: {report['summary']['success_rate']}")
             logger.info(f"  • Tiempo: {report['timing']['filtering']}")
             
-            logger.info(f"\n✔️  Validación:")
+            logger.info("\n✔️  Validación:")
             logger.info(f"  • Validaciones exitosas: {report['summary']['validation_success']}")
             logger.info(f"  • Errores de validación: {report['summary']['validation_errors']}")
             logger.info(f"  • Tiempo: {report['timing']['validation']}")
             
-            logger.info(f"\n💾 Persistencia:")
+            logger.info("\n💾 Persistencia:")
             logger.info(f"  • Repositorios nuevos: {report['summary']['repositories_inserted']}")
             logger.info(f"  • Repositorios actualizados: {report['summary']['repositories_updated']}")
             logger.info(f"  • Tasa de persistencia: {report['summary']['persistence_rate']}")
             logger.info(f"  • Tiempo: {report['timing']['persistence']}")
             
-            logger.info(f"\n📈 Estadísticas:")
-            logger.info(f"  • Distribución por lenguaje:")
+            logger.info("\n📈 Estadísticas:")
+            logger.info("  • Distribución por lenguaje:")
             for lang, count in sorted(language_stats.items(), key=lambda x: x[1], reverse=True)[:5]:
                 logger.info(f"    - {lang}: {count}")
             logger.info(f"  • Estrellas promedio: {report['statistics']['average_stars']}")
         else:
-            logger.info(f"\n💡 No se requirieron fases de filtrado/validación/persistencia")
+            logger.info("\n💡 No se requirieron fases de filtrado/validación/persistencia")
         
         logger.info(f"\n⏱️  Tiempo total: {report['timing']['total']}")
         logger.info("=" * 80)

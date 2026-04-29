@@ -18,7 +18,6 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
-from functools import wraps
 from src.core.logger import logger
 from src.core.mongo_repository import MongoRepository
 from src.github.graphql_client import GitHubGraphQLClient
@@ -431,7 +430,7 @@ class EnrichmentEngine:
         
         if force_reenrich:
             query = {}
-            logger.info(f"\n📌 Modo: FORCE RE-ENRICH")
+            logger.info("\n📌 Modo: FORCE RE-ENRICH")
             logger.info(f"  • Procesando TODOS los {total_in_db} repositorios en BD")
         else:
             # Solo repositorios que:
@@ -466,14 +465,14 @@ class EnrichmentEngine:
                  "enrichment_status.is_complete": True}
             )
             
-            logger.info(f"\n📌 Modo: INCREMENTAL (criterios de selección)")
+            logger.info("\n📌 Modo: INCREMENTAL (criterios de selección)")
             logger.info(f"  🗄️  Total repositorios en BD: {total_in_db}")
-            logger.info(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            logger.info("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             logger.info(f"  • Nunca enriquecidos:           {never_enriched}")
             logger.info(f"  • Incompletos (campos faltantes): {incomplete}")
             logger.info(f"  • Desactualizados (>7 días):      {outdated}")
             logger.info(f"  • Ya completos y al día:         {already_complete - outdated}")
-            logger.info(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            logger.info("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             logger.info(f"  ➡️  Se omiten: {max(0, already_complete - outdated)} repos (completos y actualizados)")
         
         repos = list(self.repos_repository.collection.find(query).limit(max_repos or 0))
@@ -484,7 +483,7 @@ class EnrichmentEngine:
         if total_repos == 0:
             logger.warning("\n✅ No hay repositorios pendientes de enriquecimiento")
             logger.info(f"  • Todos los {total_in_db} repositorios están completos y actualizados")
-            logger.info(f"  • El re-enriquecimiento automático se activa tras 7 días")
+            logger.info("  • El re-enriquecimiento automático se activa tras 7 días")
             return self.stats
         
         # Procesar en lotes
@@ -575,7 +574,7 @@ class EnrichmentEngine:
         # Recalcular totales después del proceso
         total_in_db_final = self.repos_repository.collection.count_documents({})
         
-        logger.info(f"\n📊 Estadísticas del Proceso:")
+        logger.info("\n📊 Estadísticas del Proceso:")
         logger.info(f"  • Repositorios procesados: {self.stats['total_processed']}")
         logger.info(f"  • Repositorios enriquecidos: {self.stats['total_enriched']}")
         logger.info(f"  • Errores: {self.stats['total_errors']}")
@@ -589,7 +588,7 @@ class EnrichmentEngine:
             logger.info(f"  • Tiempo promedio por repo: {avg_time:.2f}s")
             logger.info(f"  • Tasa de éxito: {success_rate:.1f}%")
         
-        logger.info(f"\n🗄️  Estado Final del Dataset:")
+        logger.info("\n🗄️  Estado Final del Dataset:")
         logger.info(f"  • Total repositorios en BD: {total_in_db_final}")
         logger.info(f"  • Completamente enriquecidos: {complete_count}")
         logger.info(f"  • Con campos faltantes: {incomplete_count}")
@@ -598,7 +597,7 @@ class EnrichmentEngine:
             complete_percentage = (complete_count / total_in_db_final) * 100
             logger.info(f"  • Cobertura de enriquecimiento: {complete_percentage:.1f}% ({complete_count}/{total_in_db_final})")
         
-        logger.info(f"\n📝 Campos Enriquecidos:")
+        logger.info("\n📝 Campos Enriquecidos:")
         for field, count in sorted(self.stats['fields_enriched'].items(), key=lambda x: x[1], reverse=True):
             logger.info(f"  • {field}: {count}")
         
@@ -637,11 +636,11 @@ class EnrichmentEngine:
                     logger.info(f"  ⏭️  SALTADO: Enriquecido hace {days_since} días y completo")
                     return
                 elif enrichment_status.get("is_complete") == False:
-                    logger.info(f"  🔄 RE-ENRIQUECIENDO: Campos incompletos detectados")
+                    logger.info("  🔄 RE-ENRIQUECIENDO: Campos incompletos detectados")
             except (ValueError, TypeError):
                 pass
         
-        logger.debug(f"  🔧 Enriquecimiento v3.0 (paralelo + consolidado)...")
+        logger.debug("  🔧 Enriquecimiento v3.0 (paralelo + consolidado)...")
         
         updates = {}
         fields_enriched = []
@@ -674,7 +673,7 @@ class EnrichmentEngine:
         # ═══════════════════════════════════════════════════════════
         # FASE 2: Llamadas API paralelas (REST + GraphQL simultáneas)
         # ═══════════════════════════════════════════════════════════
-        logger.debug(f"  ├─ 🚀 Lanzando llamadas API en paralelo...")
+        logger.debug("  ├─ 🚀 Lanzando llamadas API en paralelo...")
         
         api_tasks = {}
         needs_commits = not repo.get("recent_commits")
@@ -727,7 +726,7 @@ class EnrichmentEngine:
                     self._increment_field_stat("readme_text")
                     self._increment_field_stat("has_readme")
             except Exception:
-                logger.debug(f"    ℹ️  Error obteniendo README (campo opcional)")
+                logger.debug("    ℹ️  Error obteniendo README (campo opcional)")
         
         # Releases (Strategy 5)
         if "releases" in api_tasks:
@@ -745,7 +744,7 @@ class EnrichmentEngine:
                     if releases_data["latest"]:
                         self._increment_field_stat("latest_release")
             except Exception:
-                logger.debug(f"    ℹ️  Error obteniendo releases (campo opcional)")
+                logger.debug("    ℹ️  Error obteniendo releases (campo opcional)")
         
         # Branches (Strategy 6)
         if "branches" in api_tasks:
@@ -897,7 +896,7 @@ class EnrichmentEngine:
         
         # 18. Colaboradores (contributors + mentionableUsers)
         if not repo.get("collaborators") or len(repo.get("collaborators", [])) == 0:
-            logger.debug(f"  └─ Obteniendo colaboradores...")
+            logger.debug("  └─ Obteniendo colaboradores...")
             try:
                 collaborators_data = self._retry_with_backoff(self._fetch_collaborators_combined, name_with_owner)
                 if collaborators_data:
@@ -937,9 +936,9 @@ class EnrichmentEngine:
             if fields_missing:
                 logger.warning(f"  ❌ Campos faltantes: {', '.join(fields_missing)}")
             else:
-                logger.info(f"  🎉 Repositorio completamente enriquecido!")
+                logger.info("  🎉 Repositorio completamente enriquecido!")
         else:
-            logger.info(f"  ℹ️  Sin cambios necesarios")
+            logger.info("  ℹ️  Sin cambios necesarios")
     
     def _calculate_fields(self, repo: Dict[str, Any]) -> Dict[str, Any]:
         """Calcula campos derivados de datos existentes."""
@@ -1029,7 +1028,7 @@ class EnrichmentEngine:
                 logger.debug(f"    ✓ README obtenido ({len(content)} caracteres)")
                 return content
             elif response.status_code == 404:
-                logger.debug(f"    ℹ️  Sin README disponible")
+                logger.debug("    ℹ️  Sin README disponible")
                 return None
             elif response.status_code == 403:
                 # Rate limit o acceso denegado - propagar para reintentar
@@ -1042,7 +1041,7 @@ class EnrichmentEngine:
                 return None
         except requests.exceptions.Timeout:
             # Propagar timeout para que se reintente
-            logger.debug(f"    ⏱️  Timeout obteniendo README")
+            logger.debug("    ⏱️  Timeout obteniendo README")
             raise
         except requests.exceptions.RequestException:
             # Propagar errores de red para que se reintenten
@@ -1084,7 +1083,7 @@ class EnrichmentEngine:
                 }
             elif response.status_code == 404:
                 # Repo sin releases - normal
-                logger.debug(f"    ℹ️  Sin releases disponibles")
+                logger.debug("    ℹ️  Sin releases disponibles")
                 return None
             elif response.status_code == 403:
                 # Rate limit - propagar para reintentar
@@ -1096,7 +1095,7 @@ class EnrichmentEngine:
                 logger.warning(f"    ⚠️  Error HTTP {response.status_code}")
                 return None
         except requests.exceptions.Timeout:
-            logger.debug(f"    ⏱️  Timeout obteniendo releases")
+            logger.debug("    ⏱️  Timeout obteniendo releases")
             raise
         except requests.exceptions.RequestException:
             raise
@@ -2172,7 +2171,7 @@ class EnrichmentEngine:
             # Si max_users está definido y es menor que el total, limitamos
             target_count = min(max_users, total_count) if max_users else total_count
             
-            logger.info(f"� Recuperando {target_count} mentionableUsers mediante paginación...")
+            logger.info(f"Recuperando {target_count} mentionableUsers mediante paginacion...")
             
             # Iterar paginación hasta obtener todos los usuarios
             while has_next_page and len(all_users) < target_count:
