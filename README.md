@@ -79,6 +79,8 @@ It crawls public repositories, organizations and developers matching a curated t
 
 <p align="center">
   <img src="docs/assets/architecture-overview.png" alt="High-level architecture" width="820" />
+  <br/>
+  <sub><i><b>High-level architecture.</b> Ingestion and enrichment pipelines feed the metric cache and FastAPI layer, consumed by the dashboard and the Azure AI Foundry agent.</i></sub>
 </p>
 
 ---

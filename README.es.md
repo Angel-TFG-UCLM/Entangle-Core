@@ -79,6 +79,8 @@ Rastrea repositorios, organizaciones y desarrolladores públicos que coinciden c
 
 <p align="center">
   <img src="docs/assets/architecture-overview-es.png" alt="Arquitectura de alto nivel" width="820" />
+  <br/>
+  <sub><i><b>Arquitectura de alto nivel.</b> Los pipelines de ingesta y enriquecimiento alimentan la caché de métricas y la capa FastAPI, consumida por el dashboard y el agente de Azure AI Foundry.</i></sub>
 </p>
 
 ---
