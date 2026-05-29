@@ -78,9 +78,9 @@ Rastrea repositorios, organizaciones y desarrolladores públicos que coinciden c
 ## Arquitectura
 
 <p align="center">
-  <img src="docs/assets/architecture-overview-es.png" alt="Arquitectura de alto nivel" width="820" />
+  <img src="docs/assets/architecture-overview-es.png" alt="Arquitectura del sistema Entangle" width="900" />
   <br/>
-  <sub><i><b>Arquitectura de alto nivel.</b> Los pipelines de ingesta y enriquecimiento alimentan la caché de métricas y la capa FastAPI, consumida por el dashboard y el agente de Azure AI Foundry.</i></sub>
+  <sub><i><b>Arquitectura del sistema Entangle.</b> El pipeline de ingesta + enriquecimiento (Entangle-Core, Container App Job) alimenta Azure Cosmos DB for MongoDB vCore. El servicio FastAPI expone 56 endpoints REST con streaming SSE hacia el frontend Entangle-Visualizer (Dashboard 2D, Universo 3D, Chat IA). El motor de Análisis de Red se ejecuta on-demand desde la API. El agente conversacional sobre Azure AI Foundry usa GPT-4o con tool-calling de solo lectura sobre MongoDB. IaC con Bicep, CI/CD via GitHub Actions, calidad gobernada con SonarQube Cloud.</i></sub>
 </p>
 
 ---
