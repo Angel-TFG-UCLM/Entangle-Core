@@ -559,7 +559,43 @@ def chat_stream(
     yield json.dumps({"type": "status", "message": "Clasificando tu pregunta…"})
 
     # ── Paso 1: Enrutar ──
-    intent = _route_intent(user_message)
+    # _route_intent es una llamada bloqueante a Azure OpenAI. En producción
+    # puede tardar varios segundos y, si no enviamos NADA al cliente durante
+    # ese tiempo, proxies intermedios (Front Door, ingress de Container Apps,
+    # CDN) cierran el stream SSE por idle. Para evitarlo, ejecutamos la
+    # clasificación en un hilo y mientras tanto emitimos heartbeats SSE
+    # ("ping" cada 2s) que mantienen viva la conexión y permiten al
+    # frontend mostrar feedback de que sigue trabajando.
+    result_holder: Dict[str, Any] = {}
+
+    def _run_router():
+        try:
+            result_holder["intent"] = _route_intent(user_message)
+        except Exception as exc:  # pragma: no cover — _route_intent ya hace su propio fallback
+            result_holder["error"] = exc
+            result_holder["intent"] = "DATA"
+
+    router_thread = threading.Thread(target=_run_router, daemon=True)
+    router_thread.start()
+
+    HEARTBEAT_INTERVAL_S = 2.0
+    MAX_WAIT_S = 60.0
+    waited = 0.0
+    while router_thread.is_alive() and waited < MAX_WAIT_S:
+        router_thread.join(timeout=HEARTBEAT_INTERVAL_S)
+        waited += HEARTBEAT_INTERVAL_S
+        if router_thread.is_alive():
+            # Heartbeat: re-emite el status de clasificación para que el
+            # cliente sepa que seguimos vivos y los proxies no corten.
+            yield json.dumps({"type": "status", "message": "Clasificando tu pregunta…"})
+
+    if router_thread.is_alive():
+        # Timeout duro: el router se atascó. Fallback inmediato a DATA.
+        logger.warning("⚠️ Router timeout — fallback a DATA")
+        intent = "DATA"
+    else:
+        intent = result_holder.get("intent", "DATA")
+
     yield json.dumps({"type": "routing", "intent": intent})
 
     # Status post-routing: informar al usuario qué agente se activó

@@ -71,6 +71,64 @@ class TestChatStreamEndpoint:
         assert "text/event-stream" in resp.headers.get("content-type", "")
 
 
+# ==================== Router heartbeat (keeps SSE alive while classifying) ====================
+
+class TestRouterHeartbeats:
+    """The router call to Azure OpenAI can take several seconds. While it runs,
+    chat_stream must keep emitting status events so intermediary proxies (Front
+    Door, Container Apps ingress, CDN) do not close the SSE connection by idle.
+    """
+
+    @patch('src.ai.agent._route_intent')
+    @patch('src.ai.agent._stream_data_worker')
+    def test_emits_heartbeats_while_router_is_slow(self, mock_worker, mock_router):
+        # Simulate a slow router that takes ~5 seconds to respond.
+        import time
+        def slow_router(_msg):
+            time.sleep(5)
+            return "DATA"
+        mock_router.side_effect = slow_router
+        # The worker just yields a single reply to terminate the stream quickly.
+        mock_worker.return_value = iter([json.dumps({"type": "reply", "content": "ok", "history": [], "tools_used": []})])
+
+        # Make sure the endpoint is configured so chat_stream doesn't short-circuit.
+        with patch('src.ai.agent.config.AZURE_AI_ENDPOINT', 'https://fake'):
+            from src.ai.agent import chat_stream
+            events = list(chat_stream("ping"))
+
+        # Parse all events
+        parsed = [json.loads(e) for e in events]
+        status_events = [e for e in parsed if e.get('type') == 'status']
+        routing_events = [e for e in parsed if e.get('type') == 'routing']
+
+        # At least 2 status pings (one initial + at least one heartbeat at 2s)
+        # before the routing event arrives. With a 5s router we expect >=2 heartbeats.
+        classifying_pings = [e for e in status_events if e.get('message', '').startswith('Clasificando')]
+        assert len(classifying_pings) >= 2, (
+            f"Expected at least 2 'Clasificando…' status pings while router was running, "
+            f"got {len(classifying_pings)}. All events: {parsed}"
+        )
+        # Routing event eventually arrives with the intent the router returned.
+        assert len(routing_events) == 1
+        assert routing_events[0]['intent'] == 'DATA'
+
+    @patch('src.ai.agent._route_intent', return_value='DASHBOARD')
+    @patch('src.ai.agent._stream_ui_generic')
+    def test_fast_router_still_emits_routing(self, mock_ui, mock_router):
+        # When the router is fast (<2s) we should NOT spam extra heartbeats; we
+        # still must emit the initial status + the routing event correctly.
+        mock_ui.return_value = iter([json.dumps({"type": "reply", "content": "ok", "history": [], "tools_used": []})])
+        with patch('src.ai.agent.config.AZURE_AI_ENDPOINT', 'https://fake'):
+            from src.ai.agent import chat_stream
+            events = [json.loads(e) for e in chat_stream("how does the dashboard work?")]
+        # First event is always the initial classifying status.
+        assert events[0]['type'] == 'status'
+        assert events[0]['message'].startswith('Clasificando')
+        # The routing event for DASHBOARD is present.
+        routing = [e for e in events if e.get('type') == 'routing']
+        assert routing and routing[0]['intent'] == 'DASHBOARD'
+
+
 # ==================== Additional route coverage ====================
 
 class TestAdminOperationRun:
