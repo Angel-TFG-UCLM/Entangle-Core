@@ -2268,7 +2268,7 @@ async def analyze_collaboration(
             # Extraer co-colaboradores (personas con las que ha trabajado)
             co_collaborators = {}
             for repo in user_repos:
-                for collab in repo.get("collaborators", []):
+                for collab in (repo.get("collaborators") or []):
                     login = collab.get("login")
                     if login and login != user:
                         if login not in co_collaborators:
@@ -2344,7 +2344,10 @@ async def analyze_collaboration(
                 })
             
             # Obtener organizaciones del usuario
-            user_orgs = user_doc.get("organizations", [])
+            # Usar `or []` en lugar de get(..., []) porque Mongo puede
+            # almacenar el campo explícitamente como None, lo que rompería
+            # el slicing posterior (`None[:5]` → TypeError).
+            user_orgs = user_doc.get("organizations") or []
             for org in user_orgs[:5]:
                 org_login = org.get("login") if isinstance(org, dict) else org
                 if org_login:
@@ -2400,7 +2403,7 @@ async def analyze_collaboration(
                      "stargazer_count": 1, "primary_language": 1, "owner": 1}
                 )
                 if repo_doc and repo_doc.get("collaborators"):
-                    collabs = {c.get("login") for c in repo_doc.get("collaborators", []) if c.get("login")}
+                    collabs = {c.get("login") for c in (repo_doc.get("collaborators") or []) if c.get("login")}
                     repo_collaborators[repo_name] = {
                         "doc": repo_doc,
                         "collaborators": collabs
@@ -2507,7 +2510,7 @@ async def analyze_collaboration(
                 # Extraer usuarios únicos
                 users_in_org = set()
                 for repo in org_repos:
-                    for collab in repo.get("collaborators", []):
+                    for collab in (repo.get("collaborators") or []):
                         if collab.get("login"):
                             users_in_org.add(collab.get("login"))
                 
