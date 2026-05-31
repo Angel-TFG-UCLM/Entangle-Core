@@ -108,14 +108,14 @@ class TestCollaborationRoutes:
                 c.find_one.return_value = user_doc
                 cursor = MagicMock(); cursor.__iter__ = MagicMock(return_value=iter([]))
                 c.find.return_value = cursor
-            elif name == "repos" or name == "repositories":
+            elif name in ("repositories", "repos"):
                 # find with collaborators.login filter -> returns alice's repos
                 cursor = MagicMock()
                 cursor.__iter__ = MagicMock(return_value=iter(repos))
                 c.find.return_value = cursor
                 c.find_one.return_value = repos[0]
             else:
-                # metrics_collection: no cache hit
+                # metrics_collection / organizations: no cache hit
                 c.find_one.return_value = None
                 cursor = MagicMock(); cursor.__iter__ = MagicMock(return_value=iter([]))
                 c.find.return_value = cursor
@@ -123,8 +123,8 @@ class TestCollaborationRoutes:
             return c
 
         mock_db.get_collection.side_effect = _get_collection
-        resp = client.post("/api/v1/collaboration/analyze",
-                          json={"user": "alice"})
+        # Params are QUERY params on the FastAPI endpoint, not JSON body.
+        resp = client.post("/api/v1/collaboration/analyze?user=alice")
         # The bug we fixed would raise an unhandled TypeError -> 500.
         # Accept any non-500 status (200 normal, 404/400 for edge cases),
         # AND reject 500 explicitly to be sure no TypeError leaks.
@@ -133,8 +133,8 @@ class TestCollaborationRoutes:
     @patch('src.core.db.db')
     def test_analyze_collaboration_org_focus_with_null_collaborators(self, mock_db, client):
         """
-        Regression test (v1.0.3): exercises the org-focus branch where
-        org repos may contain `collaborators: None`. Verifies that
+        Regression test (v1.0.3): exercises the org-focus branch (orgs=[..])
+        where org repos may contain `collaborators: None`. Verifies that
         `repo.get("collaborators") or []` defends correctly.
         """
         mock_db.ensure_connection = MagicMock()
@@ -143,6 +143,9 @@ class TestCollaborationRoutes:
             {"_id": "or1", "name": "org-repo-1", "full_name": "acme/org-repo-1",
              "owner": {"login": "acme"}, "stargazer_count": 10,
              "collaborators": None, "primary_language": "Go"},
+            {"_id": "or2", "name": "org-repo-2", "full_name": "acme/org-repo-2",
+             "owner": {"login": "acme"}, "stargazer_count": 4,
+             "collaborators": None, "primary_language": "Python"},
         ]
 
         def _get_collection(name):
@@ -151,7 +154,7 @@ class TestCollaborationRoutes:
                 c.find_one.return_value = None
                 cursor = MagicMock(); cursor.__iter__ = MagicMock(return_value=iter([]))
                 c.find.return_value = cursor
-            elif name in ("repos", "repositories"):
+            elif name in ("repositories", "repos"):
                 cursor = MagicMock()
                 cursor.__iter__ = MagicMock(return_value=iter(org_repos))
                 c.find.return_value = cursor
@@ -168,8 +171,10 @@ class TestCollaborationRoutes:
             return c
 
         mock_db.get_collection.side_effect = _get_collection
-        resp = client.post("/api/v1/collaboration/analyze",
-                          json={"organization": "acme"})
+        # orgs param needs at least 2 orgs to satisfy the validation
+        resp = client.post(
+            "/api/v1/collaboration/analyze?orgs=acme&orgs=globex"
+        )
         assert resp.status_code != 500, f"Endpoint crashed with null collaborators: {resp.text}"
 
 
