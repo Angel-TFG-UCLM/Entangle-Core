@@ -75,6 +75,103 @@ class TestCollaborationRoutes:
                           json={"user": "octocat"})
         assert resp.status_code in (200, 400, 422, 500)
 
+    @patch('src.core.db.db')
+    def test_analyze_collaboration_user_focus_with_null_fields(self, mock_db, client):
+        """
+        Regression test for the v1.0.3 hotfix: MongoDB documents may store
+        `organizations` or `collaborators` explicitly as null. Previously
+        `doc.get(key, [])` returned None and the subsequent slice
+        (`None[:5]`) raised TypeError, causing a silent 500. Now defended
+        with `or []` in all 4 occurrences.
+
+        This test exercises the user_focus branch with both null fields
+        populated and asserts the endpoint does NOT crash.
+        """
+        mock_db.ensure_connection = MagicMock()
+
+        # User exists but has organizations=None (Mongo null)
+        user_doc = {"login": "alice", "organizations": None}
+        # Repos where alice is a collaborator, but the collaborators list
+        # itself is None (defensive scenario)
+        repos = [
+            {"_id": "r1", "name": "repo1", "full_name": "alice/repo1",
+             "owner": {"login": "alice"}, "stargazer_count": 5,
+             "collaborators": None, "primary_language": "Python"},
+            {"_id": "r2", "name": "repo2", "full_name": "alice/repo2",
+             "owner": {"login": "alice"}, "stargazer_count": 2,
+             "collaborators": None, "primary_language": "JavaScript"},
+        ]
+
+        def _get_collection(name):
+            c = MagicMock()
+            if name == "users":
+                c.find_one.return_value = user_doc
+                cursor = MagicMock(); cursor.__iter__ = MagicMock(return_value=iter([]))
+                c.find.return_value = cursor
+            elif name == "repos" or name == "repositories":
+                # find with collaborators.login filter -> returns alice's repos
+                cursor = MagicMock()
+                cursor.__iter__ = MagicMock(return_value=iter(repos))
+                c.find.return_value = cursor
+                c.find_one.return_value = repos[0]
+            else:
+                # metrics_collection: no cache hit
+                c.find_one.return_value = None
+                cursor = MagicMock(); cursor.__iter__ = MagicMock(return_value=iter([]))
+                c.find.return_value = cursor
+                c.update_one.return_value = MagicMock(modified_count=1)
+            return c
+
+        mock_db.get_collection.side_effect = _get_collection
+        resp = client.post("/api/v1/collaboration/analyze",
+                          json={"user": "alice"})
+        # The bug we fixed would raise an unhandled TypeError -> 500.
+        # Accept any non-500 status (200 normal, 404/400 for edge cases),
+        # AND reject 500 explicitly to be sure no TypeError leaks.
+        assert resp.status_code != 500, f"Endpoint crashed with null fields: {resp.text}"
+
+    @patch('src.core.db.db')
+    def test_analyze_collaboration_org_focus_with_null_collaborators(self, mock_db, client):
+        """
+        Regression test (v1.0.3): exercises the org-focus branch where
+        org repos may contain `collaborators: None`. Verifies that
+        `repo.get("collaborators") or []` defends correctly.
+        """
+        mock_db.ensure_connection = MagicMock()
+
+        org_repos = [
+            {"_id": "or1", "name": "org-repo-1", "full_name": "acme/org-repo-1",
+             "owner": {"login": "acme"}, "stargazer_count": 10,
+             "collaborators": None, "primary_language": "Go"},
+        ]
+
+        def _get_collection(name):
+            c = MagicMock()
+            if name == "users":
+                c.find_one.return_value = None
+                cursor = MagicMock(); cursor.__iter__ = MagicMock(return_value=iter([]))
+                c.find.return_value = cursor
+            elif name in ("repos", "repositories"):
+                cursor = MagicMock()
+                cursor.__iter__ = MagicMock(return_value=iter(org_repos))
+                c.find.return_value = cursor
+                c.find_one.return_value = org_repos[0]
+            elif name in ("organizations", "orgs"):
+                c.find_one.return_value = {"login": "acme"}
+                cursor = MagicMock(); cursor.__iter__ = MagicMock(return_value=iter([]))
+                c.find.return_value = cursor
+            else:
+                c.find_one.return_value = None
+                cursor = MagicMock(); cursor.__iter__ = MagicMock(return_value=iter([]))
+                c.find.return_value = cursor
+                c.update_one.return_value = MagicMock(modified_count=1)
+            return c
+
+        mock_db.get_collection.side_effect = _get_collection
+        resp = client.post("/api/v1/collaboration/analyze",
+                          json={"organization": "acme"})
+        assert resp.status_code != 500, f"Endpoint crashed with null collaborators: {resp.text}"
+
 
 class TestGitHubIntegrationRoutes:
     @patch('src.core.db.db')
