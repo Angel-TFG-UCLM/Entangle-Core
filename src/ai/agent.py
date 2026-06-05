@@ -299,12 +299,21 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized.setdefault("max_completion_tokens", max(int(original) * 4, 200))
 
     temp = normalized.get("temperature")
-    if temp is not None and temp != 1.0 and temp != 1:
+    if temp is not None and not _is_default_temperature(temp):
         normalized.pop("temperature", None)
 
     normalized.setdefault("reasoning_effort", "minimal")
 
     return normalized
+
+
+def _is_default_temperature(value) -> bool:
+    """Return True when ``value`` equals the reasoning-models default (1.0)
+    within a small float tolerance (avoids the S1244 float-equality smell)."""
+    try:
+        return abs(float(value) - 1.0) < 1e-9
+    except (TypeError, ValueError):
+        return False
 
 
 # ── Regex para extraer acciones embebidas en la respuesta del agente ──
