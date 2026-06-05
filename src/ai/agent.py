@@ -2,7 +2,7 @@
 Integración con Azure AI Foundry — Arquitectura Router-Worker.
 
 El flujo es:
-  1. ROUTER  → clasifica intención ("DATA" / "DASHBOARD" / "UNIVERSE") con gpt-4o, max_tokens 10
+  1. ROUTER  → clasifica intención ("DATA" / "DASHBOARD" / "UNIVERSE") con gpt-5-mini, max_tokens 10
   2. WORKER  → despacha al prompt especializado:
        • DATA_ANALYST      (tools + temperature 0)
        • UI_DASHBOARD      (sin tools + temperature 0.5)
@@ -151,6 +151,7 @@ def _api_call_with_retry(url: str, payload: dict) -> dict:
     Llama a la API de Azure OpenAI con reintentos automáticos para 429
     y errores transitorios (5xx). Respeta el header Retry-After.
     """
+    payload = _normalize_payload(payload)
     last_error = None
     msg_count = len(payload.get("messages", []))
     has_tools = bool(payload.get("tools"))
@@ -251,11 +252,59 @@ def _truncate_tool_result(result: str) -> str:
 
 
 def _build_api_url() -> str:
-    """Construye la URL de la API de Azure OpenAI Chat Completions."""
+    """Construye la URL de la API de Azure OpenAI Chat Completions.
+
+    Usa la api-version 2024-12-01-preview porque es la primera que admite
+    `reasoning_effort` y `max_completion_tokens` para la familia GPT-5.
+    """
     return (
         f"{config.AZURE_AI_ENDPOINT}/openai/deployments/"
-        f"{config.AZURE_AI_DEPLOYMENT}/chat/completions?api-version=2024-10-21"
+        f"{config.AZURE_AI_DEPLOYMENT}/chat/completions?api-version=2024-12-01-preview"
     )
+
+
+# Detección de familia de modelo: gpt-5-mini, gpt-5-nano, o1, etc. usan
+# parámetros distintos a gpt-4o. Cuando AZURE_AI_DEPLOYMENT contiene "gpt-5",
+# "o1" o "o3", se aplica el contrato nuevo:
+#   - max_tokens         → max_completion_tokens
+#   - temperature !=1.0  → omitida (los modelos de razonamiento solo aceptan 1.0)
+_REASONING_HINTS = ("gpt-5", "gpt5", "o1", "o3")
+
+
+def _is_reasoning_model() -> bool:
+    name = (config.AZURE_AI_DEPLOYMENT or "").lower()
+    return any(hint in name for hint in _REASONING_HINTS)
+
+
+def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapta el payload según la familia del modelo de despliegue.
+
+    Para modelos de razonamiento (gpt-5*, o1*, o3*):
+      • Renombra max_tokens → max_completion_tokens.
+      • Multiplica max_completion_tokens × 4 (mínimo 200) para reservar
+        cupo a los tokens de razonamiento internos que la API consume
+        antes de generar texto visible.
+      • Elimina temperatures distintas de 1.0 (la única permitida).
+      • Inyecta reasoning_effort="minimal" cuando no se ha definido,
+        para que el router/clasificador no consuma tokens en cadenas
+        de razonamiento innecesarias y mantenga latencia baja.
+    """
+    if not _is_reasoning_model():
+        return payload
+
+    normalized = dict(payload)
+
+    if "max_tokens" in normalized:
+        original = normalized.pop("max_tokens")
+        normalized.setdefault("max_completion_tokens", max(int(original) * 4, 200))
+
+    temp = normalized.get("temperature")
+    if temp is not None and temp != 1.0 and temp != 1:
+        normalized.pop("temperature", None)
+
+    normalized.setdefault("reasoning_effort", "minimal")
+
+    return normalized
 
 
 # ── Regex para extraer acciones embebidas en la respuesta del agente ──
@@ -311,7 +360,7 @@ def _extract_actions(reply: str) -> Tuple[str, List[Dict[str, Any]]]:
 def _route_intent(user_message: str) -> str:
     """
     Clasifica la intención del usuario como "DATA", "DASHBOARD" o "UNIVERSE".
-    Usa el mismo modelo (gpt-4o) con max_tokens=10, sin tools.
+    Usa el mismo modelo (gpt-5-mini) con max_tokens=10, sin tools.
     Fallback → "DATA" (es más seguro: el data analyst puede hacer tool calls).
     """
     try:

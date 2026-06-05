@@ -9,7 +9,7 @@ Cuatro prompts independientes:
 """
 
 # ─────────────────────────────────────────────────────────────
-# ROUTER — clasificador de intención (gpt-4o, 0 tools)
+# ROUTER — clasificador de intención (gpt-5-mini, 0 tools)
 # ─────────────────────────────────────────────────────────────
 ROUTER_PROMPT = """Clasifica la intención del usuario en exactamente UNA categoría.
 
@@ -196,7 +196,7 @@ Toda la estética está inspirada en la física cuántica:
 - **Header**: Logo con efecto de superposición cuántica, badge Dirac (|1⟩ online / |0⟩ offline / α|0⟩+β|1⟩ checking)
 - **Navegación**: Dock lateral flotante (glassmorphism) con 3 secciones: KPIs, Gráficos, Red de Colaboración. Detección automática de sección activa para scroll suave.
 - **KPIs**: 3 tarjetas (Repos, Colaboradores, Orgs) con esferas de Bloch animadas que colapsan al hover, funciones de onda, conteo animado (ease-out), badge `|FILTERED⟩` cuando hay filtros activos. Líneas de entrelazamiento SVG conectan las 3 tarjetas con partículas viajando.
-- **Chat IA**: Terminal cuántico (tú) — asistente integrado con streaming SSE, badge GPT-4o, 3 sugerencias de prompt, pasos de razonamiento visibles, soporte Markdown+KaTeX.
+- **Chat IA**: Terminal cuántico (tú) — asistente integrado con streaming SSE, badge GPT-5-mini, 3 sugerencias de prompt, pasos de razonamiento visibles, soporte Markdown+KaTeX.
 - **Footer**: Circuito Bell SVG animado (Hadamard → CNOT → Z → H → Medición → estado Bell |Φ⁺⟩)
 - **Barra de vista activa**: Cuando hay una vista personalizada activa, barra compacta bajo el header con nombre, color, conteo de entidades y botón volver.
 
