@@ -33,16 +33,16 @@
       "value": "${MONGO_STORAGE_GB=256}"
     },
     "aiModelName": {
-      "value": "${AI_MODEL_NAME=gpt-4o}"
+      "value": "${AI_MODEL_NAME=gpt-5-mini}"
     },
     "aiModelVersion": {
-      "value": "${AI_MODEL_VERSION=2024-08-06}"
+      "value": "${AI_MODEL_VERSION=2025-08-07}"
     },
     "aiDeploymentName": {
-      "value": "${AI_DEPLOYMENT_NAME=gpt-4o}"
+      "value": "${AI_DEPLOYMENT_NAME=gpt-5-mini}"
     },
     "aiDeploymentCapacity": {
-      "value": "${AI_DEPLOYMENT_CAPACITY=169}"
+      "value": "${AI_DEPLOYMENT_CAPACITY=250}"
     },
     "apiCpu": {
       "value": "${API_CPU=0.5}"
@@ -58,6 +58,9 @@
     },
     "deployStaging": {
       "value": "${DEPLOY_STAGING=true}"
+    },
+    "alertEmail": {
+      "value": "${ALERT_EMAIL=}"
     }
   }
 }

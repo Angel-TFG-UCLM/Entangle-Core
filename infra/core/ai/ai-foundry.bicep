@@ -1,9 +1,9 @@
 // ===========================================
-// Azure AI Foundry (AIServices) + GPT-4o deployment
+// Azure AI Foundry (AIServices) + gpt-5-mini deployment
 // ===========================================
 // Crea un recurso multi-modelo de AIServices (sucesor de Cognitive Services + OpenAI)
 // con custom subdomain (necesario para auth por Managed Identity con DefaultAzureCredential)
-// y un deployment de GPT-4o.
+// y un deployment de gpt-5-mini (familia de razonamiento, 400K contexto, ~20x más barato que gpt-4o).
 
 param name string
 param location string = resourceGroup().location
@@ -18,14 +18,14 @@ param customSubDomainName string = ''
 @description('Permitir acceso público al endpoint.')
 param publicNetworkAccess string = 'Enabled'
 
-@description('Modelo a desplegar (ej: gpt-4o, gpt-4o-mini).')
-param modelName string = 'gpt-4o'
+@description('Modelo a desplegar (ej: gpt-5-mini, gpt-5-nano, gpt-4o-mini).')
+param modelName string = 'gpt-5-mini'
 
-@description('Versión del modelo.')
-param modelVersion string = '2024-08-06'
+@description('Versión del modelo. Por defecto, GA estable de gpt-5-mini.')
+param modelVersion string = '2025-08-07'
 
 @description('Nombre del deployment del modelo (lo que tu app pone en AZURE_AI_DEPLOYMENT).')
-param deploymentName string = 'gpt-4o'
+param deploymentName string = 'gpt-5-mini'
 
 @description('Tipo de capacidad / SKU de despliegue. GlobalStandard reparte entre regiones, Standard local.')
 @allowed([
@@ -35,8 +35,8 @@ param deploymentName string = 'gpt-4o'
 ])
 param deploymentSkuName string = 'GlobalStandard'
 
-@description('Tokens por minuto (TPM) en miles. Por ejemplo 169 = 169.000 TPM.')
-param deploymentCapacity int = 169
+@description('Tokens por minuto (TPM) en miles. Por ejemplo 250 = 250.000 TPM.')
+param deploymentCapacity int = 250
 
 resource ai 'Microsoft.CognitiveServices/accounts@2024-10-01' = {
   name: name

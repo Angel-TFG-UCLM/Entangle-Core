@@ -7,7 +7,7 @@
 //   • Container App API (entangle-api)
 //   • Container App Staging (entangle-api-stagging)
 //   • Cosmos DB for MongoDB vCore (cluster M30)
-//   • Azure AI Foundry (AIServices) + GPT-4o deployment
+//   • Azure AI Foundry (AIServices) + gpt-5-mini deployment
 //   • Azure Static Web App (Standard) para el frontend
 //   • Role assignments para que las MIs invoquen AI Foundry
 // ===========================================
@@ -27,7 +27,7 @@ param location string
 @description('Región del cluster Mongo vCore. Northeurope tiene mejor disponibilidad de M30 que Spain Central.')
 param databaseLocation string = 'northeurope'
 
-@description('Región del recurso Azure AI Foundry. Sweden Central tiene capacidad GPT-4o.')
+@description('Región del recurso Azure AI Foundry. Sweden Central tiene capacidad GPT-5.')
 param aiLocation string = 'swedencentral'
 
 @description('Región de la Static Web App. West Europe es la única región europea que las soporta en muchas suscripciones.')
@@ -61,17 +61,17 @@ param mongoComputeTier string = 'M30'
 param mongoStorageGb int = 256
 
 // ─── AI Foundry ───
-@description('Nombre del modelo a desplegar (gpt-4o, gpt-4o-mini, etc.).')
-param aiModelName string = 'gpt-4o'
+@description('Nombre del modelo a desplegar (gpt-5-mini, gpt-5-nano, gpt-4o, etc.).')
+param aiModelName string = 'gpt-5-mini'
 
-@description('Versión del modelo. La versión por defecto coincide con la usada en producción.')
-param aiModelVersion string = '2024-08-06'
+@description('Versión del modelo. Por defecto la GA estable de gpt-5-mini en Azure AI Foundry.')
+param aiModelVersion string = '2025-08-07'
 
 @description('Nombre del deployment del modelo (lo que tu app pone en AZURE_AI_DEPLOYMENT).')
-param aiDeploymentName string = 'gpt-4o'
+param aiDeploymentName string = 'gpt-5-mini'
 
-@description('Capacidad del deployment en miles de TPM.')
-param aiDeploymentCapacity int = 169
+@description('Capacidad del deployment en miles de TPM (Tokens Por Minuto).')
+param aiDeploymentCapacity int = 250
 
 // ─── Container App API ───
 @description('CPU del container API (vCPUs). Producción actual usa 0.5.')
@@ -88,6 +88,9 @@ param apiMaxReplicas int = 1
 
 @description('Si es true, también se despliega el Container App de staging.')
 param deployStaging bool = true
+
+@description('Email del destinatario de las alertas (Action Group).')
+param alertEmail string = ''
 
 // ============= VARIABLES =============
 var abbrs = loadJsonContent('./abbreviations.json')
@@ -314,7 +317,7 @@ module apiStaging './core/host/container-app.bicep' = if (deployStaging) {
 }
 
 // ============= ROLE ASSIGNMENTS (Managed Identity → AI Foundry) =============
-// Permite a la MI del Container App API invocar GPT-4o por Entra ID
+// Permite a la MI del Container App API invocar el modelo IA por Entra ID
 module aiRoleApi './core/security/ai-role-assignment.bicep' = {
   name: 'ai-role-api'
   scope: rg
@@ -330,6 +333,21 @@ module aiRoleStaging './core/security/ai-role-assignment.bicep' = if (deployStag
   params: {
     aiServiceName: aiFoundry.outputs.name
     principalId: apiStaging.?outputs.principalId ?? ''
+  }
+}
+
+// ============= ALERTAS (Action Group + 7 metric alerts) =============
+module alerts './core/monitor/alerts.bicep' = if (!empty(alertEmail)) {
+  name: 'monitor-alerts'
+  scope: rg
+  params: {
+    actionGroupName: 'entangle-alerts'
+    location: 'global'
+    tags: tags
+    alertEmail: alertEmail
+    apiResourceId: api.outputs.id
+    stagingResourceId: deployStaging ? (apiStaging.?outputs.id ?? '') : ''
+    mongoResourceId: mongoCluster.outputs.id
   }
 }
 
