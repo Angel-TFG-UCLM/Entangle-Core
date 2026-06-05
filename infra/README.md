@@ -15,14 +15,14 @@ Este directorio contiene la infraestructura como código (IaC) que despliega el
 | Container App `*-api-staging` | `Microsoft.App/containerApps` | `location` | Backend FastAPI (staging, opcional) |
 | Cosmos DB for MongoDB vCore | `Microsoft.DocumentDB/mongoClusters` | `databaseLocation` (`northeurope`) | Cluster M30 por defecto, MongoDB 8.0 |
 | Azure AI Foundry (AIServices) | `Microsoft.CognitiveServices/accounts` | `aiLocation` (`swedencentral`) | Multi-modelo, custom subdomain |
-| GPT-4o deployment | `Microsoft.CognitiveServices/accounts/deployments` | (mismo que AI) | GlobalStandard, 169k TPM |
+| gpt-5-mini deployment | `Microsoft.CognitiveServices/accounts/deployments` | (mismo que AI) | GlobalStandard, 250k TPM, 400K contexto |
 | Static Web App (Standard) | `Microsoft.Web/staticSites` | `staticWebAppLocation` (`westeurope`) | Hosting del frontend React |
 | Role assignment AI ↔ MI API | `Microsoft.Authorization/roleAssignments` | — | "Cognitive Services User" |
 | Role assignment AI ↔ MI Staging | `Microsoft.Authorization/roleAssignments` | — | "Cognitive Services User" |
 
 > Algunos servicios viven en regiones distintas a la principal por **disponibilidad
-> de cuota**: M30 de MongoDB no está siempre en Spain Central, GPT-4o tiene capacidad
-> en Sweden Central, y las Static Web Apps requieren regiones específicas.
+> de cuota**: M30 de MongoDB no está siempre en Spain Central, gpt-5-mini tiene
+> capacidad en Sweden Central, y las Static Web Apps requieren regiones específicas.
 
 ## Despliegue rápido con `azd`
 
@@ -89,7 +89,7 @@ az containerapp update -g rg-entangle-prod -n ca-<token>-api `
 | Container Apps (consumption, 0.5 vCPU + 1 Gi, max 1) | ~5 a 30 según tráfico |
 | Container Registry (Basic) | ~5 |
 | Log Analytics (Pay-as-you-go) | ~3 a 10 |
-| AI Foundry (S0 + GPT-4o GlobalStandard) | Pago por uso de tokens |
+| AI Foundry (S0 + gpt-5-mini GlobalStandard) | Pago por uso de tokens (~$0.25/M input · $2/M output, 20× más barato que gpt-4o) |
 | Static Web App (Standard) | ~9 |
 | **Total** | **~360+ USD/mes** (dominado por el Mongo M30) |
 
