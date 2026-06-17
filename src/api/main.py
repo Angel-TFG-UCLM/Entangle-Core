@@ -14,6 +14,12 @@ from ..core.logger import logger
 from ..core.db import db
 
 
+# Referencias fuertes a tasks de fondo (p.ej. el pre-warm del modelo). asyncio
+# solo guarda referencias débiles a los tasks; sin esta colección el recolector
+# de basura podría destruirlos antes de que terminen.
+_background_tasks: set = set()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Eventos de ciclo de vida de la aplicación."""
@@ -49,7 +55,12 @@ async def lifespan(app: FastAPI):
                 logger.info("🔥 Modelo gpt-5-mini pre-calentado")
             except Exception as exc:
                 logger.warning(f"⚠️ Pre-warm del modelo falló (no bloqueante): {exc}")
-        _asyncio.create_task(_warmup())
+        # Guardamos una referencia fuerte al task: asyncio solo mantiene
+        # referencias débiles a los tasks, así que sin esto el GC podría
+        # recolectarlo antes de que termine (ver docs de asyncio.create_task).
+        task = _asyncio.create_task(_warmup())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
         
     except Exception as e:
         logger.error(f"Error durante el inicio: {e}")
