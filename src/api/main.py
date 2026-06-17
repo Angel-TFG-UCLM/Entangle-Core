@@ -28,6 +28,28 @@ async def lifespan(app: FastAPI):
         # Conectar a la base de datos
         db.connect()
         logger.info("Base de datos conectada correctamente")
+
+        # Pre-warm del modelo gpt-5-mini en background — evita los 30-40s
+        # de cold start en la primera petición real del usuario tras un
+        # rato de inactividad. La llamada es mínima (1 token) y no bloquea
+        # el arranque del servidor: corre en un task separado.
+        import asyncio as _asyncio
+        async def _warmup():
+            try:
+                from ..ai.agent import _api_call_with_retry, _build_api_url
+                payload = {
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "temperature": 1,
+                    "reasoning_effort": "minimal",
+                }
+                await _asyncio.get_event_loop().run_in_executor(
+                    None, _api_call_with_retry, _build_api_url(), payload,
+                )
+                logger.info("🔥 Modelo gpt-5-mini pre-calentado")
+            except Exception as exc:
+                logger.warning(f"⚠️ Pre-warm del modelo falló (no bloqueante): {exc}")
+        _asyncio.create_task(_warmup())
         
     except Exception as e:
         logger.error(f"Error durante el inicio: {e}")

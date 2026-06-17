@@ -1,12 +1,18 @@
 """
-Integración con Azure AI Foundry — Arquitectura Router-Worker.
+Integración con Azure AI Foundry — Arquitectura Router-Worker config-driven.
 
 El flujo es:
-  1. ROUTER  → clasifica intención ("DATA" / "DASHBOARD" / "UNIVERSE") con gpt-5-mini, max_tokens 10
-  2. WORKER  → despacha al prompt especializado:
-       • DATA_ANALYST      (tools + temperature 0)
-       • UI_DASHBOARD      (sin tools + temperature 0.5)
-       • UI_UNIVERSE       (sin tools + temperature 0.5)
+  1. ROUTER  → clasifica intención usando ``config/workers.yaml``
+  2. WORKER  → despacha al worker correspondiente con sus tools y reasoning_effort
+
+Workers, tools y prompts se declaran en ``config/workers.yaml`` y se
+registran con ``@tool`` en ``tool_functions.py``. Para añadir un worker
+nuevo basta con editar el YAML — no se toca este módulo.
+
+Compatibilidad con código antiguo:
+  - ``TOOL_FUNCTIONS`` sigue exportándose para tests legacy.
+  - ``AGENT_TOOLS`` se construye dinámicamente desde el registry para tests
+    que aún lo importan.
 
 Soporta streaming SSE para enviar pasos de razonamiento en tiempo real.
 """
@@ -21,13 +27,22 @@ from azure.identity import DefaultAzureCredential
 
 from ..core.config import config
 from ..core.logger import logger
+
+# Side-effect imports: registran las tools (@tool decorator) en tool_registry.
+# Imprescindible que se importen antes de cualquier llamada a get_schemas_for.
+from . import tool_functions as _tool_functions  # noqa: F401
+from . import rag_tool as _rag_tool  # noqa: F401  -- RAG search tool
+from . import insights_tools as _insights_tools  # noqa: F401  -- similar/compare/collab
+from . import research_tools as _research_tools  # noqa: F401  -- web + arXiv
 from .prompts import (
     DATA_ANALYST_PROMPT,
     ROUTER_PROMPT,
     UI_DASHBOARD_PROMPT,
     UI_UNIVERSE_PROMPT,
 )
-from .tool_functions import TOOL_FUNCTIONS
+from .tool_functions import TOOL_FUNCTIONS  # backwards-compat re-export
+from .tool_registry import get_callable, get_display_name, get_schemas_for
+from .workers import AgentConfig, WorkerConfig, load_agent_config
 
 # Token cache con thread-safety
 _credential = None
@@ -41,87 +56,27 @@ _BASE_BACKOFF = 2  # segundos
 _MAX_TOOL_RESULT_CHARS = 8000
 
 
-# Definición de las tools para el agente (OpenAI function calling format)
-AGENT_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "query_database",
-            "description": "Ejecuta una consulta flexible (find) sobre una colección de MongoDB. Permite construir filtros, proyecciones y sort libremente. Solo lectura.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "collection": {
-                        "type": "string",
-                        "enum": ["repositories", "organizations", "users", "metrics"],
-                        "description": "Colección a consultar",
-                    },
-                    "filter": {
-                        "type": "object",
-                        "description": "Filtro de MongoDB (JSON). Ejemplo: {\"stargazer_count\": {\"$gt\": 100}} o {\"primary_language\": \"Python\"}. Soporta $gt, $gte, $lt, $lte, $ne, $in, $regex, $exists, $or, $and, etc.",
-                    },
-                    "projection": {
-                        "type": "object",
-                        "description": "Campos a incluir/excluir. Ejemplo: {\"name\": 1, \"stargazer_count\": 1} para incluir solo esos campos.",
-                    },
-                    "sort": {
-                        "type": "object",
-                        "description": "Ordenamiento. Ejemplo: {\"stargazer_count\": -1} para ordenar por estrellas descendente. Usa -1 (DESC) o 1 (ASC).",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Máximo de resultados (1-50, default 10)",
-                        "default": 10,
-                    },
-                },
-                "required": ["collection"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_aggregation",
-            "description": "Ejecuta un pipeline de aggregation de MongoDB sobre una colección. Permite cálculos complejos como $group, $match, $sort, $unwind, $project, $bucket, $facet, etc. Solo lectura ($out/$merge prohibidos).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "collection": {
-                        "type": "string",
-                        "enum": ["repositories", "organizations", "users", "metrics"],
-                        "description": "Colección sobre la que ejecutar el pipeline",
-                    },
-                    "pipeline": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": "Array de stages de aggregation. Ejemplo: [{\"$match\": {\"stargazer_count\": {\"$gt\": 0}}}, {\"$sort\": {\"stargazer_count\": -1}}, {\"$limit\": 10}]",
-                    },
-                },
-                "required": ["collection", "pipeline"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_collection_schema",
-            "description": "Devuelve un documento de ejemplo y el esquema (campos y tipos) de una colección. Útil para entender la estructura antes de hacer consultas.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "collection": {
-                        "type": "string",
-                        "enum": ["repositories", "organizations", "users", "metrics"],
-                        "description": "Colección de la que obtener el esquema",
-                    },
-                },
-                "required": ["collection"],
-            },
-        },
-    },
-]
+def _agent_config() -> AgentConfig:
+    """Acceso perezoso a la configuración (cacheada en workers.py)."""
+    return load_agent_config()
 
 
+def _build_agent_tools() -> List[Dict[str, Any]]:
+    """Backwards-compat: devuelve todos los schemas registrados, en el orden
+    en que se declararon. Tests antiguos importan ``AGENT_TOOLS`` esperando
+    una lista; mantenemos esa interfaz como vista del registry."""
+    # Suma de tools de todos los workers (sin duplicados, preservando orden)
+    seen: Dict[str, None] = {}
+    for worker in _agent_config().workers.values():
+        for name in worker.tools:
+            seen.setdefault(name, None)
+    return get_schemas_for(seen.keys())
+
+
+# Vista pública (se evalúa la primera vez que se importa). Tests que muteen
+# esta lista verán los cambios sólo en su scope; el agente real recalcula
+# por-worker en cada petición.
+AGENT_TOOLS: List[Dict[str, Any]] = _build_agent_tools()
 
 
 def _get_auth_headers() -> Dict[str, str]:
@@ -144,6 +99,98 @@ def _get_auth_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token.token}",
     }
+
+
+def _api_call_streaming(url: str, payload: dict) -> Generator[Dict[str, Any], None, None]:
+    """
+    Llama a Azure OpenAI con stream=True y yields chunks normalizados.
+    Los tool_calls vienen fragmentados; se acumulan internamente y se emiten
+    al final como un único evento.
+
+    Yields dicts con esta forma:
+      - {"type": "content", "text": "..."}            → trozo de texto del reply
+      - {"type": "tool_calls", "calls": [...]}         → tool calls completos
+      - {"type": "done", "finish_reason": "stop"|...}  → fin del stream
+
+    NOTA: no implementa retry automático. Para casos críticos (router) seguir
+    usando ``_api_call_with_retry``. Streaming solo se usa en los workers
+    porque ahí prima la UX percibida sobre la resiliencia.
+    """
+    payload = _normalize_payload(payload)
+    payload["stream"] = True
+
+    response = requests.post(
+        url,
+        headers=_get_auth_headers(),
+        json=payload,
+        stream=True,
+        timeout=120,
+    )
+    # Si el servidor devuelve error, loguear el body completo (debugging 400/422)
+    if response.status_code >= 400:
+        body = ""
+        try:
+            body = response.text[:1000]
+        except Exception:
+            pass
+        logger.error(
+            "💥 Azure OpenAI %d Bad Request. Body: %s",
+            response.status_code, body,
+        )
+    response.raise_for_status()
+
+    accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
+    finish_reason: Optional[str] = None
+
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        # Azure SSE: "data: {...}" o "data: [DONE]"
+        if not raw_line.startswith("data:"):
+            continue
+        data_str = raw_line[5:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+
+        # Texto del reply (puede llegar en muchos chunks pequeños)
+        content_piece = delta.get("content")
+        if content_piece:
+            yield {"type": "content", "text": content_piece}
+
+        # Tool calls fragmentados: vienen con index, vamos acumulando
+        for tc_delta in delta.get("tool_calls") or []:
+            idx = tc_delta.get("index", 0)
+            entry = accumulated_tool_calls.setdefault(idx, {
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if tc_delta.get("id"):
+                entry["id"] = tc_delta["id"]
+            fn = tc_delta.get("function") or {}
+            if fn.get("name"):
+                entry["function"]["name"] += fn["name"]
+            if fn.get("arguments"):
+                entry["function"]["arguments"] += fn["arguments"]
+
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+
+    if accumulated_tool_calls:
+        ordered = [accumulated_tool_calls[k] for k in sorted(accumulated_tool_calls.keys())]
+        yield {"type": "tool_calls", "calls": ordered}
+
+    yield {"type": "done", "finish_reason": finish_reason}
 
 
 def _api_call_with_retry(url: str, payload: dict) -> dict:
@@ -367,19 +414,23 @@ def _extract_actions(reply: str) -> Tuple[str, List[Dict[str, Any]]]:
 
 
 def _route_intent(user_message: str) -> str:
+    """Clasifica la intención del usuario contra los intents definidos en
+    ``config/workers.yaml``. El router devuelve el nombre del intent en
+    UPPERCASE (legacy: tests existentes lo comparan así); en caso de error
+    o respuesta no reconocida cae al ``fallback`` del config.
     """
-    Clasifica la intención del usuario como "DATA", "DASHBOARD" o "UNIVERSE".
-    Usa el mismo modelo (gpt-5-mini) con max_tokens=10, sin tools.
-    Fallback → "DATA" (es más seguro: el data analyst puede hacer tool calls).
-    """
+    router_cfg = _agent_config().router
+    valid_upper = {i.upper() for i in router_cfg.intents}
+    fallback_upper = router_cfg.fallback.upper()
+
     try:
         payload = {
             "messages": [
-                {"role": "system", "content": ROUTER_PROMPT},
+                {"role": "system", "content": router_cfg.prompt},
                 {"role": "user", "content": user_message},
             ],
             "temperature": 0.0,
-            "max_tokens": 10,
+            "max_tokens": router_cfg.max_completion_tokens,
         }
         data = _api_call_with_retry(_build_api_url(), payload)
         raw = (
@@ -389,18 +440,20 @@ def _route_intent(user_message: str) -> str:
             .strip()
             .upper()
         )
-        intent = raw if raw in ("DATA", "DASHBOARD", "UNIVERSE") else "DATA"
+        intent = raw if raw in valid_upper else fallback_upper
         logger.info(f"🧭 Router: \"{user_message[:60]}\" → {intent} (raw={raw})")
         return intent
     except Exception as e:
-        logger.warning(f"⚠️ Router falló, fallback DATA: {e}")
-        return "DATA"
+        logger.warning(f"⚠️ Router falló, fallback {fallback_upper}: {e}")
+        return fallback_upper
 
 
 def _execute_tool_call(function_name: str, arguments: Dict[str, Any]) -> str:
     """Ejecuta una función local según la solicitud del agente.
-    Normaliza argumentos comunes que el modelo a veces nombra diferente."""
-    func = TOOL_FUNCTIONS.get(function_name)
+    Normaliza argumentos comunes que el modelo a veces nombra diferente.
+    Usa el tool registry como fuente de verdad, con caída al dict legacy
+    TOOL_FUNCTIONS para compatibilidad con tests que aún lo monkeypatchean."""
+    func = get_callable(function_name) or TOOL_FUNCTIONS.get(function_name)
     if not func:
         return json.dumps({"error": f"Función desconocida: {function_name}"})
 
@@ -436,96 +489,128 @@ def chat(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """
-    Arquitectura Router-Worker:
-      1. Router clasifica → "DATA", "DASHBOARD" o "UNIVERSE"
-      2. Worker especializado procesa la petición
+    """Arquitectura Router-Worker config-driven.
+
+      1. Router clasifica el intent contra ``config/workers.yaml``.
+      2. Se busca el WorkerConfig correspondiente.
+      3. Si el worker tiene tools → ``_run_tooled_worker``; si no → ``_run_ui_worker``.
     """
     endpoint = config.AZURE_AI_ENDPOINT
     if not endpoint:
         return {"reply": "El servicio de IA no está configurado.", "history": [], "tools_used": [], "actions": []}
 
     # ── Paso 1: Enrutar ──
-    intent = _route_intent(user_message)
+    intent_upper = _route_intent(user_message)
+    cfg = _agent_config().get_worker(intent_upper.lower())
 
     # ── Paso 2: Despachar al worker ──
-    if intent == "UNIVERSE":
-        return _chat_universe_worker(user_message, conversation_history)
-    if intent == "DASHBOARD":
-        return _chat_dashboard_worker(user_message, conversation_history)
-    return _chat_data_worker(user_message, conversation_history)
+    if cfg.has_tools:
+        return _run_tooled_worker(cfg, user_message, conversation_history)
+    return _run_ui_worker(cfg, user_message, conversation_history)
 
 
-def _chat_ui_generic(
-    system_prompt: str,
+def _run_ui_worker(
+    cfg: WorkerConfig,
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
-    label: str = "UI",
 ) -> Dict[str, Any]:
-    """Worker UI genérico: sin tools, temperature 0.5. Extrae acciones si las hay."""
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    """Worker UI genérico (sin tools). Lee prompt, temperature y reasoning
+    desde ``cfg`` — añadir un worker UI nuevo no requiere tocar este código."""
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": cfg.prompt}]
     if conversation_history:
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
-    payload = {"messages": messages, "temperature": 0.5}
+    payload: Dict[str, Any] = {"messages": messages, "temperature": cfg.temperature}
+    if cfg.reasoning_effort:
+        payload["reasoning_effort"] = cfg.reasoning_effort
 
     try:
         data = _api_call_with_retry(_build_api_url(), payload)
     except requests.exceptions.Timeout:
         return {"reply": "Lo siento, el servicio tardó demasiado en responder.", "history": [], "tools_used": [], "actions": []}
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error en {label} worker: {e}")
+        logger.error(f"Error en {cfg.display_name} worker: {e}")
         return {"reply": "Error al conectar con el servicio de IA.", "history": [], "tools_used": [], "actions": []}
 
     raw_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No pude generar una respuesta.")
 
-    # Extraer acciones embebidas
     reply, actions = _extract_actions(raw_reply)
     if actions:
-        logger.info(f"🎬 {label} worker emitió {len(actions)} acción(es): {[a['action'] for a in actions]}")
+        logger.info(f"🎬 {cfg.display_name} emitió {len(actions)} acción(es): {[a['action'] for a in actions]}")
 
     messages.append({"role": "assistant", "content": reply})
     clean_history = [m for m in messages if m.get("role") != "system"]
     return {"reply": reply, "history": clean_history, "tools_used": [], "actions": actions}
 
 
+# Aliases para compatibilidad hacia atrás con tests que monkeypatchean los
+# nombres concretos. Implementan la antigua firma reenviando al despachador
+# config-driven (`_run_ui_worker`).
+def _chat_ui_generic(
+    system_prompt: str,
+    user_message: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    label: str = "UI",
+) -> Dict[str, Any]:
+    """Compat: ejecuta un worker UI ad-hoc con un prompt arbitrario."""
+    ad_hoc = WorkerConfig(
+        intent=label.lower(),
+        display_name=label,
+        prompt=system_prompt,
+        tools=[],
+        temperature=0.5,
+        reasoning_effort="low",
+    )
+    return _run_ui_worker(ad_hoc, user_message, conversation_history)
+
+
 def _chat_dashboard_worker(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Worker DASHBOARD: responde sobre el dashboard, metodología y UI 2D."""
-    return _chat_ui_generic(UI_DASHBOARD_PROMPT, user_message, conversation_history, "DASHBOARD")
+    return _run_ui_worker(_agent_config().get_worker("dashboard"), user_message, conversation_history)
 
 
 def _chat_universe_worker(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Worker UNIVERSE: responde sobre el Universo 3D."""
-    return _chat_ui_generic(UI_UNIVERSE_PROMPT, user_message, conversation_history, "UNIVERSE")
+    return _run_ui_worker(_agent_config().get_worker("universe"), user_message, conversation_history)
 
 
 def _chat_data_worker(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Worker DATA: con tools, temperature 0, tool_choice required en round 0."""
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": DATA_ANALYST_PROMPT}]
+    return _run_tooled_worker(_agent_config().get_worker("data"), user_message, conversation_history)
+
+
+def _run_tooled_worker(
+    cfg: WorkerConfig,
+    user_message: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Worker con function-calling. Lee tools, temperature, reasoning_effort,
+    tool_choice_first_round y max_rounds desde ``cfg``."""
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": cfg.prompt}]
     if conversation_history:
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
+    tools_schemas = get_schemas_for(cfg.tools)
     tools_used: List[str] = []
-    max_rounds = 25
 
-    for round_num in range(max_rounds):
-        payload = {
+    for round_num in range(cfg.max_rounds):
+        tool_choice = cfg.tool_choice_first_round if (round_num == 0 and not tools_used) else "auto"
+        payload: Dict[str, Any] = {
             "messages": messages,
-            "tools": AGENT_TOOLS,
-            "tool_choice": "required" if round_num == 0 and not tools_used else "auto",
-            "temperature": 0,
+            "tools": tools_schemas,
+            "tool_choice": tool_choice,
+            "temperature": cfg.temperature,
         }
+        if cfg.reasoning_effort:
+            payload["reasoning_effort"] = cfg.reasoning_effort
 
         try:
             data = _api_call_with_retry(_build_api_url(), payload)
@@ -565,9 +650,7 @@ def _chat_data_worker(
         reply = message.get("content", "No pude generar una respuesta.")
         messages.append({"role": "assistant", "content": reply})
         clean_history = [m for m in messages if m.get("role") != "system"]
-        tools_display = list(dict.fromkeys(
-            TOOL_DISPLAY_NAMES.get(t, t) for t in tools_used
-        ))
+        tools_display = list(dict.fromkeys(get_display_name(t) for t in tools_used))
         return {"reply": reply, "history": clean_history, "tools_used": tools_display, "actions": []}
 
     return {
@@ -599,10 +682,10 @@ def chat_stream(
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Generator[str, None, None]:
     """
-    Versión streaming — arquitectura Router-Worker.
+    Versión streaming — arquitectura Router-Worker config-driven.
     Emite eventos SSE:
       - {"type": "status",      "message": "..."}
-      - {"type": "routing",     "intent": "DATA"|"DASHBOARD"|"UNIVERSE"}
+      - {"type": "routing",     "intent": "DATA"|"DASHBOARD"|"UNIVERSE"|...}
       - {"type": "thinking",    "description": "...", "round": N}
       - {"type": "tool_result", "summary": "..."}
       - {"type": "reply",       "content": "...", "history": [...], "tools_used": [...]}
@@ -613,8 +696,12 @@ def chat_stream(
         yield json.dumps({"type": "error", "content": "El servicio de IA no está configurado."})
         return
 
-    # Evento inmediato: feedback al usuario
-    yield json.dumps({"type": "status", "message": "Clasificando tu pregunta…"})
+    # Paso 1: thinking real del router (no fake)
+    yield json.dumps({
+        "type": "thinking",
+        "description": "Eligiendo el agente más adecuado",
+        "phase": "router",
+    })
 
     # ── Paso 1: Enrutar ──
     # _route_intent es una llamada bloqueante a Azure OpenAI. En producción
@@ -622,8 +709,10 @@ def chat_stream(
     # ese tiempo, proxies intermedios (Front Door, ingress de Container Apps,
     # CDN) cierran el stream SSE por idle. Para evitarlo, ejecutamos la
     # clasificación en un hilo y mientras tanto emitimos heartbeats SSE
-    # ("ping" cada 2s) que mantienen viva la conexión y permiten al
-    # frontend mostrar feedback de que sigue trabajando.
+    # invisibles (comentarios) que mantienen viva la conexión sin ensuciar
+    # la UI con mensajes fake.
+    cfg = _agent_config()
+    fallback_upper = cfg.router.fallback.upper()
     result_holder: Dict[str, Any] = {}
 
     def _run_router():
@@ -631,7 +720,7 @@ def chat_stream(
             result_holder["intent"] = _route_intent(user_message)
         except Exception as exc:  # pragma: no cover — _route_intent ya hace su propio fallback
             result_holder["error"] = exc
-            result_holder["intent"] = "DATA"
+            result_holder["intent"] = fallback_upper
 
     router_thread = threading.Thread(target=_run_router, daemon=True)
     router_thread.start()
@@ -643,46 +732,68 @@ def chat_stream(
         router_thread.join(timeout=HEARTBEAT_INTERVAL_S)
         waited += HEARTBEAT_INTERVAL_S
         if router_thread.is_alive():
-            # Heartbeat: re-emite el status de clasificación para que el
-            # cliente sepa que seguimos vivos y los proxies no corten.
-            yield json.dumps({"type": "status", "message": "Clasificando tu pregunta…"})
+            # Heartbeat invisible: mantiene la conexión TCP viva sin generar
+            # ruido en la UI. El frontend ignora type='heartbeat' por defecto
+            # en el switch SSE. El thinking step "Eligiendo agente" sigue
+            # visible con su timer hasta que llegue el tool_result.
+            yield json.dumps({"type": "heartbeat"})
 
     if router_thread.is_alive():
-        # Timeout duro: el router se atascó. Fallback inmediato a DATA.
-        logger.warning("⚠️ Router timeout — fallback a DATA")
-        intent = "DATA"
+        logger.warning("⚠️ Router timeout — fallback a %s", fallback_upper)
+        intent = fallback_upper
     else:
-        intent = result_holder.get("intent", "DATA")
+        intent = result_holder.get("intent", fallback_upper)
+
+    worker_cfg = cfg.get_worker(intent.lower())
+
+    # Cerrar el thinking del router con un tool_result real
+    yield json.dumps({
+        "type": "tool_result",
+        "summary": f"Agente seleccionado: {worker_cfg.display_name}",
+    })
 
     yield json.dumps({"type": "routing", "intent": intent})
 
-    # Status post-routing: informar al usuario qué agente se activó
-    if intent == "UNIVERSE":
-        yield json.dumps({"type": "status", "message": "Conectando con el Experto Universo…"})
-        yield from _stream_ui_generic(UI_UNIVERSE_PROMPT, user_message, conversation_history, "Experto Universo")
-    elif intent == "DASHBOARD":
-        yield json.dumps({"type": "status", "message": "Conectando con el Experto Dashboard…"})
-        yield from _stream_ui_generic(UI_DASHBOARD_PROMPT, user_message, conversation_history, "Experto Dashboard")
+    # Preservar indirecciones legacy: tests existentes monkeypatchean
+    # ``_stream_data_worker`` y ``_stream_ui_generic``. Mantengo las dos
+    # rutas para que el flujo siga siendo testeable sin tocar tests
+    # antiguos. Nuevos workers tooled usan el dispatcher genérico directo.
+    if worker_cfg.has_tools:
+        if worker_cfg.intent == "data":
+            yield from _stream_data_worker(user_message, conversation_history)
+        else:
+            yield from _stream_tooled_worker(worker_cfg, user_message, conversation_history)
     else:
-        yield json.dumps({"type": "status", "message": "Conectando con el Analista de datos…"})
-        yield from _stream_data_worker(user_message, conversation_history)
+        # ``_stream_ui_generic`` acepta prompt+label y dentro reusa
+        # ``_stream_ui_worker``; los tests legacy lo monkeypatchean.
+        yield from _stream_ui_generic(
+            worker_cfg.prompt,
+            user_message,
+            conversation_history,
+            worker_cfg.display_name,
+        )
 
 
-def _stream_ui_generic(
-    system_prompt: str,
+def _stream_ui_worker(
+    cfg: WorkerConfig,
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
-    label: str = "UI",
 ) -> Generator[str, None, None]:
-    """Worker UI streaming genérico: sin tools, temperature 0.5. Extrae acciones."""
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    """Streaming de un worker UI (sin tools). Lee parámetros desde ``cfg``."""
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": cfg.prompt}]
     if conversation_history:
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
-    yield json.dumps({"type": "status", "message": f"{label} redactando respuesta…", "status_key": "drafting"})
+    yield json.dumps({
+        "type": "thinking",
+        "description": f"{cfg.display_name} preparando respuesta",
+        "phase": "ui_worker",
+    })
 
-    payload = {"messages": messages, "temperature": 0.5}
+    payload: Dict[str, Any] = {"messages": messages, "temperature": cfg.temperature}
+    if cfg.reasoning_effort:
+        payload["reasoning_effort"] = cfg.reasoning_effort
 
     try:
         data = _api_call_with_retry(_build_api_url(), payload)
@@ -690,18 +801,22 @@ def _stream_ui_generic(
         yield json.dumps({"type": "error", "content": "El servicio tardó demasiado en responder."})
         return
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error en {label} worker: {e}")
+        logger.error(f"Error en {cfg.display_name} worker: {e}")
         yield json.dumps({"type": "error", "content": "Error al conectar con el servicio de IA."})
         return
 
     raw_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No pude generar una respuesta.")
 
-    # Extraer acciones embebidas
     reply, actions = _extract_actions(raw_reply)
     if actions:
-        logger.info(f"🎬 {label} worker emitió {len(actions)} acción(es): {[a['action'] for a in actions]}")
+        logger.info(f"🎬 {cfg.display_name} emitió {len(actions)} acción(es): {[a['action'] for a in actions]}")
 
-    # Emitir cada acción como un evento SSE antes del reply
+    # Cerrar el thinking con un tool_result real
+    yield json.dumps({
+        "type": "tool_result",
+        "summary": f"{len(actions)} acción(es) a aplicar" if actions else "Respuesta lista",
+    })
+
     for action in actions:
         yield json.dumps({
             "type": "action",
@@ -720,35 +835,99 @@ def _stream_ui_generic(
     })
 
 
+# Backwards-compat: tests viejos llaman a _stream_ui_generic con prompt + label
+def _stream_ui_generic(
+    system_prompt: str,
+    user_message: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    label: str = "UI",
+) -> Generator[str, None, None]:
+    ad_hoc = WorkerConfig(
+        intent=label.lower(),
+        display_name=label,
+        prompt=system_prompt,
+        tools=[],
+        temperature=0.5,
+        reasoning_effort="low",
+    )
+    yield from _stream_ui_worker(ad_hoc, user_message, conversation_history)
+
+
 def _stream_data_worker(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Generator[str, None, None]:
-    """Worker DATA streaming: con tools, temperature 0, tool_choice required en round 0."""
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": DATA_ANALYST_PROMPT}]
+    """Backwards-compat alias para el worker DATA (sigue usado por tests)."""
+    yield from _stream_tooled_worker(
+        _agent_config().get_worker("data"), user_message, conversation_history
+    )
+
+
+def _stream_tooled_worker(
+    cfg: WorkerConfig,
+    user_message: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+) -> Generator[str, None, None]:
+    """Streaming de un worker con function-calling. Lee tools, temperature,
+    reasoning_effort y max_rounds desde ``cfg``."""
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": cfg.prompt}]
     if conversation_history:
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
+    tools_schemas = get_schemas_for(cfg.tools)
     tools_used: List[str] = []
-    max_rounds = 25
+    short_name = cfg.display_name.split()[0] if cfg.display_name else "Worker"
 
-    for round_num in range(max_rounds):
-        if round_num > 0:
-            if tools_used:
-                yield json.dumps({"type": "status", "message": "Analista procesando datos obtenidos…", "status_key": "analystProcessing"})
-            else:
-                yield json.dumps({"type": "status", "message": "Analista preparando consulta…", "status_key": "analystPreparing"})
+    for round_num in range(cfg.max_rounds):
+        # Thinking real: el agente está "pensando qué hacer" antes de la
+        # llamada al LLM. Si el primer chunk del stream es texto, el frontend
+        # cierra este step automáticamente al recibir el primer 'token' (oculta
+        # los thinking y muestra el reply en streaming). Si el primer chunk es
+        # un tool_call, emitimos el tool_result de este paso justo antes del
+        # thinking del propio tool, dando continuidad realista.
+        if round_num == 0:
+            yield json.dumps({
+                "type": "thinking",
+                "description": f"{short_name} analizando tu pregunta",
+                "phase": "reasoning",
+                "round": round_num + 1,
+            })
+        else:
+            phase_desc = "Sintetizando los datos obtenidos" if tools_used else "Replanteando la consulta"
+            yield json.dumps({
+                "type": "thinking",
+                "description": phase_desc,
+                "phase": "reasoning",
+                "round": round_num + 1,
+            })
 
-        payload = {
+        tool_choice = cfg.tool_choice_first_round if (round_num == 0 and not tools_used) else "auto"
+        payload: Dict[str, Any] = {
             "messages": messages,
-            "tools": AGENT_TOOLS,
-            "tool_choice": "required" if round_num == 0 and not tools_used else "auto",
-            "temperature": 0,
+            "tools": tools_schemas,
+            "tool_choice": tool_choice,
+            "temperature": cfg.temperature,
         }
+        if cfg.reasoning_effort:
+            payload["reasoning_effort"] = cfg.reasoning_effort
 
         try:
-            data = _api_call_with_retry(_build_api_url(), payload)
+            stream_iter = _api_call_streaming(_build_api_url(), payload)
+            accumulated_content = ""
+            accumulated_tool_calls: Optional[List[Dict[str, Any]]] = None
+            finish_reason: Optional[str] = None
+            for chunk in stream_iter:
+                ctype = chunk.get("type")
+                if ctype == "content":
+                    text = chunk.get("text") or ""
+                    if text:
+                        accumulated_content += text
+                        yield json.dumps({"type": "token", "content": text})
+                elif ctype == "tool_calls":
+                    accumulated_tool_calls = chunk.get("calls")
+                elif ctype == "done":
+                    finish_reason = chunk.get("finish_reason")
         except requests.exceptions.Timeout:
             yield json.dumps({"type": "error", "content": "El servicio tardó demasiado en responder."})
             return
@@ -761,23 +940,31 @@ def _stream_data_worker(
                 yield json.dumps({"type": "error", "content": "Error al conectar con el servicio de IA."})
             return
 
-        choice = data.get("choices", [{}])[0]
-        message = choice.get("message", {})
-        finish_reason = choice.get("finish_reason")
-
-        tool_calls = message.get("tool_calls")
+        tool_calls = accumulated_tool_calls
         if finish_reason == "tool_calls" or tool_calls:
-            messages.append(message)
+            # Cerrar el thinking "analizando/sintetizando" con un tool_result
+            # real que indique cuántas herramientas planea usar.
+            n_tools = len(tool_calls or [])
+            yield json.dumps({
+                "type": "tool_result",
+                "summary": f"Va a ejecutar {n_tools} {'herramienta' if n_tools == 1 else 'herramientas'}",
+            })
 
-            for tc in tool_calls:
+            # Reconstruimos el message del assistant para añadirlo al historial
+            messages.append({
+                "role": "assistant",
+                "content": accumulated_content if accumulated_content else None,
+                "tool_calls": tool_calls or [],
+            })
+
+            for tc in (tool_calls or []):
                 fn_name = tc["function"]["name"]
                 try:
                     fn_args = json.loads(tc["function"]["arguments"])
                 except (json.JSONDecodeError, KeyError):
                     fn_args = {}
 
-                # Emitir evento de "pensando" — SIN revelar nombres técnicos
-                display_name = TOOL_DISPLAY_NAMES.get(fn_name, "Procesando")
+                display_name = get_display_name(fn_name)
                 col_raw = fn_args.get("collection", "")
                 col_display = _COLLECTION_DISPLAY.get(col_raw, col_raw)
 
@@ -806,7 +993,6 @@ def _stream_data_worker(
                 result = _execute_tool_call(fn_name, fn_args)
                 tools_used.append(fn_name)
 
-                # Emitir resumen breve del resultado
                 result_count = None
                 try:
                     result_data = json.loads(result)
@@ -832,13 +1018,10 @@ def _stream_data_worker(
 
             continue
 
-        # Respuesta final
-        reply = message.get("content", "No pude generar una respuesta.")
+        reply = accumulated_content or "No pude generar una respuesta."
         messages.append({"role": "assistant", "content": reply})
         clean_history = [m for m in messages if m.get("role") != "system"]
-        tools_display = list(dict.fromkeys(
-            TOOL_DISPLAY_NAMES.get(t, t) for t in tools_used
-        ))
+        tools_display = list(dict.fromkeys(get_display_name(t) for t in tools_used))
 
         yield json.dumps({
             "type": "reply",
@@ -848,7 +1031,6 @@ def _stream_data_worker(
         })
         return
 
-    # Safety cap alcanzado
     yield json.dumps({
         "type": "error",
         "content": "Se alcanzó el límite de procesamiento. Reformula tu pregunta.",

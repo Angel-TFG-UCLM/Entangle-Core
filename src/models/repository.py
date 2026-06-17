@@ -436,7 +436,7 @@ class Repository(BaseModel):
         has_readme = False
         readme_object = data.get("object")
         if readme_object and isinstance(readme_object, dict):
-            readme_text = _truncate_text(readme_object.get("text"), max_length=1000)
+            readme_text = _truncate_text(readme_object.get("text"), max_length=10000)
             has_readme = bool(readme_text)
         
         # ==================== SEGURIDAD (SOLO CONTADOR) ====================

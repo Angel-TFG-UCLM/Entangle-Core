@@ -41,6 +41,10 @@ class Config:
     AZURE_AI_API_KEY = os.getenv("AZURE_AI_API_KEY", "")
     AZURE_AI_DEPLOYMENT = os.getenv("AZURE_AI_DEPLOYMENT", "gpt-5-mini")
 
+    # Tavily Search API (worker DEEP_RESEARCH). Opcional: si está vacío,
+    # web_search devuelve un error controlado y el worker informa al usuario.
+    TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+
     # Frontend URL para CORS (Azure Static Web Apps)
     FRONTEND_URL = os.getenv("FRONTEND_URL", "")
     

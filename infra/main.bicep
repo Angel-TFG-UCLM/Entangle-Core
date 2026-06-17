@@ -73,6 +73,22 @@ param aiDeploymentName string = 'gpt-5-mini'
 @description('Capacidad del deployment en miles de TPM (Tokens Por Minuto).')
 param aiDeploymentCapacity int = 250
 
+@description('Nombre del modelo de embeddings (RAG worker KNOWLEDGE).')
+param embeddingModelName string = 'text-embedding-3-small'
+
+@description('Versión del modelo de embeddings.')
+param embeddingModelVersion string = '1'
+
+@description('Nombre del deployment de embeddings (lo que usa el embedder.py).')
+param embeddingDeploymentName string = 'text-embedding-3-small'
+
+@description('Capacidad del deployment de embeddings (miles de TPM).')
+param embeddingDeploymentCapacity int = 120
+
+@secure()
+@description('Tavily Search API key (worker DEEP_RESEARCH). Si está vacío, web_search devuelve error controlado y el worker informa al usuario.')
+param tavilyApiKey string = ''
+
 // ─── Container App API ───
 @description('CPU del container API (vCPUs). Producción actual usa 0.5.')
 param apiCpu string = '0.5'
@@ -182,6 +198,10 @@ module aiFoundry './core/ai/ai-foundry.bicep' = {
     modelVersion: aiModelVersion
     deploymentName: aiDeploymentName
     deploymentCapacity: aiDeploymentCapacity
+    embeddingModelName: embeddingModelName
+    embeddingModelVersion: embeddingModelVersion
+    embeddingDeploymentName: embeddingDeploymentName
+    embeddingDeploymentCapacity: embeddingDeploymentCapacity
   }
 }
 
@@ -252,6 +272,14 @@ module api './core/host/container-app.bicep' = {
         name: 'AZURE_AI_DEPLOYMENT'
         value: aiFoundry.outputs.deploymentName
       }
+      {
+        name: 'AZURE_AI_EMBEDDING_DEPLOYMENT'
+        value: aiFoundry.outputs.embeddingDeploymentName
+      }
+      {
+        name: 'TAVILY_API_KEY'
+        secretRef: 'tavily-api-key'
+      }
     ]
     secrets: [
       {
@@ -261,6 +289,10 @@ module api './core/host/container-app.bicep' = {
       {
         name: 'github-token'
         value: !empty(githubToken) ? githubToken : 'placeholder-configure-after-deploy'
+      }
+      {
+        name: 'tavily-api-key'
+        value: !empty(tavilyApiKey) ? tavilyApiKey : 'placeholder-no-web-search'
       }
     ]
   }
