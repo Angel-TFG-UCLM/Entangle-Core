@@ -8,6 +8,14 @@ import requests
 from src.ai import research_tools
 
 
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    """Neutraliza los backoffs de reintento: los unit tests no deben dormir
+    de verdad (en CI, ``--timeout=30`` mataría los tests que ejercitan la
+    lógica de reintentos de arXiv)."""
+    monkeypatch.setattr(research_tools.time, "sleep", lambda *_a, **_k: None)
+
+
 # ─────────────────── web_search (Tavily) ───────────────────
 def test_web_search_no_key(monkeypatch):
     monkeypatch.setattr(research_tools, "_TAVILY_API_KEY", "")
