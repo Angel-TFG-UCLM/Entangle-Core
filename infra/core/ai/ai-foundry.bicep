@@ -75,8 +75,43 @@ resource gpt 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
   }
 }
 
+// ============= EMBEDDINGS DEPLOYMENT (RAG) =============
+@description('Modelo de embeddings para el pipeline RAG (worker KNOWLEDGE).')
+param embeddingModelName string = 'text-embedding-3-small'
+
+@description('Versión del modelo de embeddings.')
+param embeddingModelVersion string = '1'
+
+@description('Nombre del deployment de embeddings (lo que usa el embedder.py).')
+param embeddingDeploymentName string = 'text-embedding-3-small'
+
+@description('Capacidad del deployment de embeddings (TPM en miles).')
+param embeddingDeploymentCapacity int = 120
+
+resource embedding 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
+  parent: ai
+  name: embeddingDeploymentName
+  // El embedding debe esperar al gpt para evitar 409 ConflictError
+  // (Azure serializa las creaciones de deployments dentro de un mismo recurso)
+  dependsOn: [
+    gpt
+  ]
+  sku: {
+    name: 'GlobalStandard'
+    capacity: embeddingDeploymentCapacity
+  }
+  properties: {
+    model: {
+      format: 'OpenAI'
+      name: embeddingModelName
+      version: embeddingModelVersion
+    }
+  }
+}
+
 output id string = ai.id
 output name string = ai.name
 output endpoint string = 'https://${ai.properties.customSubDomainName}.services.ai.azure.com'
 output openAiEndpoint string = ai.properties.endpoint
 output deploymentName string = gpt.name
+output embeddingDeploymentName string = embedding.name

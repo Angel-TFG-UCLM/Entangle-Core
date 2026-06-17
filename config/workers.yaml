@@ -1,0 +1,90 @@
+# Entangle — Router-Worker configuration
+#
+# Define el router (clasificador de intención) y los workers especializados
+# del agente conversacional. Añadir un worker nuevo NO requiere tocar el
+# código del agente: basta con declararlo aquí y referenciar las tools
+# por nombre (las tools se registran con @tool en src/ai/).
+#
+# Estructura:
+#   router:    config del clasificador (max_completion_tokens, intents...)
+#   workers:   diccionario {intent → WorkerConfig}
+#
+# Campos por worker:
+#   display_name           — etiqueta visible en logs y SSE
+#   prompt_constant        — nombre del constante en src/ai/prompts.py
+#   tools                  — lista de nombres registrados en tool_registry
+#                            (lista vacía = worker sin function-calling)
+#   temperature            — 0.0..2.0 (omitida automáticamente en gpt-5*)
+#   reasoning_effort       — minimal | low | medium | high
+#   tool_choice_first_round — auto | required (default: auto)
+#   max_rounds             — nº máximo de iteraciones tool ↔ LLM
+
+router:
+  prompt_constant: ROUTER_PROMPT
+  reasoning_effort: minimal
+  max_completion_tokens: 10
+  intents: [data, dashboard, universe, knowledge, insights]
+  fallback: data
+
+workers:
+  data:
+    display_name: "Analista de datos"
+    prompt_constant: DATA_ANALYST_PROMPT
+    tools:
+      - query_database
+      - run_aggregation
+      - get_collection_schema
+    temperature: 0
+    reasoning_effort: medium
+    tool_choice_first_round: required
+    max_rounds: 25
+
+  dashboard:
+    display_name: "Experto Dashboard"
+    prompt_constant: UI_DASHBOARD_PROMPT
+    tools: []
+    temperature: 0.5
+    reasoning_effort: low
+
+  universe:
+    display_name: "Experto Universo"
+    prompt_constant: UI_UNIVERSE_PROMPT
+    tools: []
+    temperature: 0.5
+    reasoning_effort: low
+
+  knowledge:
+    display_name: "Experto Conocimiento"
+    prompt_constant: KNOWLEDGE_PROMPT
+    tools:
+      - search_knowledge_base
+    temperature: 0.3
+    reasoning_effort: medium
+    tool_choice_first_round: required
+    max_rounds: 4
+
+  insights:
+    display_name: "Analista de Insights"
+    prompt_constant: INSIGHTS_PROMPT
+    tools:
+      - find_similar_repos
+      - compare_repos
+      - collaboration_strength
+    temperature: 0.2
+    reasoning_effort: medium
+    tool_choice_first_round: required
+    max_rounds: 4
+
+  # Worker fuera del router por defecto: se accede solo desde el endpoint
+  # /api/v1/chat/research (más estricto y separado) para evitar que el
+  # agente "se salga" del dominio sin que el usuario lo pida.
+  deep_research:
+    display_name: "Investigador externo"
+    prompt_constant: DEEP_RESEARCH_PROMPT
+    tools:
+      - web_search
+      - search_arxiv
+    temperature: 0.4
+    reasoning_effort: medium
+    tool_choice_first_round: required
+    max_rounds: 10

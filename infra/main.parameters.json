@@ -44,6 +44,21 @@
     "aiDeploymentCapacity": {
       "value": "${AI_DEPLOYMENT_CAPACITY=250}"
     },
+    "embeddingModelName": {
+      "value": "${AI_EMBEDDING_MODEL=text-embedding-3-small}"
+    },
+    "embeddingModelVersion": {
+      "value": "${AI_EMBEDDING_VERSION=1}"
+    },
+    "embeddingDeploymentName": {
+      "value": "${AI_EMBEDDING_DEPLOYMENT=text-embedding-3-small}"
+    },
+    "embeddingDeploymentCapacity": {
+      "value": "${AI_EMBEDDING_CAPACITY=120}"
+    },
+    "tavilyApiKey": {
+      "value": "${TAVILY_API_KEY=}"
+    },
     "apiCpu": {
       "value": "${API_CPU=0.5}"
     },
