@@ -1,4 +1,4 @@
-﻿"""Tests for OrganizationIngestionEngine - untested methods."""
+"""Tests for OrganizationIngestionEngine - untested methods."""
 import threading
 import time
 import pytest
@@ -9,6 +9,15 @@ from src.github.organization_ingestion import OrganizationIngestionEngine
 from src.models.organization import Organization
 
 
+
+def _assert_one_real_sleep(mock_sleep):
+    # Cuenta solo los sleeps "reales" de espera de rate-limit (>=1s). Otros
+    # tests de la suite pueden dejar hilos demonio paginando (graphql_client
+    # hace time.sleep(0.5) entre paginas); al parchear el time.sleep global,
+    # ese ruido sub-segundo contaminaria un assert_called_once(). Filtrarlo
+    # hace la asercion determinista e independiente del orden de los tests.
+    real = [c for c in mock_sleep.call_args_list if c.args and c.args[0] >= 1]
+    assert len(real) == 1, f"esperaba 1 sleep de rate-limit, hubo {len(real)}: {real}"
 def _make_engine(**kwargs):
     """Create engine with mocked dependencies."""
     defaults = dict(
@@ -422,7 +431,7 @@ class TestCheckRateLimit:
         engine._rate_limit_until = 105  # 5s in the future
         with patch('time.sleep') as mock_sleep:
             engine._check_rate_limit()
-            mock_sleep.assert_called_once()
+            _assert_one_real_sleep(mock_sleep)
 
 
 # ==================== _wait_for_rate_limit_reset ====================
@@ -437,7 +446,7 @@ class TestWaitForRateLimitReset:
             "remaining": 0, "reset_at": reset_at
         }
         engine._wait_for_rate_limit_reset()
-        mock_sleep.assert_called_once()
+        _assert_one_real_sleep(mock_sleep)
         assert engine._rate_limit_until > 0
 
     @patch('time.sleep')
@@ -446,7 +455,7 @@ class TestWaitForRateLimitReset:
         engine = _make_engine()
         engine._rate_limit_until = 1050  # another thread set this
         engine._wait_for_rate_limit_reset()
-        mock_sleep.assert_called_once()
+        _assert_one_real_sleep(mock_sleep)
 
     @patch('time.sleep')
     @patch('time.time', return_value=1000)
@@ -457,7 +466,7 @@ class TestWaitForRateLimitReset:
             "resources": {"graphql": {"reset": 1060}}
         }
         engine._wait_for_rate_limit_reset()
-        mock_sleep.assert_called_once()
+        _assert_one_real_sleep(mock_sleep)
 
     @patch('time.sleep')
     @patch('time.time', return_value=1000)
@@ -528,4 +537,4 @@ class TestFetchAndSaveBatchWithRetry:
         engine._fetch_and_save_batch = MagicMock(return_value=True)
         engine._check_rate_limit = MagicMock()
         engine._fetch_and_save_batch_with_retry([("org1", {})], {}, False, 1, 1)
-        mock_sleep.assert_called_once()
+        _assert_one_real_sleep(mock_sleep)
