@@ -133,6 +133,22 @@ async def get_stats():
         raise HTTPException(status_code=500, detail=error_msg)
 
 
+def _dashboard_filter_cache_key(org, language, repo, collab_type, include_bots, discipline) -> str:
+    """
+    Clave de caché estable para una combinación de filtros del dashboard.
+    Las respuestas filtradas se cachean por esta clave (doc en 'metrics',
+    type='dashboard_stats_filter') para que las repeticiones sean instantáneas.
+    """
+    return "dashboard_stats_filter::" + "|".join([
+        f"org={org or ''}",
+        f"lang={language or ''}",
+        f"repo={repo or ''}",
+        f"collab={collab_type or ''}",
+        f"bots={1 if include_bots else 0}",
+        f"disc={discipline or ''}",
+    ])
+
+
 @router.get("/dashboard/stats")
 async def get_dashboard_stats(
     force_refresh: bool = Query(default=False, description="Forzar recálculo ignorando caché"),
@@ -189,6 +205,26 @@ async def get_dashboard_stats(
                 response_data = cached_stats.get("data", {})
                 response_data["metadata"] = {
                     "cached": True,
+                    "calculatedAt": updated_at.isoformat() if isinstance(updated_at, datetime) else str(updated_at),
+                }
+                return response_data
+        
+        # 1b. CACHÉ DE RESULTADOS FILTRADOS (permanente hasta invalidación).
+        # Los filtros recalculan pipelines pesados ($unwind de ~99k colaboradores),
+        # asi que cacheamos la respuesta por combinacion de filtros: la primera vez
+        # se calcula, las siguientes (rehearsal/demo) son instantaneas. Se invalida
+        # junto al resto via refresh-metrics.
+        _filter_cache_id = None
+        if has_filters and not force_refresh:
+            _filter_cache_id = _dashboard_filter_cache_key(org, language, repo, collab_type, include_bots, discipline)
+            cached_filtered = metrics_collection.find_one({"_id": _filter_cache_id})
+            if cached_filtered:
+                updated_at = cached_filtered.get("updated_at", current_time)
+                logger.info(f"📊 Cache HIT (filtros) servido desde caché: {_filter_cache_id}")
+                response_data = cached_filtered.get("data", {})
+                response_data["metadata"] = {
+                    "cached": True,
+                    "filtered": True,
                     "calculatedAt": updated_at.isoformat() if isinstance(updated_at, datetime) else str(updated_at),
                 }
                 return response_data
@@ -529,32 +565,40 @@ async def get_dashboard_stats(
             # Sin org (ej: solo repo filter), aplicar tal cual
             shared_users_repo_match.update(repo_filter)
         
-        # OPTIMIZACION (hotfix 1.2.2): el ranking cross-org "bySharedUsers" es
-        # INVARIANTE al filtro cuando el match es global (p. ej. filtro solo por
-        # organizacion o por disciplina, que no acotan este conjunto de repos). En
-        # ese caso reutilizamos el valor ya calculado en la cache permanente del
-        # dashboard sin filtros y evitamos el pipeline $unwind (~99k colaboradores)
-        # que costaba ~13 s en cada click de filtrado. Si no hay cache utilizable,
-        # se recalcula igual que siempre (fallback seguro).
+        # OPTIMIZACION: los rankings de "compartidos" son INVARIANTES al filtro
+        # cuando su match es global, y recalcularlos hace $unwind de ~99k
+        # colaboradores (~6-13 s). En ese caso los reutilizamos de la cache sin
+        # filtros (una sola lectura proyectada):
+        #  - cross-org bySharedUsers: global si shared_users_repo_match no se acoto.
+        #  - cross-repo bySharedCollaborators: global si repo_filter esta vacio
+        #    (p. ej. filtro por disciplina o por repo, que no acotan estos repos).
+        # Si no hay cache utilizable, se recalcula igual que siempre (fallback seguro).
         _shared_users_is_global = (
             shared_users_repo_match == {"collaborators": {"$exists": True, "$ne": []}}
         )
+        _shared_collabs_is_global = not bool(repo_filter)
         _reused_shared_users = None
-        if has_filters and not force_refresh and _shared_users_is_global:
+        _reused_shared_collabs = None
+        if has_filters and not force_refresh and (_shared_users_is_global or _shared_collabs_is_global):
             try:
                 _cached_dash = metrics_collection.find_one(
                     {"type": "dashboard_stats"},
-                    {"data.charts.organizations.bySharedUsers": 1},
+                    {
+                        "data.charts.organizations.bySharedUsers": 1,
+                        "data.charts.repositories.bySharedCollaborators": 1,
+                    },
                 )
-                _cbysh = (
-                    (((_cached_dash or {}).get("data") or {}).get("charts") or {})
-                    .get("organizations", {})
-                    .get("bySharedUsers")
-                )
-                if isinstance(_cbysh, list):
-                    _reused_shared_users = _cbysh
-            except Exception as _bysh_err:
-                logger.warning(f"No se pudo reutilizar bySharedUsers de cache: {_bysh_err}")
+                _charts = (((_cached_dash or {}).get("data") or {}).get("charts") or {})
+                if _shared_users_is_global:
+                    _cbysh = (_charts.get("organizations") or {}).get("bySharedUsers")
+                    if isinstance(_cbysh, list):
+                        _reused_shared_users = _cbysh
+                if _shared_collabs_is_global:
+                    _cbysc = (_charts.get("repositories") or {}).get("bySharedCollaborators")
+                    if isinstance(_cbysc, list):
+                        _reused_shared_collabs = _cbysc
+            except Exception as _reuse_err:
+                logger.warning(f"No se pudieron reutilizar rankings de cache: {_reuse_err}")
 
         shared_users_org_pipeline = [
             {"$match": shared_users_repo_match},
@@ -769,7 +813,13 @@ async def get_dashboard_stats(
                 "shared_collaborators_count": 1
             }}
         ]
-        chart_repos_shared = list(repos_collection.aggregate(shared_collabs_repo_pipeline))
+        # Reutiliza el ranking cross-repo de la cache si el match es global (p. ej.
+        # filtro por disciplina o por repo); si no, lo calcula como siempre.
+        if _reused_shared_collabs is not None:
+            chart_repos_shared = _reused_shared_collabs
+            logger.info("bySharedCollaborators reutilizado de cache (match global); pipeline cross-repo omitido")
+        else:
+            chart_repos_shared = list(repos_collection.aggregate(shared_collabs_repo_pipeline))
         
         # Helper para detectar si un login es un bot
         def is_bot(login: str) -> bool:
@@ -1484,7 +1534,24 @@ async def get_dashboard_stats(
             
             logger.info("✅ Dashboard stats COMPLETO calculado y guardado en caché permanente")
         else:
-            logger.info("✅ Dashboard stats CON FILTROS calculado (no cacheado)")
+            # Guardar respuesta filtrada en caché (doc único, <2MB como el no-filtrado).
+            if _filter_cache_id:
+                try:
+                    metrics_collection.update_one(
+                        {"_id": _filter_cache_id},
+                        {"$set": {
+                            "_id": _filter_cache_id,
+                            "type": "dashboard_stats_filter",
+                            "data": response_data,
+                            "updated_at": current_time,
+                        }},
+                        upsert=True,
+                    )
+                    logger.info(f"✅ Dashboard stats CON FILTROS calculado y cacheado: {_filter_cache_id}")
+                except Exception as fc_err:
+                    logger.warning(f"No se pudo cachear stats filtrado: {fc_err}")
+            else:
+                logger.info("✅ Dashboard stats CON FILTROS calculado (no cacheado)")
         
         return response_data
         
@@ -1528,6 +1595,9 @@ def invalidate_all_caches():
     stats_deleted = metrics.delete_one({"type": "dashboard_stats"}).deleted_count
     counts_deleted = metrics.delete_one({"type": "simple_counts"}).deleted_count
     
+    # Cachés de respuestas filtradas del dashboard (una por combinación de filtros)
+    filtered_deleted = metrics.delete_many({"type": "dashboard_stats_filter"}).deleted_count
+    
     # Cachés de análisis de colaboración (por usuario/repos/orgs)
     analyze_deleted = metrics.delete_many(
         {"_id": {"$regex": "^collab_analysis_"}}
@@ -1545,6 +1615,7 @@ def invalidate_all_caches():
         "collaboration_graph_chunks": graph_deleted,
         "network_metrics_chunks": nm_deleted,
         "dashboard_stats": stats_deleted,
+        "dashboard_stats_filtered": filtered_deleted,
         "simple_counts": counts_deleted,
         "collaboration_analyses": analyze_deleted,
         "view_data_caches": views_deleted,
