@@ -29,6 +29,54 @@ class Database:
         self.client: Optional[MongoClient] = None
         self.db: Optional[PyMongoDatabase] = None
         self._is_connected: bool = False
+        self._indexes_ensured: bool = False
+
+    # Índices secundarios que aceleran el dashboard filtrado (hotfix 1.2.2).
+    # Sin ellos, los filtros por lenguaje/organización hacen COLLSCAN y los
+    # $lookup recorren colecciones enteras. create_index es idempotente: si el
+    # índice ya existe, no hace nada.
+    _DASHBOARD_INDEXES = {
+        "repositories": [
+            [("owner.login", 1)],
+            [("organization.login", 1)],
+            [("primary_language", 1)],
+            [("primary_language.name", 1)],
+            [("full_name", 1)],
+            [("ingested_at", -1)],
+            [("stargazer_count", -1)],
+            [("fork_count", -1)],
+            [("collaborators_count", -1)],
+        ],
+        "organizations": [
+            [("login", 1)],
+            [("ingested_at", -1)],
+        ],
+        "users": [
+            [("login", 1)],
+            [("ingested_at", -1)],
+            [("quantum_expertise_score", -1)],
+        ],
+    }
+
+    def ensure_indexes(self) -> None:
+        """
+        Crea (de forma idempotente) los índices secundarios que aceleran las
+        consultas del dashboard filtrado. No bloquea ni interrumpe el arranque:
+        se ejecuta una sola vez por proceso y cualquier error se registra como
+        warning en lugar de propagarse.
+        """
+        if self.db is None or self._indexes_ensured:
+            return
+        ensured = 0
+        for collection_name, specs in self._DASHBOARD_INDEXES.items():
+            for keys in specs:
+                try:
+                    self.db[collection_name].create_index(keys, background=True)
+                    ensured += 1
+                except Exception as idx_err:
+                    logger.warning(f"No se pudo asegurar índice {keys} en '{collection_name}': {idx_err}")
+        self._indexes_ensured = True
+        logger.info(f"🗂️  Índices del dashboard verificados ({ensured} asegurados)")
     
     def connect(self) -> None:
         """
@@ -67,6 +115,13 @@ class Database:
             
             logger.info(f"✅ Conexión exitosa a la base de datos: {config.MONGO_DB_NAME}")
             logger.info("🚀 Configuración optimizada para vCore: maxPoolSize=100, retryWrites=True")
+
+            # Asegurar índices secundarios del dashboard (idempotente, una vez por
+            # proceso, no bloqueante: nunca interrumpe el arranque).
+            try:
+                self.ensure_indexes()
+            except Exception as idx_err:
+                logger.warning(f"ensure_indexes falló (no bloqueante): {idx_err}")
             
         except ConnectionFailure as e:
             logger.error(f"❌ Error al conectar a MongoDB: {e}")
