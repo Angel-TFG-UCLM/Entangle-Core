@@ -529,6 +529,33 @@ async def get_dashboard_stats(
             # Sin org (ej: solo repo filter), aplicar tal cual
             shared_users_repo_match.update(repo_filter)
         
+        # OPTIMIZACION (hotfix 1.2.2): el ranking cross-org "bySharedUsers" es
+        # INVARIANTE al filtro cuando el match es global (p. ej. filtro solo por
+        # organizacion o por disciplina, que no acotan este conjunto de repos). En
+        # ese caso reutilizamos el valor ya calculado en la cache permanente del
+        # dashboard sin filtros y evitamos el pipeline $unwind (~99k colaboradores)
+        # que costaba ~13 s en cada click de filtrado. Si no hay cache utilizable,
+        # se recalcula igual que siempre (fallback seguro).
+        _shared_users_is_global = (
+            shared_users_repo_match == {"collaborators": {"$exists": True, "$ne": []}}
+        )
+        _reused_shared_users = None
+        if has_filters and not force_refresh and _shared_users_is_global:
+            try:
+                _cached_dash = metrics_collection.find_one(
+                    {"type": "dashboard_stats"},
+                    {"data.charts.organizations.bySharedUsers": 1},
+                )
+                _cbysh = (
+                    (((_cached_dash or {}).get("data") or {}).get("charts") or {})
+                    .get("organizations", {})
+                    .get("bySharedUsers")
+                )
+                if isinstance(_cbysh, list):
+                    _reused_shared_users = _cbysh
+            except Exception as _bysh_err:
+                logger.warning(f"No se pudo reutilizar bySharedUsers de cache: {_bysh_err}")
+
         shared_users_org_pipeline = [
             {"$match": shared_users_repo_match},
             {"$unwind": "$collaborators"},
@@ -543,8 +570,11 @@ async def get_dashboard_stats(
             }},
             {"$match": {"orgs_count": {"$gte": 2}}},
         ]
-        # Step 1: fetch user→orgs from MongoDB
-        raw_cross_users = list(repos_collection.aggregate(shared_users_org_pipeline))
+        # Step 1: fetch user->orgs from MongoDB (se omite si reutilizamos de cache)
+        if _reused_shared_users is None:
+            raw_cross_users = list(repos_collection.aggregate(shared_users_org_pipeline))
+        else:
+            raw_cross_users = []
 
         # Step 2: Python — collapse sibling orgs per user, recount
         from collections import Counter as _Counter
@@ -608,6 +638,15 @@ async def get_dashboard_stats(
             chart_orgs["bySharedUsers"] = by_shared
         else:
             chart_orgs["bySharedUsers"] = []
+
+        # Si reutilizamos el ranking cross-org de la cache (match global), lo aplicamos
+        # aqui: es identico a recalcularlo sobre todos los repos, pero sin el coste.
+        if _reused_shared_users is not None:
+            chart_orgs["bySharedUsers"] = _reused_shared_users
+            logger.info(
+                "bySharedUsers reutilizado de cache permanente (match global); "
+                "pipeline cross-org omitido"
+            )
         
         # === CHART: TOP 10 REPOSITORIOS POR DIFERENTES MÉTRICAS ===
         repo_base_projection = {
