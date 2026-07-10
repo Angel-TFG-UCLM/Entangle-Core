@@ -1578,6 +1578,7 @@ async def refresh_dashboard_metrics():
 @router.get("/collaboration/discover")
 async def discover_collaboration(
     force: bool = False,
+    summary: bool = Query(default=False, description="Devuelve solo el resumen ligero (available + metrics), sin el grafo completo. Para pintar el banner al instante."),
     year_from: Optional[int] = Query(default=None, description="Año inicio del rango temporal (incluido). Filtra repos por pushed_at."),
     year_to: Optional[int] = Query(default=None, description="Año fin del rango temporal (incluido). Filtra repos por pushed_at.")
 ):
@@ -1625,6 +1626,27 @@ async def discover_collaboration(
             }
             logger.info(f"[DISCOVER] Filtro temporal activo: {temporal_info['label']}")
         
+        # ── RESUMEN LIGERO: available + metrics sin el grafo (banner instantáneo) ──
+        # El doc meta de la caché guarda available/summary/metrics/temporal_range
+        # inline (los arrays pesados van en chunks aparte). Con una proyección
+        # leemos solo esos campos (~0.6 KB) en vez de reensamblar ~24 MB. Si no
+        # hay caché (aún no se calculó el grafo), se cae al flujo normal completo.
+        if summary and not force and not has_temporal_filter:
+            metrics_collection = db.get_collection("metrics")
+            meta = metrics_collection.find_one(
+                {"_id": "collaboration_graph"},
+                {"available": 1, "summary": 1, "metrics": 1, "temporal_range": 1},
+            )
+            if meta:
+                logger.info("[DISCOVER] Resumen ligero servido desde meta (sin grafo)")
+                return Response(content=orjson.dumps({
+                    "available": meta.get("available", True),
+                    "summary": meta.get("summary", ""),
+                    "metrics": meta.get("metrics", {}),
+                    "temporal_range": meta.get("temporal_range"),
+                    "is_summary": True,
+                }), media_type="application/json")
+
         # ── CACHÉ: intentar servir desde metrics (chunked para >2MB) ──
         # Caché solo cuando NO hay filtro temporal activo
         if not force and not has_temporal_filter:
