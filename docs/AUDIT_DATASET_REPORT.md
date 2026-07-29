@@ -6,7 +6,12 @@
 
 ---
 
-## 1. Problema Principal: Solo se usa 1 keyword de 72
+## 1. Hallazgo histórico: solo se usaba 1 keyword de 71
+
+> **Estado actual:** corregido. El pipeline vigente ejecuta búsquedas
+> segmentadas independientes para las 8 entradas de `search_keywords`. La lista
+> exacta y su uso están documentados en
+> [`INGESTION_KEYWORDS.md`](./INGESTION_KEYWORDS.md).
 
 ### Causa raíz
 
@@ -24,7 +29,7 @@ La query enviada a GitHub es: `quantum stars:X..Y created:YEAR fork:false`
 - **Falsos positivos:** Cualquier repo con "quantum" en nombre/descripción/README se encuentra, sin importar el contexto (QuantumultX, Firefox Quantum, bloomberg/quantum, etc.)
 - **Falsos negativos:** Repos QC legítimos que usan `qiskit`, `cirq`, `braket`, `pennylane` en su nombre/descripción pero NO contienen la palabra "quantum" nunca se encuentran.
 
-### Dónde se usan realmente las 72 keywords
+### Dónde se usaban realmente las 71 keywords
 
 Solo en el filtro post-búsqueda `matches_keywords()` de `src/github/filters.py` (líneas 271-309). Pero como GitHub ya filtró por "quantum", casi todos los repos contienen "quantum", así que el filtro casi nunca rechaza nada.
 
