@@ -191,6 +191,10 @@ All runtime configuration is loaded from environment variables (see [`.env.examp
 
 Both files are documented inline through `*_description` fields, so they double as self-describing configuration.
 
+The complete, human-readable list is available in
+**[Ingestion keyword taxonomy](./docs/INGESTION_KEYWORDS.md)**: 8 GitHub
+discovery terms and the 71 relevance keywords applied to repository metadata.
+
 ---
 
 ## Running the pipeline
