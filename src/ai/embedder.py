@@ -12,6 +12,7 @@ Diseño:
 Modelo objetivo: ``text-embedding-3-small`` (1536 dim, ~$0.02/M tokens,
 desplegado en ``entangle-ai-resource`` Sweden Central).
 """
+
 from __future__ import annotations
 
 import random
@@ -20,10 +21,10 @@ import time
 from typing import List, Optional
 
 import requests
-from azure.identity import DefaultAzureCredential
 
 from ..core.config import config
 from ..core.logger import logger
+from .providers import get_ai_provider
 
 
 _DEFAULT_BATCH_SIZE = 64
@@ -33,52 +34,65 @@ _REQUEST_TIMEOUT_S = 60
 
 # Token cache compartido con agent.py (cada módulo tiene el suyo para
 # evitar acoplamiento, pero la rotación interna del SDK ya cachea)
-_credential: Optional[DefaultAzureCredential] = None
+_credential: Optional[object] = None
 _credential_lock = threading.Lock()
 
 
-def _get_credential() -> DefaultAzureCredential:
+def _get_credential() -> object:
     global _credential
     with _credential_lock:
         if _credential is None:
-            _credential = DefaultAzureCredential()
+            provider = get_ai_provider()
+            _credential = (
+                provider._credential()
+            )  # Azure provider only; local tests patch this seam.
         return _credential
 
 
 def _auth_headers() -> dict:
-    """API key prioritaria si está configurada, fallback a Entra ID."""
-    if config.AZURE_AI_API_KEY:
+    """Authentication for the explicitly selected provider."""
+    if config.AI_PROVIDER == "azure-openai":
+        if config.AZURE_AI_API_KEY and config.ENVIRONMENT != "production":
+            return {
+                "Content-Type": "application/json",
+                "api-key": config.AZURE_AI_API_KEY,
+            }
+        token = _get_credential().get_token(
+            "https://cognitiveservices.azure.com/.default"
+        )
         return {
             "Content-Type": "application/json",
-            "api-key": config.AZURE_AI_API_KEY,
+            "Authorization": f"Bearer {token.token}",
         }
-    token = _get_credential().get_token("https://cognitiveservices.azure.com/.default")
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token.token}",
-    }
+    return get_ai_provider().headers()
 
 
 def _embedding_url(deployment: str) -> str:
-    return (
-        f"{config.AZURE_AI_ENDPOINT}/openai/deployments/{deployment}"
-        f"/embeddings?api-version=2024-02-01"
-    )
+    return get_ai_provider().embedding_url(deployment)
 
 
 def _call_with_retry(url: str, payload: dict) -> dict:
     last_error: Optional[Exception] = None
     for attempt in range(_MAX_RETRIES + 1):
         try:
-            resp = requests.post(url, headers=_auth_headers(), json=payload, timeout=_REQUEST_TIMEOUT_S)
+            resp = requests.post(
+                url, headers=_auth_headers(), json=payload, timeout=_REQUEST_TIMEOUT_S
+            )
             if resp.status_code == 429 or resp.status_code >= 500:
                 retry_after = resp.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after else _BASE_BACKOFF_S * (2 ** attempt)
+                wait = (
+                    float(retry_after)
+                    if retry_after
+                    else _BASE_BACKOFF_S * (2**attempt)
+                )
                 wait += random.uniform(0, 1.5)  # jitter
                 wait = min(wait, 30.0)
                 logger.warning(
                     "Embeddings HTTP %s — reintento %d/%d en %.1fs",
-                    resp.status_code, attempt + 1, _MAX_RETRIES, wait,
+                    resp.status_code,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    wait,
                 )
                 time.sleep(wait)
                 last_error = requests.HTTPError(f"{resp.status_code}", response=resp)
@@ -88,7 +102,7 @@ def _call_with_retry(url: str, payload: dict) -> dict:
         except requests.RequestException as e:
             last_error = e
             if attempt < _MAX_RETRIES:
-                wait = _BASE_BACKOFF_S * (2 ** attempt)
+                wait = _BASE_BACKOFF_S * (2**attempt)
                 time.sleep(wait)
                 continue
             raise
@@ -114,7 +128,16 @@ def embed_texts(
     """
     if not texts:
         return []
-    if not config.AZURE_AI_ENDPOINT:
+    provider = get_ai_provider()
+    if not config.EMBEDDINGS_ENABLED:
+        raise RuntimeError("Embeddings deshabilitados explícitamente por configuración")
+    if config.AI_PROVIDER == "bedrock":
+        return provider.embed(texts, deployment)  # type: ignore[attr-defined]
+    if config.AI_PROVIDER in {"offline", "disabled"}:
+        raise RuntimeError(
+            "Embeddings no disponibles con el proveedor de IA seleccionado"
+        )
+    if config.AI_PROVIDER == "azure-openai" and not config.AZURE_AI_ENDPOINT:
         raise RuntimeError("AZURE_AI_ENDPOINT no está configurado")
 
     url = _embedding_url(deployment)
@@ -123,8 +146,8 @@ def embed_texts(
     t0 = time.time()
 
     for start in range(0, len(texts), batch_size):
-        batch = texts[start:start + batch_size]
-        payload = {"input": batch, "model": deployment}
+        batch = texts[start : start + batch_size]
+        payload = {"input": batch, "model": config.AI_EMBEDDING_MODEL or deployment}
         data = _call_with_retry(url, payload)
 
         # Azure devuelve `data` ordenado por `index` ascendente.
@@ -136,7 +159,10 @@ def embed_texts(
     elapsed = time.time() - t0
     logger.info(
         "🧠 embed_texts: %d textos, %d tokens, %.1fs (%.0f t/s)",
-        len(texts), total_tokens, elapsed, total_tokens / max(elapsed, 0.001),
+        len(texts),
+        total_tokens,
+        elapsed,
+        total_tokens / max(elapsed, 0.001),
     )
     return out
 

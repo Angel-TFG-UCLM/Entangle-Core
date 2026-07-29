@@ -10,6 +10,9 @@ param containerMinReplicas int = 0
 param targetPort int = 8000
 param env array = []
 param secrets array = []
+@description('Dedicated user-assigned identity for deterministic production credentials.')
+param userAssignedIdentityId string = ''
+param userAssignedIdentityPrincipalId string = ''
 
 resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' existing = {
   name: containerAppsEnvironmentName
@@ -24,7 +27,10 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
   location: location
   tags: tags
   identity: {
-    type: 'SystemAssigned'
+    type: empty(userAssignedIdentityId) ? 'SystemAssigned' : 'UserAssigned'
+    userAssignedIdentities: empty(userAssignedIdentityId) ? null : {
+      '${userAssignedIdentityId}': {}
+    }
   }
   properties: {
     managedEnvironmentId: containerAppsEnvironment.id
@@ -94,4 +100,4 @@ output id string = containerApp.id
 output name string = containerApp.name
 output uri string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
 output fqdn string = containerApp.properties.configuration.ingress.fqdn
-output principalId string = containerApp.identity.principalId
+output principalId string = empty(userAssignedIdentityPrincipalId) ? containerApp.identity.principalId : userAssignedIdentityPrincipalId

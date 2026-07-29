@@ -3,6 +3,7 @@ Conexión a MongoDB.
 Este módulo proporciona una clase Database para gestionar la conexión a MongoDB
 y expone funciones auxiliares para obtener referencias a la base de datos y colecciones.
 """
+
 from typing import Optional
 from pymongo import MongoClient
 from pymongo.database import Database as PyMongoDatabase
@@ -14,26 +15,28 @@ from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 from .config import config
 from .logger import logger
+from .snapshot import SnapshotError, load_bundle, load_offline_replies
 
 
 class Database:
     """
     Clase para gestionar la conexión a MongoDB.
-    
+
     Attributes:
         client: Cliente de MongoDB (MongoClient)
         db: Base de datos activa
     """
-    
+
     def __init__(self):
         self.client: Optional[MongoClient] = None
         self.db: Optional[PyMongoDatabase] = None
         self._is_connected: bool = False
-    
+        self.snapshot_manifest = None
+
     def connect(self) -> None:
         """
         Establece la conexión a MongoDB.
-        
+
         Raises:
             ConnectionFailure: Si no se puede conectar a MongoDB
             ServerSelectionTimeoutError: Si se agota el tiempo de espera
@@ -41,10 +44,29 @@ class Database:
         if self._is_connected:
             logger.warning("Ya existe una conexión activa a MongoDB")
             return
-            
+
         try:
-            logger.info(f"Conectando a MongoDB (Azure Cosmos DB for MongoDB vCore): {config.MONGO_URI}")
-            
+            if config.DATA_MODE == "snapshot":
+                if config.DATABASE_PROVIDER != "portable-mongo":
+                    raise RuntimeError("snapshot requiere el proveedor portable-mongo")
+                import mongomock
+
+                self.snapshot_manifest, collections = load_bundle(config.SNAPSHOT_PATH)
+                if config.AI_PROVIDER == "offline":
+                    # Validate the mandatory replay sidecar before declaring
+                    # an offline instance ready.
+                    load_offline_replies(config.SNAPSHOT_PATH)
+                self.client = mongomock.MongoClient()
+                self.db = self.client[self.snapshot_manifest["database_name"]]
+                for name, documents in collections.items():
+                    if documents:
+                        self.db[name].insert_many(documents)
+                self._is_connected = True
+                logger.info("Snapshot verificado y cargado sin Mongo externo")
+                return
+
+            logger.info("Conectando al proveedor Mongo configurado")
+
             # OPTIMIZADO PARA AZURE COSMOS DB FOR MONGODB (vCore)
             # Configuración de alto rendimiento para MongoDB nativo
             self.client = MongoClient(
@@ -54,20 +76,24 @@ class Database:
                 socketTimeoutMS=30000,  # Aumentado para operaciones bulk
                 retryReads=True,
                 retryWrites=True,  # ✅ HABILITADO: vCore soporta retry writes nativamente
-                maxPoolSize=100,    # ✅ ALTO RENDIMIENTO: Pool grande para concurrencia
-                minPoolSize=10,     # ✅ ALTO RENDIMIENTO: Mantener conexiones activas
-                maxIdleTimeMS=45000
+                maxPoolSize=100,  # ✅ ALTO RENDIMIENTO: Pool grande para concurrencia
+                minPoolSize=10,  # ✅ ALTO RENDIMIENTO: Mantener conexiones activas
+                maxIdleTimeMS=45000,
             )
-            
+
             # Verificar la conexión con ping
-            self.client.admin.command('ping')
-            
+            self.client.admin.command("ping")
+
             self.db = self.client[config.MONGO_DB_NAME]
             self._is_connected = True
-            
-            logger.info(f"✅ Conexión exitosa a la base de datos: {config.MONGO_DB_NAME}")
-            logger.info("🚀 Configuración optimizada para vCore: maxPoolSize=100, retryWrites=True")
-            
+
+            logger.info(
+                f"✅ Conexión exitosa a la base de datos: {config.MONGO_DB_NAME}"
+            )
+            logger.info(
+                "🚀 Configuración optimizada para vCore: maxPoolSize=100, retryWrites=True"
+            )
+
         except ConnectionFailure as e:
             logger.error(f"❌ Error al conectar a MongoDB: {e}")
             self._is_connected = False
@@ -80,54 +106,60 @@ class Database:
             logger.error(f"❌ Error inesperado al conectar a MongoDB: {e}")
             self._is_connected = False
             raise
-    
+
     def disconnect(self) -> None:
         """Cierra la conexión a MongoDB."""
         if self.client:
             self.client.close()
             self._is_connected = False
             logger.info("🔌 Conexión a MongoDB cerrada")
-    
+
     def get_collection(self, collection_name: str) -> Collection:
         """
         Obtiene una colección de la base de datos.
-        
+
         Args:
             collection_name: Nombre de la colección (repositories, organizations, users, relations)
-            
+
         Returns:
             Collection: Colección de MongoDB
-            
+
         Raises:
             Exception: Si la base de datos no está conectada
         """
         if self.db is None:
             raise Exception("Base de datos no conectada. Ejecuta connect() primero.")
         return self.db[collection_name]
-    
+
     def is_connected(self) -> bool:
         """
         Verifica si la conexión está activa haciendo un ping real.
-        
+
         Returns:
             bool: True si está conectado, False en caso contrario
         """
         if not self._is_connected or self.client is None:
             return False
-        
+
+        if config.DATA_MODE == "snapshot":
+            return True
         try:
             # Hacer ping real para verificar que la conexión sigue viva
-            self.client.admin.command('ping')
+            self.client.admin.command("ping")
             return True
         except Exception as e:
             logger.warning(f"Conexión a MongoDB caída: {e}")
             self._is_connected = False
             return False
-    
+
+    def is_ready(self) -> bool:
+        """Return startup connection state without performing external I/O."""
+        return self._is_connected and self.db is not None
+
     def ensure_connection(self) -> None:
         """
         Asegura que hay una conexión activa, reconectando si es necesario.
-        
+
         Raises:
             Exception: Si no se puede establecer la conexión
         """
@@ -140,42 +172,42 @@ class Database:
                     self.client = None
                     self.db = None
                     self._is_connected = False
-                
+
                 # Reconectar
                 self.connect()
             except Exception as e:
                 logger.error(f"Error al reconectar a MongoDB: {e}")
                 raise
-    
+
     def get_database(self) -> PyMongoDatabase:
         """
         Obtiene la referencia a la base de datos.
-        
+
         Returns:
             Database: Instancia de la base de datos
-            
+
         Raises:
             Exception: Si la base de datos no está conectada
         """
         if self.db is None:
             raise Exception("Base de datos no conectada. Ejecuta connect() primero.")
         return self.db
-    
+
     def list_collections(self) -> list:
         """
         Lista todas las colecciones en la base de datos.
-        
+
         Returns:
             list: Lista de nombres de colecciones
         """
         if not self.db:
             raise Exception("Base de datos no conectada. Ejecuta connect() primero.")
         return self.db.list_collection_names()
-    
+
     def drop_collection(self, collection_name: str) -> None:
         """
         Elimina una colección completa. USAR CON PRECAUCIÓN.
-        
+
         Args:
             collection_name: Nombre de la colección a eliminar
         """
@@ -183,12 +215,12 @@ class Database:
             raise Exception("Base de datos no conectada. Ejecuta connect() primero.")
         self.db.drop_collection(collection_name)
         logger.warning(f"⚠️  Colección '{collection_name}' eliminada")
-    
+
     def __enter__(self):
         """Context manager entry."""
         self.connect()
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
         self.disconnect()
@@ -202,7 +234,7 @@ def get_database() -> PyMongoDatabase:
     """
     Función auxiliar para obtener la base de datos.
     Conecta automáticamente si no está conectado.
-    
+
     Returns:
         Database: Instancia de la base de datos MongoDB
     """
@@ -215,10 +247,10 @@ def get_collection(collection_name: str) -> Collection:
     """
     Función auxiliar para obtener una colección.
     Conecta automáticamente si no está conectado.
-    
+
     Args:
         collection_name: Nombre de la colección
-        
+
     Returns:
         Collection: Colección de MongoDB
     """

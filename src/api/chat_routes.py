@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from ..ai.agent import chat, chat_stream, _run_tooled_worker
 from ..ai.workers import load_agent_config
 from ..core.logger import logger
+from ..core.config import config
 from ..core.session_memory import (
     ensure_session_indexes,
     load_history,
@@ -85,6 +86,8 @@ async def chat_endpoint(request: ChatRequest):
     basada en datos reales de la base de datos. Persiste el turno en la
     sesión si se aporta ``session_id`` (o crea uno nuevo)."""
     logger.info("💬 Chat request: %s...", request.message[:100])
+    if config.AI_PROVIDER == "disabled":
+        raise HTTPException(status_code=503, detail="El proveedor de IA está deshabilitado explícitamente.")
 
     session_id, history = _resolve_history(request)
 
@@ -117,6 +120,8 @@ async def chat_stream_endpoint(request: ChatRequest, req: Request):
     que el frontend lo guarde antes de empezar a renderizar la respuesta.
     """
     logger.info("💬 Chat stream request: %s...", request.message[:100])
+    if config.AI_PROVIDER == "disabled":
+        raise HTTPException(status_code=503, detail="El proveedor de IA está deshabilitado explícitamente.")
 
     session_id, history = _resolve_history(request)
 

@@ -127,12 +127,23 @@ var stagingAppName = '${abbrs.appContainerApps}${resourceToken}-api-staging'
 var mongoName = '${abbrs.documentDBMongoClusters}${resourceToken}'
 var aiName = '${abbrs.cognitiveServicesAccounts}${resourceToken}'
 var swaName = '${abbrs.webStaticSites}${resourceToken}'
+var apiIdentityName = 'id-${resourceToken}-api'
 
 // ============= RESOURCE GROUP =============
 resource rg 'Microsoft.Resources/resourceGroups@2021-04-01' = {
   name: rgName
   location: location
   tags: tags
+}
+
+module apiIdentity './core/security/user-assigned-identity.bicep' = {
+  name: 'api-user-assigned-identity'
+  scope: rg
+  params: {
+    name: apiIdentityName
+    location: location
+    tags: tags
+  }
 }
 
 // ============= LOG ANALYTICS =============
@@ -230,6 +241,8 @@ module api './core/host/container-app.bicep' = {
     containerMemory: apiMemory
     containerMaxReplicas: apiMaxReplicas
     containerMinReplicas: apiMinReplicas
+    userAssignedIdentityId: apiIdentity.outputs.id
+    userAssignedIdentityPrincipalId: apiIdentity.outputs.principalId
     targetPort: 8000
     env: [
       {
@@ -249,18 +262,6 @@ module api './core/host/container-app.bicep' = {
         value: 'quantum_github'
       }
       {
-        name: 'FRONTEND_URL'
-        value: staticWebApp.outputs.uri
-      }
-      {
-        name: 'MONGO_URI'
-        secretRef: 'mongo-uri'
-      }
-      {
-        name: 'GITHUB_TOKEN'
-        secretRef: 'github-token'
-      }
-      {
         name: 'AZURE_AI_ENDPOINT'
         value: aiFoundry.outputs.endpoint
       }
@@ -273,8 +274,48 @@ module api './core/host/container-app.bicep' = {
         value: aiFoundry.outputs.deploymentName
       }
       {
+        name: 'AI_MODEL'
+        value: aiDeploymentName
+      }
+      {
         name: 'AZURE_AI_EMBEDDING_DEPLOYMENT'
         value: aiFoundry.outputs.embeddingDeploymentName
+      }
+      {
+        name: 'FRONTEND_URL'
+        value: staticWebApp.outputs.uri
+      }
+      {
+        name: 'MONGO_URI'
+        secretRef: 'mongo-uri'
+      }
+      {
+        name: 'GITHUB_TOKEN'
+        secretRef: 'github-token'
+      }
+      {
+        name: 'AZURE_MANAGED_IDENTITY_CLIENT_ID'
+        value: apiIdentity.outputs.clientId
+      }
+      {
+        name: 'ENTANGLE_DATA_MODE'
+        value: 'live'
+      }
+      {
+        name: 'ENTANGLE_DATABASE_PROVIDER'
+        value: 'mongo'
+      }
+      {
+        name: 'ENTANGLE_AI_PROVIDER'
+        value: 'azure-openai'
+      }
+      {
+        name: 'ENTANGLE_SEARCH_PROVIDER'
+        value: 'tavily'
+      }
+      {
+        name: 'ENTANGLE_GITHUB_PROVIDER'
+        value: 'github'
       }
       {
         name: 'TAVILY_API_KEY'
@@ -312,6 +353,8 @@ module apiStaging './core/host/container-app.bicep' = if (deployStaging) {
     containerMemory: apiMemory
     containerMaxReplicas: 1
     containerMinReplicas: 0
+    userAssignedIdentityId: apiIdentity.outputs.id
+    userAssignedIdentityPrincipalId: apiIdentity.outputs.principalId
     targetPort: 8000
     env: [
       {
@@ -327,12 +370,60 @@ module apiStaging './core/host/container-app.bicep' = if (deployStaging) {
         value: 'quantum_github'
       }
       {
+        name: 'AZURE_MANAGED_IDENTITY_CLIENT_ID'
+        value: apiIdentity.outputs.clientId
+      }
+      {
+        name: 'ENTANGLE_DATA_MODE'
+        value: 'live'
+      }
+      {
+        name: 'ENTANGLE_DATABASE_PROVIDER'
+        value: 'mongo'
+      }
+      {
+        name: 'ENTANGLE_AI_PROVIDER'
+        value: 'azure-openai'
+      }
+      {
+        name: 'ENTANGLE_SEARCH_PROVIDER'
+        value: 'tavily'
+      }
+      {
+        name: 'ENTANGLE_GITHUB_PROVIDER'
+        value: 'github'
+      }
+      {
         name: 'MONGO_URI'
         secretRef: 'mongo-uri'
       }
       {
         name: 'GITHUB_TOKEN'
         secretRef: 'github-token'
+      }
+      {
+        name: 'AZURE_AI_ENDPOINT'
+        value: aiFoundry.outputs.endpoint
+      }
+      {
+        name: 'AZURE_AI_PROJECT'
+        value: aiName
+      }
+      {
+        name: 'AZURE_AI_DEPLOYMENT'
+        value: aiFoundry.outputs.deploymentName
+      }
+      {
+        name: 'AI_MODEL'
+        value: aiDeploymentName
+      }
+      {
+        name: 'AZURE_AI_EMBEDDING_DEPLOYMENT'
+        value: aiFoundry.outputs.embeddingDeploymentName
+      }
+      {
+        name: 'FRONTEND_URL'
+        value: staticWebApp.outputs.uri
       }
     ]
     secrets: [

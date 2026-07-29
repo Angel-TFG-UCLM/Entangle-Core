@@ -7,6 +7,7 @@ pydantic==2.9.2
 
 # Base de datos
 pymongo==4.10.1
+mongomock==4.3.0
 
 # Cliente HTTP
 requests==2.32.3
@@ -29,6 +30,7 @@ python-dotenv==1.0.1
 # Azure AI Foundry
 requests>=2.32.3
 azure-identity>=1.17.0
+boto3>=1.35.0
 
 # Testing
 pytest==8.3.3

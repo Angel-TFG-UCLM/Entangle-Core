@@ -55,7 +55,8 @@ resource ai 'Microsoft.CognitiveServices/accounts@2024-10-01' = {
     networkAcls: {
       defaultAction: 'Allow'
     }
-    disableLocalAuth: false
+    // Production API access is Entra-only through the dedicated app identity.
+    disableLocalAuth: true
   }
 }
 

@@ -1,0 +1,18 @@
+region             = "eu-west-1"
+name_prefix        = "entangle-preserved"
+profile            = "economy"
+subnet_ids         = ["subnet-replace-me"]
+security_group_ids = ["sg-replace-me"]
+vpc_id = "vpc-replace-me"
+load_balancer_subnet_ids = ["subnet-public-a-replace-me", "subnet-public-b-replace-me"]
+load_balancer_security_group_ids = ["sg-alb-replace-me"]
+bedrock_model_arn = "arn:aws:bedrock:eu-west-1::foundation-model/replace-me"
+bedrock_model_id = "replace-me"
+bedrock_embedding_model_id = ""
+bedrock_embedding_model_arn = ""
+mongo_secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:entangle-mongo"
+github_token_secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:entangle-github"
+acm_certificate_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/replace-me"
+api_hostname = "api.example.com"
+route53_zone_id = "ZREPLACE"
+# Copy to terraform.tfvars. Use deployment-time secrets/IAM for Mongo and providers.

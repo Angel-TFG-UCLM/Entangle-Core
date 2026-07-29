@@ -1,0 +1,40 @@
+{
+  "collections": {
+    "metrics": {
+      "document_count": 1,
+      "path": "collections/metrics.jsonl",
+      "sha256": "d82dc52e59e7fdf3a8c70d7fa1f17f40b8a6bdee60479b5eb93adb8447df974b"
+    },
+    "organizations": {
+      "document_count": 1,
+      "path": "collections/organizations.jsonl",
+      "sha256": "65e547b2f7aef2cb4e4092dc4563f7dc46b474691a69d690dbd859dd40283df6"
+    },
+    "repositories": {
+      "document_count": 1,
+      "path": "collections/repositories.jsonl",
+      "sha256": "d43ffb86918cce796b12e53731f6914b5953e5272fe7bd7c224d1989c819f9f3"
+    },
+    "users": {
+      "document_count": 1,
+      "path": "collections/users.jsonl",
+      "sha256": "e63f63893eb5d96024ac44ae3a37f980bc1479fdbea9e72cc7117adc9f64e9bb"
+    }
+  },
+  "created_at": "2026-07-29T12:30:13.374287+00:00",
+  "database_name": "quantum_github",
+  "files": {
+    "offline_chat.json": {
+      "sha256": "e7b7afd71b5d3048da38c30cb19699dd869be13de40d961046d0926852a4728f"
+    }
+  },
+  "format": "entangle-snapshot",
+  "redacted_fields": [
+    "api_key",
+    "authorization",
+    "password",
+    "secret",
+    "token"
+  ],
+  "version": 1
+}

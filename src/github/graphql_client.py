@@ -24,9 +24,24 @@ class GitHubGraphQLClient:
             ValueError: Si el token no está configurado
         """
         self.token = token or config.GITHUB_TOKEN
+        if config.GITHUB_PROVIDER == "disabled":
+            self.token = None
+            self.available = False
+            self.api_url = config.GITHUB_API_URL
+            self.headers = {}
+            logger.info("Proveedor GitHub deshabilitado; no se realizarán llamadas de red.")
+            return
+        self.available = bool(self.token)
         
         if not self.token:
             error_msg = "GITHUB_TOKEN no está configurado. Define la variable de entorno o pasa el token al constructor."
+            if config.DATA_MODE == "snapshot":
+                # Offline browsing must import the API without pretending GitHub
+                # is available. Any ingestion call still fails explicitly below.
+                self.api_url = config.GITHUB_API_URL
+                self.headers = {}
+                logger.warning("%s GitHub queda deshabilitado en modo snapshot.", error_msg)
+                return
             logger.error(error_msg)
             raise ValueError(error_msg)
         
@@ -37,6 +52,12 @@ class GitHubGraphQLClient:
         }
         
         logger.info("Cliente GraphQL de GitHub inicializado correctamente")
+
+    def _require_available(self) -> None:
+        if not self.available or config.GITHUB_PROVIDER == "disabled":
+            raise RuntimeError(
+                "Proveedor GitHub deshabilitado; no se realizarán llamadas de red."
+            )
     
     def execute_query(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -52,6 +73,7 @@ class GitHubGraphQLClient:
         Raises:
             requests.HTTPError: Si la petición falla
         """
+        self._require_available()
         payload = {"query": query}
         if variables:
             payload["variables"] = variables
@@ -343,6 +365,7 @@ class GitHubGraphQLClient:
                 }
             }
         """
+        self._require_available()
         rest_url = "https://api.github.com/rate_limit"
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -418,6 +441,7 @@ class GitHubGraphQLClient:
         Returns:
             Lista de diccionarios con información de repositorios
         """
+        self._require_available()
         # Usar configuración global si no se proporciona
         if config_criteria is None:
             config_criteria = ingestion_config
@@ -575,6 +599,7 @@ class GitHubGraphQLClient:
         Returns:
             Lista completa de repositorios
         """
+        self._require_available()
         all_repositories = []
         after_cursor = None
         has_next_page = True
@@ -647,6 +672,7 @@ class GitHubGraphQLClient:
         Returns:
             Lista de repositorios del segmento especificado
         """
+        self._require_available()
         # Usar la configuración global si no se proporciona
         from ..core.config import ingestion_config
         config = config_criteria or ingestion_config
@@ -864,4 +890,16 @@ class GitHubGraphQLClient:
 
 
 # Instancia global del cliente
-github_client = GitHubGraphQLClient()
+class _LazyGitHubClient:
+    """Defer credential validation until an endpoint actually uses GitHub."""
+
+    def __init__(self) -> None:
+        self._client: Optional[GitHubGraphQLClient] = None
+
+    def __getattr__(self, name: str):
+        if self._client is None:
+            self._client = GitHubGraphQLClient()
+        return getattr(self._client, name)
+
+
+github_client = _LazyGitHubClient()

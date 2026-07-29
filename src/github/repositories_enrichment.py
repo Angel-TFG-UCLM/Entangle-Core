@@ -20,6 +20,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from src.core.logger import logger
 from src.core.mongo_repository import MongoRepository
+from src.core.config import config as app_config
 from src.github.graphql_client import GitHubGraphQLClient
 
 
@@ -117,6 +118,10 @@ class EnrichmentEngine:
             config: Configuración opcional (se usa para rate limit y reintentos)
             progress_callback: Callback opcional fn(items_processed, items_total, message)
         """
+        if app_config.GITHUB_PROVIDER == "disabled":
+            raise RuntimeError(
+                "Proveedor GitHub deshabilitado; el enriquecimiento no puede realizar llamadas REST."
+            )
         self.github_token = github_token
         self.repos_repository = repos_repository
         self.config = config or {}

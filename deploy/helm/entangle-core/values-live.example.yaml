@@ -1,0 +1,14 @@
+# Explicit live configuration. Create the referenced Secrets outside this chart.
+runtime:
+  dataMode: live
+  databaseProvider: mongo
+  aiProvider: azure-openai
+  searchProvider: disabled
+  githubProvider: github
+  mongoUriSecretName: entangle-runtime
+  mongoUriSecretKey: MONGO_URI
+  githubTokenSecretName: entangle-runtime
+  githubTokenSecretKey: GITHUB_TOKEN
+  azureAiEndpoint: https://replace-me.openai.azure.com
+  azureAiDeployment: replace-me
+  azureManagedIdentityClientId: replace-me-user-assigned-identity-client-id

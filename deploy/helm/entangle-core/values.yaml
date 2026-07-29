@@ -1,0 +1,29 @@
+image:
+  repository: entangle-core
+  tag: latest
+  pullPolicy: IfNotPresent
+replicas: 1
+service:
+  port: 8000
+runtime:
+  # The default starts the synthetic snapshot without external dependencies.
+  dataMode: snapshot
+  databaseProvider: portable-mongo
+  aiProvider: offline
+  searchProvider: disabled
+  githubProvider: github
+  snapshotPath: /app/preservation/fixtures/offline
+  mongoUriSecretName: ""
+  mongoUriSecretKey: MONGO_URI
+  githubTokenSecretName: ""
+  githubTokenSecretKey: GITHUB_TOKEN
+  azureAiEndpoint: ""
+  azureAiDeployment: ""
+  azureManagedIdentityClientId: ""
+  aiBaseUrl: ""
+  aiModel: ""
+  aiApiKeySecretName: ""
+  aiApiKeySecretKey: AI_API_KEY
+resources:
+  requests: { cpu: 250m, memory: 512Mi }
+  limits: { cpu: "1", memory: 1Gi }

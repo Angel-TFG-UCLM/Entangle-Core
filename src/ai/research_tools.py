@@ -17,6 +17,7 @@ Diseño:
   - Todas las respuestas vienen "limpias": el agente recibe solo lo que
     necesita para responder y citar.
 """
+
 from __future__ import annotations
 
 import json
@@ -53,7 +54,7 @@ _TAVILY_TIMEOUT_S = 30
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Consulta en lenguaje natural. Ejemplo: \"IBM Heron processor release date\".",
+                "description": 'Consulta en lenguaje natural. Ejemplo: "IBM Heron processor release date".',
             },
             "max_results": {
                 "type": "integer",
@@ -63,7 +64,7 @@ _TAVILY_TIMEOUT_S = 30
             "include_domains": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Limita la búsqueda a estos dominios (ej: [\"github.com\", \"ibm.com\"]). Opcional.",
+                "description": 'Limita la búsqueda a estos dominios (ej: ["github.com", "ibm.com"]). Opcional.',
             },
         },
         "required": ["query"],
@@ -77,11 +78,26 @@ def web_search(
 ) -> str:
     """Llamada a Tavily Search API. Devuelve JSON estructurado con
     title/url/content/score."""
+    from ..core.config import config
+
+    if config.SEARCH_PROVIDER == "disabled":
+        return json.dumps(
+            {
+                "error": "web_search no disponible (ENTANGLE_SEARCH_PROVIDER=disabled)",
+                "hint": "La preservación offline no realiza búsquedas externas.",
+            }
+        )
+    if config.SEARCH_PROVIDER != "tavily":
+        return json.dumps(
+            {"error": f"Proveedor de búsqueda no compatible: {config.SEARCH_PROVIDER}"}
+        )
     if not _TAVILY_API_KEY:
-        return json.dumps({
-            "error": "web_search no disponible (TAVILY_API_KEY no configurada)",
-            "hint": "El agente debe informar al usuario que no puede buscar en internet en este momento.",
-        })
+        return json.dumps(
+            {
+                "error": "web_search no disponible (TAVILY_API_KEY no configurada)",
+                "hint": "El agente debe informar al usuario que no puede buscar en internet en este momento.",
+            }
+        )
 
     payload = {
         "api_key": _TAVILY_API_KEY,
@@ -104,16 +120,20 @@ def web_search(
         # Curar la respuesta — solo lo útil
         results: List[Dict[str, Any]] = []
         for item in data.get("results", []):
-            results.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "snippet": (item.get("content") or "")[:600],
-                "score": round(item.get("score", 0.0), 4),
-            })
+            results.append(
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "snippet": (item.get("content") or "")[:600],
+                    "score": round(item.get("score", 0.0), 4),
+                }
+            )
 
         logger.info(
             "🌐 web_search(%r) → %d hits in %.1fs",
-            query[:50], len(results), elapsed,
+            query[:50],
+            len(results),
+            elapsed,
         )
         return json.dumps(
             {"query": query, "count": len(results), "results": results},
@@ -128,8 +148,8 @@ def web_search(
 # arXiv (papers académicos, gratis, sin key)
 # ─────────────────────────────────────────────────────────────
 _ARXIV_URL = "https://export.arxiv.org/api/query"
-_ARXIV_TIMEOUT_S = 15                # bajamos: si tarda más de 15s es señal de degradación
-_ARXIV_MAX_RETRIES = 5               # solo se aplica a 429s; timeouts mueren a los 2
+_ARXIV_TIMEOUT_S = 15  # bajamos: si tarda más de 15s es señal de degradación
+_ARXIV_MAX_RETRIES = 5  # solo se aplica a 429s; timeouts mueren a los 2
 _ARXIV_BACKOFFS_S = (5, 10, 15, 20, 30)
 
 
@@ -149,7 +169,7 @@ _ARXIV_BACKOFFS_S = (5, 10, 15, 20, 30)
                 "type": "string",
                 "description": (
                     "Consulta en inglés (arXiv indexa principalmente en EN). "
-                    "Ejemplo: \"variational quantum eigensolver hardware noise\"."
+                    'Ejemplo: "variational quantum eigensolver hardware noise".'
                 ),
             },
             "max_results": {
@@ -180,6 +200,15 @@ def search_arxiv(
     arXiv tiene un rate-limit estricto (~1 req cada 3s por IP global).
     Implementa retry exponencial 3x con backoff 2s/4s/8s en caso de 429.
     """
+    from ..core.config import config
+
+    if config.SEARCH_PROVIDER == "disabled":
+        return json.dumps(
+            {
+                "error": "search_arxiv no disponible (ENTANGLE_SEARCH_PROVIDER=disabled)",
+                "hint": "La preservación offline no realiza búsquedas externas.",
+            }
+        )
     import xml.etree.ElementTree as ET
 
     search_query = query.strip()
@@ -194,9 +223,7 @@ def search_arxiv(
         "sortOrder": "descending",
     }
     # arXiv pide en sus términos un User-Agent identificable.
-    headers = {
-        "User-Agent": "Entangle-Quantum-Research/1.0 (https://entangle.uclm.es)"
-    }
+    headers = {"User-Agent": "Entangle-Quantum-Research/1.0 (https://entangle.uclm.es)"}
 
     last_exc: Optional[Exception] = None
     resp = None
@@ -212,14 +239,19 @@ def search_arxiv(
         try:
             t0 = time.time()
             resp = requests.get(
-                _ARXIV_URL, params=params, headers=headers, timeout=_ARXIV_TIMEOUT_S,
+                _ARXIV_URL,
+                params=params,
+                headers=headers,
+                timeout=_ARXIV_TIMEOUT_S,
             )
             elapsed = time.time() - t0
             if resp.status_code == 429:
                 wait = _ARXIV_BACKOFFS_S[min(attempt, len(_ARXIV_BACKOFFS_S) - 1)]
                 logger.warning(
                     "📚 arXiv 429 (attempt %d/%d) — esperando %ds antes de reintentar",
-                    attempt + 1, _ARXIV_MAX_RETRIES, wait,
+                    attempt + 1,
+                    _ARXIV_MAX_RETRIES,
+                    wait,
                 )
                 time.sleep(wait)
                 last_exc = requests.HTTPError(f"429 attempt {attempt + 1}")
@@ -235,16 +267,20 @@ def search_arxiv(
                     "search_arxiv: %d timeouts consecutivos — abortando y delegando a web_search",
                     timeout_attempts,
                 )
-                return json.dumps({
-                    "error": (
-                        "arXiv API no responde (timeouts). Probablemente está sobrecargado. "
-                        "Usa web_search en su lugar."
-                    ),
-                })
+                return json.dumps(
+                    {
+                        "error": (
+                            "arXiv API no responde (timeouts). Probablemente está sobrecargado. "
+                            "Usa web_search en su lugar."
+                        ),
+                    }
+                )
             wait = 3  # pausa corta para no martillear si está caído
             logger.warning(
                 "📚 arXiv timeout (attempt %d): %s — retry rápido en %ds",
-                attempt + 1, e, wait,
+                attempt + 1,
+                e,
+                wait,
             )
             time.sleep(wait)
             continue
@@ -254,24 +290,36 @@ def search_arxiv(
                 wait = _ARXIV_BACKOFFS_S[min(attempt, len(_ARXIV_BACKOFFS_S) - 1)]
                 logger.warning(
                     "📚 arXiv error (attempt %d/%d): %s — retry en %ds",
-                    attempt + 1, _ARXIV_MAX_RETRIES, e, wait,
+                    attempt + 1,
+                    _ARXIV_MAX_RETRIES,
+                    e,
+                    wait,
                 )
                 time.sleep(wait)
                 continue
-            logger.error("search_arxiv failed after %d retries: %s", _ARXIV_MAX_RETRIES, e)
-            return json.dumps({
-                "error": (
-                    "arXiv API no respondió tras varios reintentos. Usa web_search como fallback."
-                ),
-            })
+            logger.error(
+                "search_arxiv failed after %d retries: %s", _ARXIV_MAX_RETRIES, e
+            )
+            return json.dumps(
+                {
+                    "error": (
+                        "arXiv API no respondió tras varios reintentos. Usa web_search como fallback."
+                    ),
+                }
+            )
 
     if resp is None or resp.status_code != 200:
-        return json.dumps({
-            "error": f"arXiv no respondió OK: {last_exc}",
-        })
+        return json.dumps(
+            {
+                "error": f"arXiv no respondió OK: {last_exc}",
+            }
+        )
 
     # Parse Atom feed
-    ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
     try:
         root = ET.fromstring(resp.content)
     except ET.ParseError as e:
@@ -289,22 +337,36 @@ def search_arxiv(
             for a in entry.findall("atom:author", ns)
         ]
 
-        title = (title_el.text or "").strip().replace("\n", " ") if title_el is not None else ""
-        summary = (summary_el.text or "").strip().replace("\n", " ") if summary_el is not None else ""
+        title = (
+            (title_el.text or "").strip().replace("\n", " ")
+            if title_el is not None
+            else ""
+        )
+        summary = (
+            (summary_el.text or "").strip().replace("\n", " ")
+            if summary_el is not None
+            else ""
+        )
         url = (id_el.text or "").strip() if id_el is not None else ""
-        published = (published_el.text or "").strip() if published_el is not None else ""
+        published = (
+            (published_el.text or "").strip() if published_el is not None else ""
+        )
 
-        results.append({
-            "title": title,
-            "authors": authors,
-            "summary": summary[:800],
-            "url": url,
-            "published": published[:10],  # YYYY-MM-DD
-        })
+        results.append(
+            {
+                "title": title,
+                "authors": authors,
+                "summary": summary[:800],
+                "url": url,
+                "published": published[:10],  # YYYY-MM-DD
+            }
+        )
 
     logger.info(
         "📚 search_arxiv(%r) → %d papers in %.1fs",
-        query[:50], len(results), elapsed,
+        query[:50],
+        len(results),
+        elapsed,
     )
     return json.dumps(
         {"query": query, "count": len(results), "results": results},

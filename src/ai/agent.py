@@ -16,6 +16,7 @@ Compatibilidad con código antiguo:
 
 Soporta streaming SSE para enviar pasos de razonamiento en tiempo real.
 """
+
 import json
 import re
 import threading
@@ -23,10 +24,10 @@ import time
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
-from azure.identity import DefaultAzureCredential
 
 from ..core.config import config
 from ..core.logger import logger
+from .providers import get_ai_provider
 
 # Side-effect imports: registran las tools (@tool decorator) en tool_registry.
 # Imprescindible que se importen antes de cualquier llamada a get_schemas_for.
@@ -80,28 +81,13 @@ AGENT_TOOLS: List[Dict[str, Any]] = _build_agent_tools()
 
 
 def _get_auth_headers() -> Dict[str, str]:
-    """Obtiene headers de autenticación para la API de Foundry.
-    Usa API Key si está configurada, sino Azure Entra ID (DefaultAzureCredential)."""
-    if config.AZURE_AI_API_KEY:
-        return {
-            "Content-Type": "application/json",
-            "api-key": config.AZURE_AI_API_KEY,
-        }
-
-    # Azure Entra ID authentication
-    global _credential
-    with _credential_lock:
-        if _credential is None:
-            _credential = DefaultAzureCredential()
-
-    token = _credential.get_token("https://cognitiveservices.azure.com/.default")
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token.token}",
-    }
+    """Return authentication for the explicitly selected provider."""
+    return get_ai_provider().headers()
 
 
-def _api_call_streaming(url: str, payload: dict) -> Generator[Dict[str, Any], None, None]:
+def _api_call_streaming(
+    url: str, payload: dict
+) -> Generator[Dict[str, Any], None, None]:
     """
     Llama a Azure OpenAI con stream=True y yields chunks normalizados.
     Los tool_calls vienen fragmentados; se acumulan internamente y se emiten
@@ -116,7 +102,17 @@ def _api_call_streaming(url: str, payload: dict) -> Generator[Dict[str, Any], No
     usando ``_api_call_with_retry``. Streaming solo se usa en los workers
     porque ahí prima la UX percibida sobre la resiliencia.
     """
-    payload = _normalize_payload(payload)
+    provider = get_ai_provider()
+    payload = provider.prepare_chat_payload(_normalize_payload(payload))
+    if not provider.http_transport:
+        result = provider.complete(payload)
+        message = (result.get("choices") or [{}])[0].get("message", {})
+        if message.get("content"):
+            yield {"type": "content", "text": message["content"]}
+        if message.get("tool_calls"):
+            yield {"type": "tool_calls", "calls": message["tool_calls"]}
+        yield {"type": "done", "finish_reason": "stop"}
+        return
     payload["stream"] = True
 
     response = requests.post(
@@ -135,7 +131,8 @@ def _api_call_streaming(url: str, payload: dict) -> Generator[Dict[str, Any], No
             pass
         logger.error(
             "💥 Azure OpenAI %d Bad Request. Body: %s",
-            response.status_code, body,
+            response.status_code,
+            body,
         )
     response.raise_for_status()
 
@@ -170,11 +167,14 @@ def _api_call_streaming(url: str, payload: dict) -> Generator[Dict[str, Any], No
         # Tool calls fragmentados: vienen con index, vamos acumulando
         for tc_delta in delta.get("tool_calls") or []:
             idx = tc_delta.get("index", 0)
-            entry = accumulated_tool_calls.setdefault(idx, {
-                "id": "",
-                "type": "function",
-                "function": {"name": "", "arguments": ""},
-            })
+            entry = accumulated_tool_calls.setdefault(
+                idx,
+                {
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                },
+            )
             if tc_delta.get("id"):
                 entry["id"] = tc_delta["id"]
             fn = tc_delta.get("function") or {}
@@ -187,7 +187,9 @@ def _api_call_streaming(url: str, payload: dict) -> Generator[Dict[str, Any], No
             finish_reason = choice["finish_reason"]
 
     if accumulated_tool_calls:
-        ordered = [accumulated_tool_calls[k] for k in sorted(accumulated_tool_calls.keys())]
+        ordered = [
+            accumulated_tool_calls[k] for k in sorted(accumulated_tool_calls.keys())
+        ]
         yield {"type": "tool_calls", "calls": ordered}
 
     yield {"type": "done", "finish_reason": finish_reason}
@@ -198,7 +200,10 @@ def _api_call_with_retry(url: str, payload: dict) -> dict:
     Llama a la API de Azure OpenAI con reintentos automáticos para 429
     y errores transitorios (5xx). Respeta el header Retry-After.
     """
-    payload = _normalize_payload(payload)
+    provider = get_ai_provider()
+    payload = provider.prepare_chat_payload(_normalize_payload(payload))
+    if not provider.http_transport:
+        return provider.complete(payload)
     last_error = None
     msg_count = len(payload.get("messages", []))
     has_tools = bool(payload.get("tools"))
@@ -223,8 +228,10 @@ def _api_call_with_retry(url: str, payload: dict) -> dict:
             )
             # Si no es 429 ni 5xx, procesamos normalmente
             if response.status_code == 429 or response.status_code >= 500:
-                retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
-                wait = int(retry_after) if retry_after else _BASE_BACKOFF * (2 ** attempt)
+                retry_after = response.headers.get(
+                    "Retry-After"
+                ) or response.headers.get("retry-after")
+                wait = int(retry_after) if retry_after else _BASE_BACKOFF * (2**attempt)
                 wait = min(wait, 30)  # Cap 30s
                 logger.warning(
                     f"⏳ API retornó {response.status_code}, reintento {attempt + 1}/{_MAX_RETRIES} "
@@ -245,8 +252,10 @@ def _api_call_with_retry(url: str, payload: dict) -> dict:
             raise
         except requests.exceptions.ConnectionError as e:
             if attempt < _MAX_RETRIES:
-                wait = _BASE_BACKOFF * (2 ** attempt)
-                logger.warning(f"⏳ Error de conexión, reintento {attempt + 1}/{_MAX_RETRIES} en {wait}s...")
+                wait = _BASE_BACKOFF * (2**attempt)
+                logger.warning(
+                    f"⏳ Error de conexión, reintento {attempt + 1}/{_MAX_RETRIES} en {wait}s..."
+                )
                 time.sleep(wait)
                 last_error = e
                 continue
@@ -290,12 +299,14 @@ def _truncate_tool_result(result: str) -> str:
         pass
 
     # Fallback: devolver JSON válido indicando que es demasiado grande
-    return json.dumps({
-        "error": "El resultado es demasiado grande para procesarlo completo.",
-        "hint": "Añade filtros más específicos, usa projection para limitar campos, o reduce el limit.",
-        "_truncated": True,
-        "_original_chars": len(result),
-    })
+    return json.dumps(
+        {
+            "error": "El resultado es demasiado grande para procesarlo completo.",
+            "hint": "Añade filtros más específicos, usa projection para limitar campos, o reduce el limit.",
+            "_truncated": True,
+            "_original_chars": len(result),
+        }
+    )
 
 
 def _build_api_url() -> str:
@@ -304,10 +315,7 @@ def _build_api_url() -> str:
     Usa la api-version 2024-12-01-preview porque es la primera que admite
     `reasoning_effort` y `max_completion_tokens` para la familia GPT-5.
     """
-    return (
-        f"{config.AZURE_AI_ENDPOINT}/openai/deployments/"
-        f"{config.AZURE_AI_DEPLOYMENT}/chat/completions?api-version=2024-12-01-preview"
-    )
+    return get_ai_provider().chat_url()
 
 
 # Detección de familia de modelo: gpt-5-mini, gpt-5-nano, o1, etc. usan
@@ -319,6 +327,8 @@ _REASONING_HINTS = ("gpt-5", "gpt5", "o1", "o3")
 
 
 def _is_reasoning_model() -> bool:
+    if config.AI_PROVIDER != "azure-openai":
+        return False
     name = (config.AZURE_AI_DEPLOYMENT or "").lower()
     return any(hint in name for hint in _REASONING_HINTS)
 
@@ -365,14 +375,14 @@ def _is_default_temperature(value) -> bool:
 
 # ── Regex para extraer acciones embebidas en la respuesta del agente ──
 _ACTION_PATTERN = re.compile(
-    r'\[ACTION:(\w+)(?::(\{.*?\}))?\]',
+    r"\[ACTION:(\w+)(?::(\{.*?\}))?\]",
     re.DOTALL,
 )
 
 # Patrón para limpiar code fences que envuelvan marcadores de acción
 # El modelo a veces mete los marcadores dentro de ```...``` por costumbre
 _CODE_FENCE_ACTION = re.compile(
-    r'```[^\n]*\n*\s*(\[ACTION:[^\]]+\])\s*\n*```',
+    r"```[^\n]*\n*\s*(\[ACTION:[^\]]+\])\s*\n*```",
     re.DOTALL,
 )
 
@@ -394,7 +404,7 @@ def _extract_actions(reply: str) -> Tuple[str, List[Dict[str, Any]]]:
       y actions_list es [{"action": "OPEN_UNIVERSE", "data": {...}}, ...]
     """
     # Paso 0: Desenvolver code fences que contengan marcadores de acción
-    text = _CODE_FENCE_ACTION.sub(r'\1', reply)
+    text = _CODE_FENCE_ACTION.sub(r"\1", reply)
 
     actions: List[Dict[str, Any]] = []
     for match in _ACTION_PATTERN.finditer(text):
@@ -407,9 +417,9 @@ def _extract_actions(reply: str) -> Tuple[str, List[Dict[str, Any]]]:
         actions.append({"action": action_type, "data": action_data})
 
     # Eliminar los marcadores del texto
-    cleaned = _ACTION_PATTERN.sub('', text).strip()
+    cleaned = _ACTION_PATTERN.sub("", text).strip()
     # Limpiar líneas vacías duplicadas que queden
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned, actions
 
 
@@ -441,7 +451,7 @@ def _route_intent(user_message: str) -> str:
             .upper()
         )
         intent = raw if raw in valid_upper else fallback_upper
-        logger.info(f"🧭 Router: \"{user_message[:60]}\" → {intent} (raw={raw})")
+        logger.info(f'🧭 Router: "{user_message[:60]}" → {intent} (raw={raw})')
         return intent
     except Exception as e:
         logger.warning(f"⚠️ Router falló, fallback {fallback_upper}: {e}")
@@ -476,10 +486,12 @@ def _execute_tool_call(function_name: str, arguments: Dict[str, Any]) -> str:
         # Error de argumentos (missing/unexpected) — dar feedback claro al modelo
         error_msg = str(e)
         logger.warning(f"⚠️ Argumentos incorrectos para {function_name}: {error_msg}")
-        return json.dumps({
-            "error": f"Argumentos incorrectos: {error_msg}",
-            "hint": "Revisa los nombres de parámetros en la definición de la herramienta.",
-        })
+        return json.dumps(
+            {
+                "error": f"Argumentos incorrectos: {error_msg}",
+                "hint": "Revisa los nombres de parámetros en la definición de la herramienta.",
+            }
+        )
     except Exception as e:
         logger.error(f"Error ejecutando {function_name}: {e}")
         return json.dumps({"error": str(e)})
@@ -491,13 +503,18 @@ def chat(
 ) -> Dict[str, Any]:
     """Arquitectura Router-Worker config-driven.
 
-      1. Router clasifica el intent contra ``config/workers.yaml``.
-      2. Se busca el WorkerConfig correspondiente.
-      3. Si el worker tiene tools → ``_run_tooled_worker``; si no → ``_run_ui_worker``.
+    1. Router clasifica el intent contra ``config/workers.yaml``.
+    2. Se busca el WorkerConfig correspondiente.
+    3. Si el worker tiene tools → ``_run_tooled_worker``; si no → ``_run_ui_worker``.
     """
     endpoint = config.AZURE_AI_ENDPOINT
-    if not endpoint:
-        return {"reply": "El servicio de IA no está configurado.", "history": [], "tools_used": [], "actions": []}
+    if config.AI_PROVIDER == "azure-openai" and not endpoint:
+        return {
+            "reply": "El servicio de IA no está configurado.",
+            "history": [],
+            "tools_used": [],
+            "actions": [],
+        }
 
     # ── Paso 1: Enrutar ──
     intent_upper = _route_intent(user_message)
@@ -528,20 +545,41 @@ def _run_ui_worker(
     try:
         data = _api_call_with_retry(_build_api_url(), payload)
     except requests.exceptions.Timeout:
-        return {"reply": "Lo siento, el servicio tardó demasiado en responder.", "history": [], "tools_used": [], "actions": []}
+        return {
+            "reply": "Lo siento, el servicio tardó demasiado en responder.",
+            "history": [],
+            "tools_used": [],
+            "actions": [],
+        }
     except requests.exceptions.RequestException as e:
         logger.error(f"Error en {cfg.display_name} worker: {e}")
-        return {"reply": "Error al conectar con el servicio de IA.", "history": [], "tools_used": [], "actions": []}
+        return {
+            "reply": "Error al conectar con el servicio de IA.",
+            "history": [],
+            "tools_used": [],
+            "actions": [],
+        }
 
-    raw_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No pude generar una respuesta.")
+    raw_reply = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "No pude generar una respuesta.")
+    )
 
     reply, actions = _extract_actions(raw_reply)
     if actions:
-        logger.info(f"🎬 {cfg.display_name} emitió {len(actions)} acción(es): {[a['action'] for a in actions]}")
+        logger.info(
+            f"🎬 {cfg.display_name} emitió {len(actions)} acción(es): {[a['action'] for a in actions]}"
+        )
 
     messages.append({"role": "assistant", "content": reply})
     clean_history = [m for m in messages if m.get("role") != "system"]
-    return {"reply": reply, "history": clean_history, "tools_used": [], "actions": actions}
+    return {
+        "reply": reply,
+        "history": clean_history,
+        "tools_used": [],
+        "actions": actions,
+    }
 
 
 # Aliases para compatibilidad hacia atrás con tests que monkeypatchean los
@@ -569,21 +607,27 @@ def _chat_dashboard_worker(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    return _run_ui_worker(_agent_config().get_worker("dashboard"), user_message, conversation_history)
+    return _run_ui_worker(
+        _agent_config().get_worker("dashboard"), user_message, conversation_history
+    )
 
 
 def _chat_universe_worker(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    return _run_ui_worker(_agent_config().get_worker("universe"), user_message, conversation_history)
+    return _run_ui_worker(
+        _agent_config().get_worker("universe"), user_message, conversation_history
+    )
 
 
 def _chat_data_worker(
     user_message: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    return _run_tooled_worker(_agent_config().get_worker("data"), user_message, conversation_history)
+    return _run_tooled_worker(
+        _agent_config().get_worker("data"), user_message, conversation_history
+    )
 
 
 def _run_tooled_worker(
@@ -602,7 +646,11 @@ def _run_tooled_worker(
     tools_used: List[str] = []
 
     for round_num in range(cfg.max_rounds):
-        tool_choice = cfg.tool_choice_first_round if (round_num == 0 and not tools_used) else "auto"
+        tool_choice = (
+            cfg.tool_choice_first_round
+            if (round_num == 0 and not tools_used)
+            else "auto"
+        )
         payload: Dict[str, Any] = {
             "messages": messages,
             "tools": tools_schemas,
@@ -616,13 +664,28 @@ def _run_tooled_worker(
             data = _api_call_with_retry(_build_api_url(), payload)
         except requests.exceptions.Timeout:
             logger.error("Timeout al llamar al agente de IA")
-            return {"reply": "Lo siento, el servicio tardó demasiado en responder.", "history": [], "tools_used": tools_used, "actions": []}
+            return {
+                "reply": "Lo siento, el servicio tardó demasiado en responder.",
+                "history": [],
+                "tools_used": tools_used,
+                "actions": [],
+            }
         except requests.exceptions.RequestException as e:
             logger.error(f"Error llamando al agente de IA: {e}")
-            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 429:
-                return {"reply": "El servicio está temporalmente saturado. Espera unos segundos.", "history": [], "tools_used": tools_used, "actions": []}
-            return {"reply": "Error al conectar con el servicio de IA.", "history": [], "tools_used": tools_used, "actions": []}
+                return {
+                    "reply": "El servicio está temporalmente saturado. Espera unos segundos.",
+                    "history": [],
+                    "tools_used": tools_used,
+                    "actions": [],
+                }
+            return {
+                "reply": "Error al conectar con el servicio de IA.",
+                "history": [],
+                "tools_used": tools_used,
+                "actions": [],
+            }
 
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
@@ -640,18 +703,25 @@ def _run_tooled_worker(
                 logger.info(f"🔧 Agente solicita: {fn_name}({fn_args})")
                 result = _execute_tool_call(fn_name, fn_args)
                 tools_used.append(fn_name)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result,
+                    }
+                )
             continue
 
         reply = message.get("content", "No pude generar una respuesta.")
         messages.append({"role": "assistant", "content": reply})
         clean_history = [m for m in messages if m.get("role") != "system"]
         tools_display = list(dict.fromkeys(get_display_name(t) for t in tools_used))
-        return {"reply": reply, "history": clean_history, "tools_used": tools_display, "actions": []}
+        return {
+            "reply": reply,
+            "history": clean_history,
+            "tools_used": tools_display,
+            "actions": [],
+        }
 
     return {
         "reply": "Se alcanzó el límite de procesamiento. Por favor, reformula tu pregunta.",
@@ -692,16 +762,20 @@ def chat_stream(
       - {"type": "error",       "content": "..."}
     """
     endpoint = config.AZURE_AI_ENDPOINT
-    if not endpoint:
-        yield json.dumps({"type": "error", "content": "El servicio de IA no está configurado."})
+    if config.AI_PROVIDER == "azure-openai" and not endpoint:
+        yield json.dumps(
+            {"type": "error", "content": "El servicio de IA no está configurado."}
+        )
         return
 
     # Paso 1: thinking real del router (no fake)
-    yield json.dumps({
-        "type": "thinking",
-        "description": "Eligiendo el agente más adecuado",
-        "phase": "router",
-    })
+    yield json.dumps(
+        {
+            "type": "thinking",
+            "description": "Eligiendo el agente más adecuado",
+            "phase": "router",
+        }
+    )
 
     # ── Paso 1: Enrutar ──
     # _route_intent es una llamada bloqueante a Azure OpenAI. En producción
@@ -718,7 +792,9 @@ def chat_stream(
     def _run_router():
         try:
             result_holder["intent"] = _route_intent(user_message)
-        except Exception as exc:  # pragma: no cover — _route_intent ya hace su propio fallback
+        except (
+            Exception
+        ) as exc:  # pragma: no cover — _route_intent ya hace su propio fallback
             result_holder["error"] = exc
             result_holder["intent"] = fallback_upper
 
@@ -747,10 +823,12 @@ def chat_stream(
     worker_cfg = cfg.get_worker(intent.lower())
 
     # Cerrar el thinking del router con un tool_result real
-    yield json.dumps({
-        "type": "tool_result",
-        "summary": f"Agente seleccionado: {worker_cfg.display_name}",
-    })
+    yield json.dumps(
+        {
+            "type": "tool_result",
+            "summary": f"Agente seleccionado: {worker_cfg.display_name}",
+        }
+    )
 
     yield json.dumps({"type": "routing", "intent": intent})
 
@@ -762,7 +840,9 @@ def chat_stream(
         if worker_cfg.intent == "data":
             yield from _stream_data_worker(user_message, conversation_history)
         else:
-            yield from _stream_tooled_worker(worker_cfg, user_message, conversation_history)
+            yield from _stream_tooled_worker(
+                worker_cfg, user_message, conversation_history
+            )
     else:
         # ``_stream_ui_generic`` acepta prompt+label y dentro reusa
         # ``_stream_ui_worker``; los tests legacy lo monkeypatchean.
@@ -785,11 +865,13 @@ def _stream_ui_worker(
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
-    yield json.dumps({
-        "type": "thinking",
-        "description": f"{cfg.display_name} preparando respuesta",
-        "phase": "ui_worker",
-    })
+    yield json.dumps(
+        {
+            "type": "thinking",
+            "description": f"{cfg.display_name} preparando respuesta",
+            "phase": "ui_worker",
+        }
+    )
 
     payload: Dict[str, Any] = {"messages": messages, "temperature": cfg.temperature}
     if cfg.reasoning_effort:
@@ -798,41 +880,59 @@ def _stream_ui_worker(
     try:
         data = _api_call_with_retry(_build_api_url(), payload)
     except requests.exceptions.Timeout:
-        yield json.dumps({"type": "error", "content": "El servicio tardó demasiado en responder."})
+        yield json.dumps(
+            {"type": "error", "content": "El servicio tardó demasiado en responder."}
+        )
         return
     except requests.exceptions.RequestException as e:
         logger.error(f"Error en {cfg.display_name} worker: {e}")
-        yield json.dumps({"type": "error", "content": "Error al conectar con el servicio de IA."})
+        yield json.dumps(
+            {"type": "error", "content": "Error al conectar con el servicio de IA."}
+        )
         return
 
-    raw_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "No pude generar una respuesta.")
+    raw_reply = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "No pude generar una respuesta.")
+    )
 
     reply, actions = _extract_actions(raw_reply)
     if actions:
-        logger.info(f"🎬 {cfg.display_name} emitió {len(actions)} acción(es): {[a['action'] for a in actions]}")
+        logger.info(
+            f"🎬 {cfg.display_name} emitió {len(actions)} acción(es): {[a['action'] for a in actions]}"
+        )
 
     # Cerrar el thinking con un tool_result real
-    yield json.dumps({
-        "type": "tool_result",
-        "summary": f"{len(actions)} acción(es) a aplicar" if actions else "Respuesta lista",
-    })
+    yield json.dumps(
+        {
+            "type": "tool_result",
+            "summary": (
+                f"{len(actions)} acción(es) a aplicar" if actions else "Respuesta lista"
+            ),
+        }
+    )
 
     for action in actions:
-        yield json.dumps({
-            "type": "action",
-            "action": action["action"],
-            "data": action.get("data", {}),
-        })
+        yield json.dumps(
+            {
+                "type": "action",
+                "action": action["action"],
+                "data": action.get("data", {}),
+            }
+        )
 
     messages.append({"role": "assistant", "content": reply})
     clean_history = [m for m in messages if m.get("role") != "system"]
 
-    yield json.dumps({
-        "type": "reply",
-        "content": reply,
-        "history": clean_history,
-        "tools_used": [],
-    })
+    yield json.dumps(
+        {
+            "type": "reply",
+            "content": reply,
+            "history": clean_history,
+            "tools_used": [],
+        }
+    )
 
 
 # Backwards-compat: tests viejos llaman a _stream_ui_generic con prompt + label
@@ -887,22 +987,34 @@ def _stream_tooled_worker(
         # un tool_call, emitimos el tool_result de este paso justo antes del
         # thinking del propio tool, dando continuidad realista.
         if round_num == 0:
-            yield json.dumps({
-                "type": "thinking",
-                "description": f"{short_name} analizando tu pregunta",
-                "phase": "reasoning",
-                "round": round_num + 1,
-            })
+            yield json.dumps(
+                {
+                    "type": "thinking",
+                    "description": f"{short_name} analizando tu pregunta",
+                    "phase": "reasoning",
+                    "round": round_num + 1,
+                }
+            )
         else:
-            phase_desc = "Sintetizando los datos obtenidos" if tools_used else "Replanteando la consulta"
-            yield json.dumps({
-                "type": "thinking",
-                "description": phase_desc,
-                "phase": "reasoning",
-                "round": round_num + 1,
-            })
+            phase_desc = (
+                "Sintetizando los datos obtenidos"
+                if tools_used
+                else "Replanteando la consulta"
+            )
+            yield json.dumps(
+                {
+                    "type": "thinking",
+                    "description": phase_desc,
+                    "phase": "reasoning",
+                    "round": round_num + 1,
+                }
+            )
 
-        tool_choice = cfg.tool_choice_first_round if (round_num == 0 and not tools_used) else "auto"
+        tool_choice = (
+            cfg.tool_choice_first_round
+            if (round_num == 0 and not tools_used)
+            else "auto"
+        )
         payload: Dict[str, Any] = {
             "messages": messages,
             "tools": tools_schemas,
@@ -929,15 +1041,30 @@ def _stream_tooled_worker(
                 elif ctype == "done":
                     finish_reason = chunk.get("finish_reason")
         except requests.exceptions.Timeout:
-            yield json.dumps({"type": "error", "content": "El servicio tardó demasiado en responder."})
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "content": "El servicio tardó demasiado en responder.",
+                }
+            )
             return
         except requests.exceptions.RequestException as e:
             logger.error(f"Error llamando al agente de IA: {e}")
-            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 429:
-                yield json.dumps({"type": "error", "content": "El servicio está temporalmente saturado. Espera unos segundos."})
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "content": "El servicio está temporalmente saturado. Espera unos segundos.",
+                    }
+                )
             else:
-                yield json.dumps({"type": "error", "content": "Error al conectar con el servicio de IA."})
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "content": "Error al conectar con el servicio de IA.",
+                    }
+                )
             return
 
         tool_calls = accumulated_tool_calls
@@ -945,19 +1072,23 @@ def _stream_tooled_worker(
             # Cerrar el thinking "analizando/sintetizando" con un tool_result
             # real que indique cuántas herramientas planea usar.
             n_tools = len(tool_calls or [])
-            yield json.dumps({
-                "type": "tool_result",
-                "summary": f"Va a ejecutar {n_tools} {'herramienta' if n_tools == 1 else 'herramientas'}",
-            })
+            yield json.dumps(
+                {
+                    "type": "tool_result",
+                    "summary": f"Va a ejecutar {n_tools} {'herramienta' if n_tools == 1 else 'herramientas'}",
+                }
+            )
 
             # Reconstruimos el message del assistant para añadirlo al historial
-            messages.append({
-                "role": "assistant",
-                "content": accumulated_content if accumulated_content else None,
-                "tool_calls": tool_calls or [],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": accumulated_content if accumulated_content else None,
+                    "tool_calls": tool_calls or [],
+                }
+            )
 
-            for tc in (tool_calls or []):
+            for tc in tool_calls or []:
                 fn_name = tc["function"]["name"]
                 try:
                     fn_args = json.loads(tc["function"]["arguments"])
@@ -980,14 +1111,16 @@ def _stream_tooled_worker(
 
                 description = f"{display_name} {' '.join(desc_parts)}".strip()
 
-                yield json.dumps({
-                    "type": "thinking",
-                    "description": description,
-                    "tool_key": fn_name,
-                    "collection_key": col_raw,
-                    "has_filter": bool(fn_args.get("filter")),
-                    "round": round_num + 1,
-                })
+                yield json.dumps(
+                    {
+                        "type": "thinking",
+                        "description": description,
+                        "tool_key": fn_name,
+                        "collection_key": col_raw,
+                        "has_filter": bool(fn_args.get("filter")),
+                        "round": round_num + 1,
+                    }
+                )
 
                 logger.info(f"🔧 Agente solicita: {fn_name}({fn_args})")
                 result = _execute_tool_call(fn_name, fn_args)
@@ -996,7 +1129,9 @@ def _stream_tooled_worker(
                 result_count = None
                 try:
                     result_data = json.loads(result)
-                    result_count = result_data.get("count", result_data.get("total", None))
+                    result_count = result_data.get(
+                        "count", result_data.get("total", None)
+                    )
                     if result_count is not None:
                         summary = f"{result_count} resultados obtenidos"
                     else:
@@ -1004,17 +1139,21 @@ def _stream_tooled_worker(
                 except (json.JSONDecodeError, AttributeError):
                     summary = "Datos recibidos"
 
-                yield json.dumps({
-                    "type": "tool_result",
-                    "summary": summary,
-                    "count": result_count,
-                })
+                yield json.dumps(
+                    {
+                        "type": "tool_result",
+                        "summary": summary,
+                        "count": result_count,
+                    }
+                )
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result,
+                    }
+                )
 
             continue
 
@@ -1023,15 +1162,19 @@ def _stream_tooled_worker(
         clean_history = [m for m in messages if m.get("role") != "system"]
         tools_display = list(dict.fromkeys(get_display_name(t) for t in tools_used))
 
-        yield json.dumps({
-            "type": "reply",
-            "content": reply,
-            "history": clean_history,
-            "tools_used": tools_display,
-        })
+        yield json.dumps(
+            {
+                "type": "reply",
+                "content": reply,
+                "history": clean_history,
+                "tools_used": tools_display,
+            }
+        )
         return
 
-    yield json.dumps({
-        "type": "error",
-        "content": "Se alcanzó el límite de procesamiento. Reformula tu pregunta.",
-    })
+    yield json.dumps(
+        {
+            "type": "error",
+            "content": "Se alcanzó el límite de procesamiento. Reformula tu pregunta.",
+        }
+    )

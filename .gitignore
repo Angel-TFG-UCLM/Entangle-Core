@@ -212,3 +212,9 @@ scripts/run_full_pipeline_test.py
 
 # SonarQube
 .scannerwork/
+
+# Terraform local state and provider cache
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan

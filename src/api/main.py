@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
         db.connect()
         logger.info("Base de datos conectada correctamente")
 
-        # Pre-warm del modelo gpt-5-mini en background — evita los 30-40s
+        # Pre-warm is only meaningful for a configured remote provider.
         # de cold start en la primera petición real del usuario tras un
         # rato de inactividad. La llamada es mínima (1 token) y no bloquea
         # el arranque del servidor: corre en un task separado.
@@ -58,9 +58,10 @@ async def lifespan(app: FastAPI):
         # Guardamos una referencia fuerte al task: asyncio solo mantiene
         # referencias débiles a los tasks, así que sin esto el GC podría
         # recolectarlo antes de que termine (ver docs de asyncio.create_task).
-        task = _asyncio.create_task(_warmup())
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        if config.AI_PROVIDER not in {"offline", "disabled"}:
+            task = _asyncio.create_task(_warmup())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         
     except Exception as e:
         logger.error(f"Error durante el inicio: {e}")

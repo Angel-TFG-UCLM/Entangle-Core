@@ -2,6 +2,7 @@
 Configuración del proyecto.
 Carga variables de entorno y configuración global.
 """
+
 import os
 import json
 from pathlib import Path
@@ -14,47 +15,128 @@ load_dotenv()
 
 class Config:
     """Configuración general del proyecto."""
-    
+
     # GitHub
     GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
     GITHUB_API_URL = "https://api.github.com/graphql"
-    
+
     # MongoDB
     MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "quantum_github")
-    
+    # Preservation providers are deliberately selected rather than inferred.
+    # Defaults retain the historical online deployment contract.
+    DATA_MODE = os.getenv("ENTANGLE_DATA_MODE", "live").lower()
+    DATABASE_PROVIDER = os.getenv("ENTANGLE_DATABASE_PROVIDER", "mongo").lower()
+    SNAPSHOT_PATH = os.getenv("ENTANGLE_SNAPSHOT_PATH", "")
+
     # API Configuration
     # Azure Container Apps uses PORT environment variable
     API_HOST = os.getenv("API_HOST", "0.0.0.0")
     API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
-    
+
     # Entorno
     ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
     DEBUG = os.getenv("DEBUG", "True").lower() == "true"
-    
+
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    
+
     # Azure AI Foundry
-    AZURE_AI_ENDPOINT = os.getenv("AZURE_AI_ENDPOINT", "")  # ej: https://entangle-ai-resource.services.ai.azure.com
+    AZURE_AI_ENDPOINT = os.getenv(
+        "AZURE_AI_ENDPOINT", ""
+    )  # ej: https://entangle-ai-resource.services.ai.azure.com
     AZURE_AI_PROJECT = os.getenv("AZURE_AI_PROJECT", "")  # ej: entangle-ai
     AZURE_AI_API_KEY = os.getenv("AZURE_AI_API_KEY", "")
     AZURE_AI_DEPLOYMENT = os.getenv("AZURE_AI_DEPLOYMENT", "gpt-5-mini")
+    AZURE_MANAGED_IDENTITY_CLIENT_ID = os.getenv("AZURE_MANAGED_IDENTITY_CLIENT_ID", "")
+    AI_PROVIDER = os.getenv("ENTANGLE_AI_PROVIDER", "azure-openai").lower()
+    AI_BASE_URL = os.getenv("AI_BASE_URL", "")
+    AI_MODEL = os.getenv("AI_MODEL", "")
+    AI_API_KEY = os.getenv("AI_API_KEY", "")
+    AI_EMBEDDING_MODEL = os.getenv("AI_EMBEDDING_MODEL", "")
+    EMBEDDINGS_ENABLED = (
+        os.getenv("ENTANGLE_EMBEDDINGS_ENABLED", "true").lower() == "true"
+    )
+    AWS_REGION = os.getenv("AWS_REGION", "")
 
     # Tavily Search API (worker DEEP_RESEARCH). Opcional: si está vacío,
     # web_search devuelve un error controlado y el worker informa al usuario.
     TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+    SEARCH_PROVIDER = os.getenv("ENTANGLE_SEARCH_PROVIDER", "tavily").lower()
+    GITHUB_PROVIDER = os.getenv("ENTANGLE_GITHUB_PROVIDER", "github").lower()
 
     # Frontend URL para CORS (Azure Static Web Apps)
     FRONTEND_URL = os.getenv("FRONTEND_URL", "")
-    
+
     @classmethod
     def validate(cls):
         """Valida que las configuraciones críticas estén presentes."""
-        if not cls.GITHUB_TOKEN:
+        if cls.DATA_MODE not in {"live", "snapshot"}:
+            raise ValueError("ENTANGLE_DATA_MODE debe ser 'live' o 'snapshot'")
+        if cls.DATABASE_PROVIDER not in {"mongo", "portable-mongo"}:
+            raise ValueError(
+                "ENTANGLE_DATABASE_PROVIDER debe ser 'mongo' o 'portable-mongo'"
+            )
+        if cls.AI_PROVIDER not in {
+            "azure-openai",
+            "bedrock",
+            "openai-compatible",
+            "offline",
+            "disabled",
+        }:
+            raise ValueError("ENTANGLE_AI_PROVIDER no es compatible")
+        if cls.SEARCH_PROVIDER not in {"tavily", "disabled"}:
+            raise ValueError("ENTANGLE_SEARCH_PROVIDER debe ser 'tavily' o 'disabled'")
+        if cls.GITHUB_PROVIDER not in {"github", "disabled"}:
+            raise ValueError(
+                "GitHub sigue siendo la única integración de ingesta compatible"
+            )
+        if cls.AI_PROVIDER == "azure-openai" and not cls.AZURE_AI_ENDPOINT:
+            raise ValueError("AZURE_AI_ENDPOINT es obligatorio para azure-openai")
+        if cls.AI_PROVIDER == "openai-compatible" and (
+            not cls.AI_BASE_URL or not cls.AI_MODEL
+        ):
+            raise ValueError("AI_BASE_URL y AI_MODEL son obligatorios para openai-compatible")
+        if cls.AI_PROVIDER == "bedrock" and (not cls.AWS_REGION or not cls.AI_MODEL):
+            raise ValueError("AWS_REGION y AI_MODEL son obligatorios para bedrock")
+        if cls.ENVIRONMENT == "production" and cls.AI_PROVIDER == "azure-openai":
+            if not cls.AZURE_MANAGED_IDENTITY_CLIENT_ID:
+                raise ValueError(
+                    "AZURE_MANAGED_IDENTITY_CLIENT_ID es obligatorio para Azure AI en producción"
+                )
+        if cls.DATA_MODE == "snapshot":
+            if cls.DATABASE_PROVIDER != "portable-mongo":
+                raise ValueError(
+                    "El modo snapshot requiere ENTANGLE_DATABASE_PROVIDER=portable-mongo"
+                )
+            if not cls.SNAPSHOT_PATH:
+                raise ValueError(
+                    "ENTANGLE_SNAPSHOT_PATH es obligatorio en modo snapshot"
+                )
+            return
+        if cls.GITHUB_PROVIDER == "github" and not cls.GITHUB_TOKEN:
             raise ValueError("GITHUB_TOKEN no está configurado")
         if not cls.MONGO_URI:
             raise ValueError("MONGO_URI no está configurado")
+
+    @classmethod
+    def runtime_status(cls) -> Dict[str, Any]:
+        """Expose selected modes without exposing credentials."""
+        return {
+            "data_mode": cls.DATA_MODE,
+            "providers": {
+                "database": cls.DATABASE_PROVIDER,
+                "ai": cls.AI_PROVIDER,
+                "search": cls.SEARCH_PROVIDER,
+                "github": cls.GITHUB_PROVIDER,
+                "embeddings_enabled": cls.EMBEDDINGS_ENABLED,
+            },
+            "external_dependencies": {
+                "github": cls.DATA_MODE == "live",
+                "ai": cls.AI_PROVIDER not in {"offline", "disabled"},
+                "search": cls.SEARCH_PROVIDER != "disabled",
+            },
+        }
 
 
 class IngestionConfig:
@@ -62,13 +144,13 @@ class IngestionConfig:
     Configuración de criterios de ingesta para repositorios de software cuántico.
     Carga los criterios desde un archivo JSON externo.
     """
-    
+
     def __init__(self, config_path: Optional[str] = None):
         """
         Inicializa la configuración de ingesta.
-        
+
         Args:
-            config_path: Ruta al archivo de configuración JSON. 
+            config_path: Ruta al archivo de configuración JSON.
                         Si es None, usa la ruta por defecto.
         """
         if config_path is None:
@@ -77,28 +159,28 @@ class IngestionConfig:
             config_path = base_dir / "config" / "ingestion_config.json"
         else:
             config_path = Path(config_path)
-        
+
         self.config_path = config_path
         self._config_data: Dict[str, Any] = {}
         self._load_config()
-    
+
     def _load_config(self):
         """Carga y valida el archivo de configuración."""
         # Importar logger aquí para evitar importación circular
         from .logger import logger
-        
+
         try:
             if not self.config_path.exists():
                 raise FileNotFoundError(
                     f"Archivo de configuración no encontrado: {self.config_path}"
                 )
-            
-            with open(self.config_path, 'r', encoding='utf-8') as f:
+
+            with open(self.config_path, "r", encoding="utf-8") as f:
                 self._config_data = json.load(f)
-            
+
             logger.info(f"Configuración de ingesta cargada desde: {self.config_path}")
             self._validate_config()
-            
+
         except FileNotFoundError as e:
             logger.error(f"Error: {e}")
             raise
@@ -108,26 +190,26 @@ class IngestionConfig:
         except Exception as e:
             logger.error(f"Error inesperado al cargar configuración: {e}")
             raise
-    
+
     def _validate_config(self):
         """Valida que los parámetros requeridos estén presentes y sean del tipo correcto."""
         from .logger import logger
-        
+
         required_fields = {
             "keywords": list,
             "languages": list,
             "min_stars": int,
             "max_inactivity_days": int,
-            "exclude_forks": bool
+            "exclude_forks": bool,
         }
-        
+
         # Validar campos requeridos
         for field, expected_type in required_fields.items():
             if field not in self._config_data:
                 error_msg = f"Campo requerido ausente en configuración: {field}"
                 logger.error(error_msg)
                 raise ValueError(error_msg)
-            
+
             value = self._config_data[field]
             if not isinstance(value, expected_type):
                 error_msg = (
@@ -137,34 +219,34 @@ class IngestionConfig:
                 )
                 logger.error(error_msg)
                 raise TypeError(error_msg)
-        
+
         # Validar que las listas no estén vacías
         if not self._config_data["keywords"]:
             logger.warning("La lista de keywords está vacía")
-        
+
         if not self._config_data["languages"]:
             logger.warning("La lista de languages está vacía")
-        
+
         # Validar valores numéricos
         if self._config_data["min_stars"] < 0:
             error_msg = "min_stars no puede ser negativo"
             logger.error(error_msg)
             raise ValueError(error_msg)
-        
+
         if self._config_data["max_inactivity_days"] < 0:
             error_msg = "max_inactivity_days no puede ser negativo"
             logger.error(error_msg)
             raise ValueError(error_msg)
-        
+
         logger.info("Configuración de ingesta validada exitosamente")
-    
+
     # Propiedades para acceder a los criterios de filtrado
-    
+
     @property
     def keywords(self) -> List[str]:
         """Lista de palabras clave para identificar repositorios cuánticos."""
         return self._config_data.get("keywords", [])
-    
+
     @property
     def search_keywords(self) -> List[str]:
         """
@@ -173,78 +255,81 @@ class IngestionConfig:
         Por defecto usa solo la primera keyword del config si no se especifica.
         """
         return self._config_data.get("search_keywords", self.keywords[:1])
-    
+
     @property
     def languages(self) -> List[str]:
         """Lista de lenguajes de programación permitidos."""
         return self._config_data.get("languages", [])
-    
+
     @property
     def min_stars(self) -> int:
         """Número mínimo de estrellas requeridas."""
         return self._config_data.get("min_stars", 0)
-    
+
     @property
     def max_inactivity_days(self) -> int:
         """Máximo número de días de inactividad permitidos."""
         return self._config_data.get("max_inactivity_days", 365)
-    
+
     @property
     def exclude_forks(self) -> bool:
         """Si se deben excluir los repositorios que son forks."""
         return self._config_data.get("exclude_forks", True)
-    
+
     @property
     def min_contributors(self) -> int:
         """Número mínimo de contribuidores (opcional)."""
         return self._config_data.get("min_contributors", 1)
-    
+
     @property
     def additional_filters(self) -> Dict[str, Any]:
         """Filtros adicionales opcionales."""
         return self._config_data.get("additional_filters", {})
-    
+
     @property
     def description(self) -> str:
         """Descripción de la configuración."""
         return self._config_data.get("description", "")
-    
+
     @property
     def version(self) -> str:
         """Versión de la configuración."""
         return self._config_data.get("version", "1.0")
-    
+
     @property
     def segmentation(self) -> Optional[Dict[str, Any]]:
         """
         Configuración de segmentación para superar el límite de 1000 resultados.
-        
+
         Returns:
             Dict con 'stars' (lista de rangos [min, max]) y 'created_years' (lista de años)
             o None si no está configurada la segmentación
         """
         return self._config_data.get("segmentation", None)
-    
+
     @property
     def enable_segmentation(self) -> bool:
         """Si está habilitada la segmentación dinámica."""
-        return self.segmentation is not None and self._config_data.get("enable_segmentation", False)
-    
+        return self.segmentation is not None and self._config_data.get(
+            "enable_segmentation", False
+        )
+
     def get_all_config(self) -> Dict[str, Any]:
         """
         Retorna toda la configuración como diccionario.
-        
+
         Returns:
             Diccionario con toda la configuración cargada
         """
         return self._config_data.copy()
-    
+
     def reload(self):
         """Recarga la configuración desde el archivo."""
         from .logger import logger
+
         logger.info("Recargando configuración de ingesta...")
         self._load_config()
-    
+
     def __repr__(self) -> str:
         """Representación en string de la configuración."""
         return (
@@ -267,13 +352,13 @@ ingestion_config = IngestionConfig()
 def load_ingestion_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Carga y retorna la configuración de ingesta completa.
-    
+
     Args:
         config_path: Ruta opcional al archivo de configuración
-        
+
     Returns:
         Diccionario con toda la configuración
     """
     config_instance = IngestionConfig(config_path) if config_path else ingestion_config
-    
+
     return config_instance.get_all_config()

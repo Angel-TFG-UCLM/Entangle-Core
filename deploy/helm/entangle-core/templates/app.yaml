@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "entangle-core.fullname" . }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector: { matchLabels: { app: entangle-core } }
+  template:
+    metadata: { labels: { app: entangle-core } }
+    spec:
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports: [{ containerPort: 8000 }]
+          env:
+            - { name: ENTANGLE_DATA_MODE, value: {{ .Values.runtime.dataMode | quote }} }
+            - { name: ENTANGLE_DATABASE_PROVIDER, value: {{ .Values.runtime.databaseProvider | quote }} }
+            - { name: ENTANGLE_AI_PROVIDER, value: {{ .Values.runtime.aiProvider | quote }} }
+            - { name: ENTANGLE_SEARCH_PROVIDER, value: {{ .Values.runtime.searchProvider | quote }} }
+            - { name: ENTANGLE_GITHUB_PROVIDER, value: {{ .Values.runtime.githubProvider | quote }} }
+            {{- if eq .Values.runtime.dataMode "snapshot" }}
+            - { name: ENTANGLE_SNAPSHOT_PATH, value: {{ required "runtime.snapshotPath is required for snapshot mode" .Values.runtime.snapshotPath | quote }} }
+            {{- else }}
+            - name: MONGO_URI
+              valueFrom: { secretKeyRef: { name: {{ required "runtime.mongoUriSecretName is required for live mode" .Values.runtime.mongoUriSecretName }}, key: {{ .Values.runtime.mongoUriSecretKey }} } }
+            - name: GITHUB_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ required "runtime.githubTokenSecretName is required for live mode" .Values.runtime.githubTokenSecretName }}, key: {{ .Values.runtime.githubTokenSecretKey }} } }
+            {{- end }}
+            {{- if eq .Values.runtime.aiProvider "azure-openai" }}
+            - { name: AZURE_AI_ENDPOINT, value: {{ required "runtime.azureAiEndpoint is required for azure-openai" .Values.runtime.azureAiEndpoint | quote }} }
+            - { name: AZURE_AI_DEPLOYMENT, value: {{ required "runtime.azureAiDeployment is required for azure-openai" .Values.runtime.azureAiDeployment | quote }} }
+            - { name: AZURE_MANAGED_IDENTITY_CLIENT_ID, value: {{ required "runtime.azureManagedIdentityClientId is required for azure-openai" .Values.runtime.azureManagedIdentityClientId | quote }} }
+            {{- else if eq .Values.runtime.aiProvider "openai-compatible" }}
+            - { name: AI_BASE_URL, value: {{ required "runtime.aiBaseUrl is required for openai-compatible" .Values.runtime.aiBaseUrl | quote }} }
+            - { name: AI_MODEL, value: {{ required "runtime.aiModel is required for openai-compatible" .Values.runtime.aiModel | quote }} }
+            {{- if .Values.runtime.aiApiKeySecretName }}
+            - name: AI_API_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.runtime.aiApiKeySecretName }}, key: {{ .Values.runtime.aiApiKeySecretKey }} } }
+            {{- end }}
+            {{- end }}
+          readinessProbe: { httpGet: { path: /api/v1/health/ready, port: 8000 }, initialDelaySeconds: 5 }
+          livenessProbe: { httpGet: { path: /api/v1/health, port: 8000 }, initialDelaySeconds: 15 }
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: entangle-core }
+spec:
+  selector: { app: entangle-core }
+  ports: [{ port: {{ .Values.service.port }}, targetPort: 8000 }]
