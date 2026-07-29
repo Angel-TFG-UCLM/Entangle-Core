@@ -1,5 +1,5 @@
 name_prefix = "entangle-preserved"
 profile     = "economy"
 api_image   = "replace-with-your-registry/entangle-core:immutable-tag"
-# Set key_vault_id plus secret IDs through TF_VAR_* or a secure CI variable group.
+# Set each Key Vault secret URI and its ARM resource ID through TF_VAR_* or a secure CI variable group.
 # Do not put tokens, database URIs, or cloud credentials in tfvars.

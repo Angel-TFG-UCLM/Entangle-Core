@@ -124,8 +124,14 @@ resource "azurerm_role_assignment" "acr_pull" {
   principal_id         = azurerm_user_assigned_identity.api.principal_id
 }
 
-resource "azurerm_role_assignment" "key_vault_secrets" {
-  scope                = var.key_vault_id
+resource "azurerm_role_assignment" "mongo_secret_reader" {
+  scope                = var.mongo_key_vault_secret_resource_id
+  role_definition_name = "Key Vault Secrets User"
+  principal_id         = azurerm_user_assigned_identity.api.principal_id
+}
+
+resource "azurerm_role_assignment" "github_secret_reader" {
+  scope                = var.github_key_vault_secret_resource_id
   role_definition_name = "Key Vault Secrets User"
   principal_id         = azurerm_user_assigned_identity.api.principal_id
 }
@@ -148,6 +154,13 @@ module "runtime" {
   deploy_staging             = var.deploy_staging
   min_replicas               = local.economy ? 0 : 1
   max_replicas               = local.economy ? 1 : 3
+
+  depends_on = [
+    azurerm_role_assignment.acr_pull,
+    azurerm_role_assignment.ai_user,
+    azurerm_role_assignment.mongo_secret_reader,
+    azurerm_role_assignment.github_secret_reader,
+  ]
 }
 
 resource "azurerm_static_web_app" "visualizer" {
