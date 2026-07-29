@@ -191,6 +191,11 @@ Toda la configuración en runtime se carga desde variables de entorno (ver [`.en
 
 Ambos archivos están documentados inline mediante campos `*_description`, así que también funcionan como configuración auto-descrita.
 
+La lista completa y legible está disponible en
+**[Taxonomía de keywords de ingesta](./docs/INGESTION_KEYWORDS.md)**: 8
+términos de descubrimiento en GitHub y las 71 palabras de relevancia aplicadas
+a los metadatos de cada repositorio.
+
 ---
 
 ## Ejecución del pipeline
