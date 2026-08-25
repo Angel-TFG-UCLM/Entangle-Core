@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Entangle · Voice Demo (ElevenLabs)</title>
+<style>
+  :root { --bg:#0b1020; --card:#151b30; --accent:#22d3ee; --accent2:#a855f7; --text:#e6e9f5; --muted:#8b93b0; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:'Segoe UI',system-ui,sans-serif; background:radial-gradient(1200px 600px at 20% -10%, #1b2448 0%, var(--bg) 60%); color:var(--text); min-height:100vh; }
+  .wrap { max-width:760px; margin:0 auto; padding:40px 20px 80px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  h1 span { background:linear-gradient(90deg,var(--accent),var(--accent2)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .sub { color:var(--muted); margin:0 0 24px; font-size:14px; }
+  .card { background:var(--card); border:1px solid #26304f; border-radius:14px; padding:20px; margin-bottom:18px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:8px; }
+  textarea { width:100%; min-height:130px; resize:vertical; background:#0e1428; color:var(--text); border:1px solid #2b3760; border-radius:10px; padding:12px; font-size:14px; line-height:1.5; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; align-items:center; }
+  button { border:0; border-radius:10px; padding:11px 18px; font-size:14px; font-weight:600; cursor:pointer; color:#06121a; background:linear-gradient(90deg,var(--accent),#38bdf8); transition:transform .05s ease, opacity .2s; }
+  button.secondary { background:linear-gradient(90deg,var(--accent2),#c084fc); color:#140a1f; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button:active { transform:translateY(1px); }
+  .rec { background:linear-gradient(90deg,#f43f5e,#fb7185); color:#1a0509; }
+  .rec.recording { animation:pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
+  audio { width:100%; margin-top:14px; }
+  .status { font-size:12px; padding:4px 10px; border-radius:999px; background:#0e1428; border:1px solid #2b3760; color:var(--muted); }
+  .status.ok { color:#4ade80; border-color:#1e5f3a; }
+  .status.off { color:#fbbf24; border-color:#5f4a1e; }
+  .hint { color:var(--muted); font-size:12px; margin-top:10px; }
+  .foot { color:var(--muted); font-size:12px; text-align:center; margin-top:30px; }
+  .foot a { color:var(--accent); }
+  code { background:#0e1428; padding:2px 6px; border-radius:6px; color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Entangle · <span>Voice Layer</span></h1>
+  <p class="sub">Capa de voz sobre el agente conversacional de Entangle, con ElevenLabs. Escribe (o dicta) una pregunta/respuesta y escúchala. <span id="status" class="status">comprobando…</span></p>
+
+  <div class="card">
+    <label for="text">Texto (por defecto, una respuesta de ejemplo del agente de Entangle)</label>
+    <textarea id="text">En el ecosistema open source de computación cuántica en GitHub, cuatro fabricantes concentran la mayor parte de la actividad: Qiskit de IBM, Cirq de Google, PennyLane de Xanadu y Braket de Amazon. Un hallazgo importante es que el 81,7% de los repositorios dependen de un único mantenedor, lo que supone un riesgo de sostenibilidad para el ecosistema.</textarea>
+    <div class="row">
+      <button id="speak">🔊 Escuchar (Text-to-Speech)</button>
+      <button id="record" class="secondary rec">🎤 Grabar pregunta (Speech-to-Text)</button>
+      <label style="margin:0; display:flex; align-items:center; gap:6px; color:var(--muted); font-size:13px;">
+        <input type="checkbox" id="autospeak" checked /> locutar tras transcribir
+      </label>
+    </div>
+    <audio id="player" controls hidden></audio>
+    <p class="hint" id="hint">TTS multilingüe (ES/EN). La grabación usa el micrófono del navegador y se transcribe con Scribe.</p>
+  </div>
+
+  <p class="foot">Voice by <a href="https://elevenlabs.io" target="_blank" rel="noopener">ElevenLabs</a> · demo no comercial · proyecto Entangle (TFG UCLM)</p>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), hint = $("hint"), player = $("player");
+
+async function checkStatus() {
+  try {
+    const r = await fetch("/status");
+    const d = await r.json();
+    if (d.configured) { statusEl.textContent = "ElevenLabs conectado · " + d.tts_model; statusEl.className = "status ok"; }
+    else { statusEl.textContent = "falta ELEVENLABS_API_KEY"; statusEl.className = "status off"; }
+  } catch (e) { statusEl.textContent = "servidor no disponible"; statusEl.className = "status off"; }
+}
+checkStatus();
+
+async function speak(text) {
+  hint.textContent = "Generando audio…";
+  const r = await fetch("/tts", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ text }) });
+  if (!r.ok) { hint.textContent = "Error TTS: " + (await r.text()); return; }
+  const blob = await r.blob();
+  player.src = URL.createObjectURL(blob);
+  player.hidden = false;
+  player.play();
+  hint.textContent = "Reproduciendo. Cada clip consume créditos del plan gratuito (~10 min/mes).";
+}
+
+$("speak").onclick = () => {
+  const text = $("text").value.trim();
+  if (text) speak(text);
+};
+
+// ---- Grabación + STT ----
+let mediaRecorder = null, chunks = [];
+const recordBtn = $("record");
+
+recordBtn.onclick = async () => {
+  if (mediaRecorder && mediaRecorder.state === "recording") {
+    mediaRecorder.stop();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    chunks = [];
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      recordBtn.classList.remove("recording");
+      recordBtn.textContent = "🎤 Grabar pregunta (Speech-to-Text)";
+      const blob = new Blob(chunks, { type: "audio/webm" });
+      hint.textContent = "Transcribiendo…";
+      const fd = new FormData();
+      fd.append("file", blob, "question.webm");
+      const r = await fetch("/stt", { method: "POST", body: fd });
+      if (!r.ok) { hint.textContent = "Error STT: " + (await r.text()); return; }
+      const d = await r.json();
+      $("text").value = d.text || "";
+      hint.textContent = "Transcrito.";
+      if ($("autospeak").checked && d.text) speak(d.text);
+    };
+    mediaRecorder.start();
+    recordBtn.classList.add("recording");
+    recordBtn.textContent = "⏹ Detener y transcribir";
+    hint.textContent = "Grabando… habla y pulsa Detener.";
+  } catch (e) {
+    hint.textContent = "No se pudo acceder al micrófono: " + e.message;
+  }
+};
+</script>
+</body>
+</html>
