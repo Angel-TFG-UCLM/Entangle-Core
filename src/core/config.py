@@ -45,6 +45,17 @@ class Config:
     # web_search devuelve un error controlado y el worker informa al usuario.
     TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
+    # ElevenLabs (capa de voz opcional: TTS + STT Scribe). Si la key está
+    # vacía, la capa de voz se desactiva (endpoints /voice → 503) y el resto
+    # de la app funciona igual. Plan gratuito: uso NO comercial + atribución.
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+    ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")  # vacío = auto-seleccionar
+    # Turbo v2.5: multilingüe (ES/EN), baja latencia y ~mitad de créditos que
+    # multilingual_v2 — mejor para el plan gratuito. Cambia a eleven_multilingual_v2
+    # si prefieres máxima calidad a mayor coste de créditos.
+    ELEVENLABS_TTS_MODEL = os.getenv("ELEVENLABS_TTS_MODEL", "eleven_turbo_v2_5")
+    ELEVENLABS_STT_MODEL = os.getenv("ELEVENLABS_STT_MODEL", "scribe_v1")
+
     # Frontend URL para CORS (Azure Static Web Apps)
     FRONTEND_URL = os.getenv("FRONTEND_URL", "")
     

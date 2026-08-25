@@ -11,6 +11,9 @@ pymongo==4.10.1
 # Cliente HTTP
 requests==2.32.3
 
+# Formularios multipart (subida de audio para STT — capa de voz ElevenLabs)
+python-multipart==0.0.12
+
 # Análisis de redes de colaboración
 networkx>=3.0
 
