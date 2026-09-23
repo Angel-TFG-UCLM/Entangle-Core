@@ -36,6 +36,11 @@ class TestVoiceModule:
         with pytest.raises(voice.VoiceError):
             voice.text_to_speech("   ")
 
+    def test_tts_rejects_invalid_voice_id(self, monkeypatch):
+        monkeypatch.setattr(voice.config, "ELEVENLABS_API_KEY", "sk-test")
+        with pytest.raises(voice.VoiceError):
+            voice.text_to_speech("hola", voice_id="../other-voice")
+
     def test_tts_calls_api(self, monkeypatch):
         monkeypatch.setattr(voice.config, "ELEVENLABS_API_KEY", "sk-test")
         monkeypatch.setattr(voice.config, "ELEVENLABS_VOICE_ID", "voice-123")

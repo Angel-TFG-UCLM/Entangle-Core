@@ -13,7 +13,9 @@ Uso libre / plan gratuito de ElevenLabs: recuerda la atribución
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 
@@ -22,6 +24,8 @@ from ..core.logger import logger
 
 _BASE_URL = "https://api.elevenlabs.io/v1"
 _TIMEOUT = 30  # segundos
+_MISSING_API_KEY = "ELEVENLABS_API_KEY no configurada"
+_VOICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Cache de la voz auto-resuelta para no llamar a /voices en cada request.
 _cached_voice_id: Optional[str] = None
@@ -53,7 +57,7 @@ def resolve_voice_id() -> str:
     if _cached_voice_id:
         return _cached_voice_id
     if not is_configured():
-        raise VoiceError("ELEVENLABS_API_KEY no configurada")
+        raise VoiceError(_MISSING_API_KEY)
 
     resp = requests.get(f"{_BASE_URL}/voices", headers=_headers(), timeout=_TIMEOUT)
     resp.raise_for_status()
@@ -66,6 +70,13 @@ def resolve_voice_id() -> str:
         voices[0].get("name", _cached_voice_id),
     )
     return _cached_voice_id
+
+
+def _safe_voice_id(voice_id: str) -> str:
+    """Valida y codifica un identificador antes de usarlo en una URL."""
+    if not _VOICE_ID_PATTERN.fullmatch(voice_id):
+        raise VoiceError("Identificador de voz no válido")
+    return quote(voice_id, safe="")
 
 
 def text_to_speech(
@@ -88,11 +99,11 @@ def text_to_speech(
         requests.HTTPError: si la API de ElevenLabs responde con error.
     """
     if not is_configured():
-        raise VoiceError("ELEVENLABS_API_KEY no configurada")
+        raise VoiceError(_MISSING_API_KEY)
     if not text or not text.strip():
         raise VoiceError("El texto para TTS está vacío")
 
-    vid = voice_id or resolve_voice_id()
+    vid = _safe_voice_id(voice_id or resolve_voice_id())
     model = model_id or config.ELEVENLABS_TTS_MODEL
     url = f"{_BASE_URL}/text-to-speech/{vid}"
     payload = {
@@ -129,7 +140,7 @@ def speech_to_text(
         requests.HTTPError: si la API de ElevenLabs responde con error.
     """
     if not is_configured():
-        raise VoiceError("ELEVENLABS_API_KEY no configurada")
+        raise VoiceError(_MISSING_API_KEY)
     if not audio:
         raise VoiceError("El audio para STT está vacío")
 
