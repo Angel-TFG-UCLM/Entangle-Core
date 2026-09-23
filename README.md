@@ -21,7 +21,7 @@ Ingestion, enrichment, network analysis and AI-powered insights, served through 
 [![Maintainability](https://img.shields.io/badge/maintainability-A-brightgreen?logo=sonarqube&logoColor=white)](#quality--code-analysis)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-[**Open app**](https://blue-rock-0771cc403.1.azurestaticapps.net) ·
+[**Open app**](https://angel-tfg-uclm.github.io/Entangle-Visualizer/) ·
 [**Frontend repo**](https://github.com/Angel-TFG-UCLM/Entangle-Visualizer) ·
 [**Report a bug**](https://github.com/Angel-TFG-UCLM/Entangle-Core/issues)
 
