@@ -15,6 +15,7 @@ on:
 
 jobs:
   build-and-deploy:
+    if: vars.AZURE_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions: 
       id-token: write #This is required for requesting the OIDC JWT Token
@@ -46,4 +47,10 @@ jobs:
           _buildArgumentsKey_: |
             _buildArgumentsValues_
 
+  deployment-skipped:
+    if: vars.AZURE_DEPLOY_ENABLED != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report skipped deployment
+        run: echo "Azure deployment skipped because AZURE_DEPLOY_ENABLED is not set to 'true'."
 
