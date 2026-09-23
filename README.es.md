@@ -21,7 +21,7 @@ Pipeline de ingesta, enriquecimiento, análisis de redes e insights con IA, expu
 [![Mantenibilidad](https://img.shields.io/badge/mantenibilidad-A-brightgreen?logo=sonarqube&logoColor=white)](#calidad--an%C3%A1lisis-est%C3%A1tico)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-[**Abrir app**](https://blue-rock-0771cc403.1.azurestaticapps.net) ·
+[**Abrir app**](https://angel-tfg-uclm.github.io/Entangle-Visualizer/) ·
 [**Repo del frontend**](https://github.com/Angel-TFG-UCLM/Entangle-Visualizer) ·
 [**Reportar un bug**](https://github.com/Angel-TFG-UCLM/Entangle-Core/issues)
 
